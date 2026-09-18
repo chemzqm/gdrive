@@ -9,7 +9,8 @@ let package = Package(
     products: [
         .library(name: "GDrive", targets: ["GDrive"]),
         .executable(name: "gdrive-auth", targets: ["GDriveAuth"]),
-        .executable(name: "gdrive-bench", targets: ["GDriveBench"])
+        .executable(name: "gdrive-bench", targets: ["GDriveBench"]),
+        .executable(name: "gdrive-upload", targets: ["GDriveUploadBench"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
@@ -49,6 +50,17 @@ let package = Package(
                 .product(name: "Logging", package: "swift-log")
             ],
             path: "Sources/GDriveBench",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
+        .executableTarget(
+            name: "GDriveUploadBench",
+            dependencies: [
+                "GDrive",
+                .product(name: "Logging", package: "swift-log")
+            ],
+            path: "Sources/GDriveUploadBench",
             swiftSettings: [
                 .swiftLanguageMode(.v6)
             ]

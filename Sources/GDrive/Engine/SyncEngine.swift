@@ -77,7 +77,7 @@ public final class SyncEngine: Sendable {
     public func sync(
         localPath: String,
         remoteFolderId: String,
-        concurrency: Int = 16,
+        concurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
@@ -166,7 +166,7 @@ public final class SyncEngine: Sendable {
     public func syncLocalToRemoteEmpty(
         localPath: String,
         remoteRootId: String,
-        maxUploadConcurrency: Int = 16,
+        maxUploadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
@@ -294,8 +294,9 @@ public final class SyncEngine: Sendable {
         }
         let localDirMap = LocalDirMap(rootItemId: rootItemId)
 
-        // 3. 设置有界并发上传流水线
-        let uploadSemaphore = AsyncSemaphore(count: maxUploadConcurrency)
+        // 3. 设置有界并发上传流水线（严格上限 64 并发）
+        let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
+        let uploadSemaphore = AsyncSemaphore(count: effectiveConcurrency)
         let uploadGroup = DispatchGroup()
 
         // 加载快速变更比对基线缓存 (§6.2)
@@ -379,7 +380,8 @@ public final class SyncEngine: Sendable {
             delimiter: 0x00,
             pathPrefix: prefixBytes
         )
-        let request = ScanRequest(root: resolvedLocalPath, filters: [], options: scanOptions)
+        let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
+        let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
         let scanner = DirectoryScanner()
 
         _ = try await scanner.scan(request) { batch in
@@ -399,7 +401,7 @@ public final class SyncEngine: Sendable {
                         relPath = (fullPath as NSString).lastPathComponent
                     }
 
-                    if relPath.isEmpty { continue }
+                    if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") { continue }
 
                     let parentRel = (relPath as NSString).deletingLastPathComponent
                     let name = (relPath as NSString).lastPathComponent
@@ -480,6 +482,9 @@ public final class SyncEngine: Sendable {
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
+                            // 先等待直接父目录在 Google Drive 远端就绪，避免空占并发上传槽位
+                            let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+
                             await uploadSemaphore.wait()
                             defer {
                                 self.monitor.finishUpload(id: fullPath)
@@ -490,11 +495,36 @@ public final class SyncEngine: Sendable {
 
                             do {
                                 let remoteFileId = try await self.idPool.nextId()
-                                let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
 
-                                // 恒定内存流式计算 SHA-256 与文件大小
                                 let fileURL = URL(fileURLWithPath: fullPath)
-                                let (sha256Hex, fileSize) = try SyncEngine.computeFileSha256(at: fileURL)
+                                let limit8MB: Int64 = 8 * 1024 * 1024
+                                let metaSize = Int64(record.metadata?.fileSize ?? 0)
+
+                                let sha256Hex: String
+                                let fileSize: Int64
+                                let smallContent: Data?
+
+                                if metaSize <= limit8MB {
+                                    // 小文件 (≤ 8MB)：单次磁盘读取装入内存，并在内存计算 SHA-256（彻底杜绝二次读盘）
+                                    let data = try Data(contentsOf: fileURL)
+                                    let actualSize = Int64(data.count)
+                                    if actualSize <= limit8MB {
+                                        fileSize = actualSize
+                                        sha256Hex = SyncEngine.computeSha256(of: data)
+                                        smallContent = data
+                                    } else {
+                                        let (s, sz) = try SyncEngine.computeFileSha256(at: fileURL)
+                                        sha256Hex = s
+                                        fileSize = sz
+                                        smallContent = nil
+                                    }
+                                } else {
+                                    let (s, sz) = try SyncEngine.computeFileSha256(at: fileURL)
+                                    sha256Hex = s
+                                    fileSize = sz
+                                    smallContent = nil
+                                }
+
                                 self.monitor.startUpload(id: fullPath, name: name, totalBytes: fileSize)
 
                                 let dev = Int64(record.metadata?.identity.device ?? 1)
@@ -504,15 +534,13 @@ public final class SyncEngine: Sendable {
                                 let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
 
                                 // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
-                                let limit8MB: Int64 = 8 * 1024 * 1024
-                                if fileSize <= limit8MB {
-                                    // 小文件 (≤ 8MB)：上传前零数据库 I/O 阻塞，直接发起网络传输
-                                    let fileData = try Data(contentsOf: fileURL)
+                                if fileSize <= limit8MB, let content = smallContent {
+                                    // 小文件：直接发送内存数据，零磁盘暂存与二次读盘
                                     _ = try await self.client.uploadMultipart(
                                         name: name,
                                         parentId: remoteParentId,
                                         remoteId: remoteFileId,
-                                        content: fileData,
+                                        content: content,
                                         expectedSha256: sha256Hex
                                     )
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
@@ -695,7 +723,7 @@ public final class SyncEngine: Sendable {
     public func syncRemoteToLocalEmpty(
         localPath: String,
         remoteRootId: String,
-        maxDownloadConcurrency: Int = 16,
+        maxDownloadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
@@ -791,7 +819,8 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        let downloadSemaphore = AsyncSemaphore(count: maxDownloadConcurrency)
+        let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
+        let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)
         let downloadGroup = DispatchGroup()
 
         final class DownloadTracker: @unchecked Sendable {
@@ -976,6 +1005,15 @@ public final class SyncEngine: Sendable {
         CC_SHA256_Final(&digest, &ctx)
         let hex = digest.map { String(format: "%02x", $0) }.joined()
         return (hex, totalSize)
+    }
+
+    /// 在内存中极速计算 Data 的 SHA-256 字符串（小文件专用，单次耗时 ~10us）
+    static func computeSha256(of data: Data) -> String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        data.withUnsafeBytes { ptr in
+            _ = CC_SHA256(ptr.baseAddress, CC_LONG(data.count), &digest)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 
     /// 执行大文件 (> 8MB) 分块断点续传：
@@ -1209,7 +1247,7 @@ public final class SyncEngine: Sendable {
     public func syncIncremental(
         localPath: String,
         remoteRootId: String,
-        maxConcurrency: Int = 16,
+        maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
@@ -1255,7 +1293,7 @@ public final class SyncEngine: Sendable {
         rootItemId: Int64,
         localPath: String,
         remoteRootId: String,
-        maxConcurrency: Int = 16,
+        maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
@@ -1652,7 +1690,8 @@ public final class SyncEngine: Sendable {
             delimiter: 0x00,
             pathPrefix: prefixBytes
         )
-        let request = ScanRequest(root: resolvedLocalPath, filters: [], options: scanOptions)
+        let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
+        let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
         let scanner = DirectoryScanner()
 
         struct DiscoveredRecord {
@@ -1700,7 +1739,7 @@ public final class SyncEngine: Sendable {
                     relPath = (fullPath as NSString).lastPathComponent
                 }
 
-                if relPath.isEmpty { continue }
+                if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") { continue }
 
                 let name = (relPath as NSString).lastPathComponent
                 let parentRel = (relPath as NSString).deletingLastPathComponent
@@ -2038,7 +2077,8 @@ public final class SyncEngine: Sendable {
             return records
         }
 
-        let syncSemaphore = AsyncSemaphore(count: maxConcurrency)
+        let effectiveSyncConcurrency = max(1, min(64, maxConcurrency))
+        let syncSemaphore = AsyncSemaphore(count: effectiveSyncConcurrency)
         let syncGroup = DispatchGroup()
 
         final class ActionTracker: @unchecked Sendable {

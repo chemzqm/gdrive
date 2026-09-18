@@ -1,6 +1,7 @@
 import Foundation
 import CommonCrypto
 import Logging
+import os
 
 /// Google Drive 文件及目录元数据资源模型
 public struct DriveFile: Codable, Sendable {
@@ -102,24 +103,136 @@ public struct DriveChangesPage: Codable, Sendable {
 /// - 响应字段一次性校验 (id,name,mimeType,parents,size,sha256Checksum,version)
 public final class DriveClient: Sendable {
     public let auth: Auth
+    public let rateLimiter: DriveRateLimiter
     private let session: URLSession
     private let logger = Logger(label: "gdrive.client")
 
     public static let fields = "id,name,mimeType,parents,size,sha256Checksum,version,trashed"
 
+    private struct CachedToken: Sendable {
+        let token: String
+        let expiresAt: Date
+    }
+
+    private let tokenState = OSAllocatedUnfairLock<CachedToken?>(initialState: nil)
+
     /// 创建针对高并发传输优化的专属 URLSession
     public static func makeDefaultSession() -> URLSession {
         let config = URLSessionConfiguration.default
-        config.httpMaximumConnectionsPerHost = 64
+        config.httpMaximumConnectionsPerHost = 128
+        config.httpShouldUsePipelining = true
         config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 300
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
         return URLSession(configuration: config)
     }
 
-    public init(auth: Auth, session: URLSession = DriveClient.makeDefaultSession()) {
+    public init(
+        auth: Auth,
+        session: URLSession = DriveClient.makeDefaultSession(),
+        rateLimiter: DriveRateLimiter = DriveRateLimiter()
+    ) {
         self.auth = auth
         self.session = session
+        self.rateLimiter = rateLimiter
+    }
+
+    /// 高并发快速获取有效 Access Token（内存原子级缓存，避免 Actor 争用）
+    public func getValidToken() async throws -> String {
+        let cached = tokenState.withLock { $0 }
+        if let cached, cached.expiresAt.timeIntervalSinceNow > 60 {
+            return cached.token
+        }
+
+        let freshToken = try await auth.token()
+        let authData = await auth.authData()
+        let exp = authData.expiresAt ?? Date(timeIntervalSinceNow: 3500)
+
+        tokenState.withLock { $0 = CachedToken(token: freshToken, expiresAt: exp) }
+        return freshToken
+    }
+
+    // MARK: - 核心执行器 (自适应限流与弹性重试)
+
+    /// 统一执行 HTTP 请求，具备平滑限流调度、全局退避协同、401 自动刷新与 429/503/403 指数退避重试
+    public func executeRequest(
+        _ request: URLRequest,
+        maxRetries: Int = 5,
+        acceptableStatusCodes: Set<Int> = Set(200..<300)
+    ) async throws -> (Data, HTTPURLResponse) {
+        var attempt = 0
+        var currentReq = request
+
+        while true {
+            attempt += 1
+            await rateLimiter.acquire()
+
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: currentReq)
+            } catch {
+                if attempt <= maxRetries {
+                    let jitter = Double.random(in: 0.1...0.5)
+                    let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
+                    await rateLimiter.reportRateLimit(retryAfter: delay)
+                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    continue
+                }
+                throw error
+            }
+
+            guard let http = response as? HTTPURLResponse else {
+                throw DriveError.invalidResponse(message: "非 HTTP 响应")
+            }
+
+            // 401 凭证过期：清空内存 Token 缓存，重新拉取有效 Token 自动重试
+            if http.statusCode == 401 && attempt <= 2 {
+                tokenState.withLock { $0 = nil }
+                let freshToken = try await getValidToken()
+                currentReq.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
+                continue
+            }
+
+            // 检查限流 (429, 503, 或 403 包含 rateLimitExceeded / userRateLimitExceeded / quotaExceeded)
+            let isRateLimit: Bool
+            var retryDelay: Double? = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+
+            if http.statusCode == 429 || http.statusCode == 503 {
+                isRateLimit = true
+            } else if http.statusCode == 403 {
+                let detail = String(decoding: data, as: UTF8.self)
+                if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") || detail.contains("quotaExceeded") {
+                    isRateLimit = true
+                    if retryDelay == nil { retryDelay = 2.0 }
+                } else {
+                    isRateLimit = false
+                }
+            } else {
+                isRateLimit = false
+            }
+
+            if isRateLimit {
+                if attempt <= maxRetries {
+                    let jitter = Double.random(in: 0.2...0.8)
+                    let backoff = min(16.0, (retryDelay ?? pow(2.0, Double(attempt))) + jitter)
+                    await rateLimiter.reportRateLimit(retryAfter: backoff)
+                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    continue
+                }
+                throw DriveError.rateLimited(retryAfter: retryDelay)
+            }
+
+            // 遇到 409（通常作为业务已存在核验）或 308（Resumable 分块未完成），直接返回供上层处理
+            if http.statusCode == 409 || http.statusCode == 308 || acceptableStatusCodes.contains(http.statusCode) {
+                await rateLimiter.reportSuccess()
+                return (data, http)
+            }
+
+            // 其他 HTTP 错误状态
+            let detail = String(decoding: data, as: UTF8.self)
+            throw DriveError.serverError(statusCode: http.statusCode, message: detail)
+        }
     }
 
     // MARK: - 预分配 ID
@@ -131,7 +244,7 @@ public final class DriveClient: Sendable {
 
         while remaining > 0 {
             let batch = min(remaining, 1000)
-            let token = try await auth.token()
+            let token = try await getValidToken()
             var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/generateIds")!
             components.queryItems = [
                 URLQueryItem(name: "count", value: String(batch)),
@@ -144,8 +257,7 @@ public final class DriveClient: Sendable {
             var req = URLRequest(url: url)
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-            let (data, response) = try await session.data(for: req)
-            try checkHTTPStatus(response: response, data: data)
+            let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
 
             struct GenerateIdsResponse: Decodable {
                 let ids: [String]
@@ -168,7 +280,7 @@ public final class DriveClient: Sendable {
         parentId: String,
         remoteId: String
     ) async throws -> DriveFile {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
         components.queryItems = [
             URLQueryItem(name: "fields", value: Self.fields)
@@ -186,17 +298,13 @@ public final class DriveClient: Sendable {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
 
         // 409 冲突：预生成 ID 重试或并发已被创建，核验证实对象
         if http.statusCode == 409 {
             return try await verifyExistingFolder(remoteId: remoteId, expectedName: name, expectedParentId: parentId)
         }
 
-        try checkHTTPStatus(response: response, data: data)
         return try JSONDecoder().decode(DriveFile.self, from: data)
     }
 
@@ -214,7 +322,7 @@ public final class DriveClient: Sendable {
         return existing
     }
 
-    // MARK: - 小文件 Multipart 上传 (≤ 8MB)
+    public static let multipartBoundary = "-------GDriveMultipartBoundary7MA4YWxkTrZu0gW"
 
     /// 使用 Multipart/related 一步上传文件（不落临时磁盘，正文直接发送并校验校验和）
     public func uploadMultipart(
@@ -225,14 +333,14 @@ public final class DriveClient: Sendable {
         content: Data,
         expectedSha256: String
     ) async throws -> DriveFile {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files")!
         components.queryItems = [
             URLQueryItem(name: "uploadType", value: "multipart"),
             URLQueryItem(name: "fields", value: Self.fields)
         ]
 
-        let boundary = "-------GDriveBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
+        let boundary = Self.multipartBoundary
         var req = URLRequest(url: components.url!)
         req.httpMethod = "POST"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -247,7 +355,7 @@ public final class DriveClient: Sendable {
 
         // 构造 multipart 请求体
         var body = Data()
-        body.reserveCapacity(content.count + 512)
+        body.reserveCapacity(content.count + metadataData.count + 256)
         body.append("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".data(using: .utf8)!)
         body.append(metadataData)
         body.append("\r\n--\(boundary)\r\nContent-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
@@ -256,10 +364,7 @@ public final class DriveClient: Sendable {
 
         req.httpBody = body
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
 
         // 409 冲突核验
         if http.statusCode == 409 {
@@ -272,7 +377,6 @@ public final class DriveClient: Sendable {
             )
         }
 
-        try checkHTTPStatus(response: response, data: data)
         let driveFile = try JSONDecoder().decode(DriveFile.self, from: data)
 
         // 校验响应中的大小与 SHA-256
@@ -319,7 +423,7 @@ public final class DriveClient: Sendable {
         content: Data,
         expectedSha256: String
     ) async throws -> DriveFile {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files/\(remoteId)")!
         components.queryItems = [
             URLQueryItem(name: "uploadType", value: "media"),
@@ -332,8 +436,7 @@ public final class DriveClient: Sendable {
         req.setValue(mimeType, forHTTPHeaderField: "Content-Type")
         req.httpBody = content
 
-        let (data, response) = try await session.data(for: req)
-        try checkHTTPStatus(response: response, data: data)
+        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
         let driveFile = try JSONDecoder().decode(DriveFile.self, from: data)
 
         // 校验响应中的大小与 SHA-256
@@ -354,7 +457,7 @@ public final class DriveClient: Sendable {
         totalBytes: Int64,
         mimeType: String = "application/octet-stream"
     ) async throws -> URL {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files/\(remoteId)")!
         components.queryItems = [
             URLQueryItem(name: "uploadType", value: "resumable"),
@@ -367,11 +470,8 @@ public final class DriveClient: Sendable {
         req.setValue(mimeType, forHTTPHeaderField: "X-Upload-Content-Type")
         req.setValue(String(totalBytes), forHTTPHeaderField: "X-Upload-Content-Length")
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
-        guard http.statusCode == 200, let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
+        guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
             let detail = String(decoding: data, as: UTF8.self)
             throw DriveError.serverError(statusCode: http.statusCode, message: "创建 Resumable 更新会话失败: \(detail)")
         }
@@ -389,7 +489,7 @@ public final class DriveClient: Sendable {
         totalBytes: Int64,
         mimeType: String = "application/octet-stream"
     ) async throws -> URL {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files")!
         components.queryItems = [
             URLQueryItem(name: "uploadType", value: "resumable"),
@@ -410,11 +510,8 @@ public final class DriveClient: Sendable {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: metadata)
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
-        guard http.statusCode == 200, let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
+        guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
             let detail = String(decoding: data, as: UTF8.self)
             throw DriveError.serverError(statusCode: http.statusCode, message: "创建 Resumable 会话失败: \(detail)")
         }
@@ -437,10 +534,7 @@ public final class DriveClient: Sendable {
         req.setValue(String(chunkData.count), forHTTPHeaderField: "Content-Length")
         req.httpBody = chunkData
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308])
 
         if http.statusCode == 308 {
             // 分块已成功接收，后续仍需继续上传
@@ -461,33 +555,23 @@ public final class DriveClient: Sendable {
         req.setValue("bytes */\(totalBytes)", forHTTPHeaderField: "Content-Range")
         req.setValue("0", forHTTPHeaderField: "Content-Length")
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
+        let (_, http) = try await executeRequest(req, acceptableStatusCodes: [308])
 
-        if http.statusCode == 308 {
-            guard let range = http.value(forHTTPHeaderField: "Range") else {
-                return 0
-            }
-            // 格式: bytes=0-4194303
-            if let lastStr = range.split(separator: "-").last, let last = Int64(lastStr) {
-                return last + 1
-            }
+        guard let range = http.value(forHTTPHeaderField: "Range") else {
             return 0
-        } else if http.statusCode == 200 || http.statusCode == 201 {
-            return totalBytes
-        } else {
-            let detail = String(decoding: data, as: UTF8.self)
-            throw DriveError.serverError(statusCode: http.statusCode, message: "查询会话状态失败: \(detail)")
         }
+        // 格式: bytes=0-4194303
+        if let lastStr = range.split(separator: "-").last, let last = Int64(lastStr) {
+            return last + 1
+        }
+        return 0
     }
 
     // MARK: - 元数据获取与核验
 
     /// 获取单个文件或目录的元数据
     public func getFile(remoteId: String) async throws -> DriveFile {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         components.queryItems = [
             URLQueryItem(name: "fields", value: Self.fields),
@@ -497,14 +581,10 @@ public final class DriveClient: Sendable {
         var req = URLRequest(url: components.url!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
-        }
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 404])
         if http.statusCode == 404 {
             throw DriveError.notFound(fileId: remoteId)
         }
-        try checkHTTPStatus(response: response, data: data)
         return try JSONDecoder().decode(DriveFile.self, from: data)
     }
 
@@ -516,7 +596,7 @@ public final class DriveClient: Sendable {
         var pageToken: String?
 
         while true {
-            let token = try await auth.token()
+            let token = try await getValidToken()
             var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
             var queryItems = [
                 URLQueryItem(name: "q", value: "'\(parentId)' in parents and trashed = false"),
@@ -533,8 +613,7 @@ public final class DriveClient: Sendable {
             var req = URLRequest(url: components.url!)
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-            let (data, response) = try await session.data(for: req)
-            try checkHTTPStatus(response: response, data: data)
+            let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
 
             struct ListFilesResponse: Decodable {
                 let nextPageToken: String?
@@ -563,7 +642,7 @@ public final class DriveClient: Sendable {
         expectedSha256: String? = nil,
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         components.queryItems = [
             URLQueryItem(name: "alt", value: "media"),
@@ -573,6 +652,7 @@ public final class DriveClient: Sendable {
         var req = URLRequest(url: components.url!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
+        await rateLimiter.acquire()
         let tempURL = destinationURL.deletingLastPathComponent()
             .appendingPathComponent(".tmp_\(UUID().uuidString)")
 
@@ -638,7 +718,7 @@ public final class DriveClient: Sendable {
 
     /// 获取当前最新起始 Changes Token
     public func getStartPageToken() async throws -> String {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/changes/startPageToken")!
         components.queryItems = [
             URLQueryItem(name: "supportsAllDrives", value: "true")
@@ -647,8 +727,7 @@ public final class DriveClient: Sendable {
         var req = URLRequest(url: components.url!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: req)
-        try checkHTTPStatus(response: response, data: data)
+        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
 
         struct StartTokenResponse: Decodable {
             let startPageToken: String
@@ -659,7 +738,7 @@ public final class DriveClient: Sendable {
 
     /// 列举自 pageToken 之后发生的所有远端变更
     public func listChanges(pageToken: String, pageSize: Int = 1000) async throws -> DriveChangesPage {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/changes")!
         components.queryItems = [
             URLQueryItem(name: "pageToken", value: pageToken),
@@ -672,9 +751,7 @@ public final class DriveClient: Sendable {
         var req = URLRequest(url: components.url!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        let (data, response) = try await session.data(for: req)
-        try checkHTTPStatus(response: response, data: data)
-
+        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
         return try JSONDecoder().decode(DriveChangesPage.self, from: data)
     }
 
@@ -688,7 +765,7 @@ public final class DriveClient: Sendable {
         addParentId: String? = nil,
         removeParentId: String? = nil
     ) async throws -> DriveFile {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         var queryItems = [
             URLQueryItem(name: "fields", value: Self.fields),
@@ -713,8 +790,7 @@ public final class DriveClient: Sendable {
         }
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: req)
-        try checkHTTPStatus(response: response, data: data)
+        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
         return try JSONDecoder().decode(DriveFile.self, from: data)
     }
 
@@ -722,7 +798,7 @@ public final class DriveClient: Sendable {
 
     /// 将远端对象移至回收站
     public func trash(remoteId: String) async throws {
-        let token = try await auth.token()
+        let token = try await getValidToken()
         let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
 
         var req = URLRequest(url: url)
@@ -733,8 +809,7 @@ public final class DriveClient: Sendable {
         let body = ["trashed": true]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await session.data(for: req)
-        try checkHTTPStatus(response: response, data: data)
+        _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
     }
 
     // MARK: - 私有辅助

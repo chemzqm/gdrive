@@ -1,4 +1,4 @@
-.PHONY: all build debug clean test bench
+.PHONY: all build debug clean test bench upload
 
 all: build
 
@@ -16,4 +16,8 @@ test:
 	swift test
 
 bench:
-	swift run gdrive-bench
+	swift run -c release gdrive-bench
+
+upload:
+	swift run -c release gdrive-upload
+
