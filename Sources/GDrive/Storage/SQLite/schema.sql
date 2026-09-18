@@ -1,139 +1,248 @@
--- GDrive SQLite state schema: one current row per path; bidirectional sync baseline.
+-- GDrive SQLite State Store Schema
+-- Conforms to v1.md and AGENTS.md requirements:
+-- - Bidirectional sync baseline with SQLite as single source of truth
+-- - Only SHA-256 for content verification and sync decision
+-- - Scanner FileIdentity (device + inode) and mtime/size cache for fast local change detection
+-- - Parent-child tree structure (parent_id + name) instead of full path blobs
+-- - B/L/R (Baseline, Local, Remote) three-party observations with dirty generation tracking
+-- - Operation intent durability before remote requests
+
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE store_meta (
+-- -----------------------------------------------------------------------------
+-- Metadata / Schema Versioning
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS store_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    storage_schema INTEGER NOT NULL,
-    commit_sequence INTEGER NOT NULL CHECK (typeof(commit_sequence) = 'integer' AND commit_sequence >= 0),
-    workspace_id TEXT NOT NULL,
-    session_key_reference BLOB CHECK (session_key_reference IS NULL OR typeof(session_key_reference) = 'blob')
+    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
 
-CREATE TABLE file_state (
-    file_id INTEGER PRIMARY KEY, -- Internal lookup only; path uniqueness is below.
-    job_id TEXT NOT NULL,
-    binding_id TEXT NOT NULL,
-    path_key BLOB NOT NULL CHECK (typeof(path_key) = 'blob' AND length(path_key) > 1 AND substr(path_key, 1, 1) <> x'00' AND
-        instr(path_key, x'0000') = 0 AND substr(path_key, -1) = x'00'),
-    -- NUL-terminated canonical UTF-8 components, never a hash; root parent = x''.
-    parent_path_key BLOB NOT NULL CHECK (typeof(parent_path_key) = 'blob'),
-    relative_components BLOB NOT NULL,
+-- -----------------------------------------------------------------------------
+-- Roots: Synchronized Directory Pairs
+-- Represents binding between a local directory and a Google Drive folder.
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS roots (
+    root_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id TEXT NOT NULL,
+    local_root_path TEXT NOT NULL UNIQUE,
+    local_root_device INTEGER NOT NULL,
+    local_root_inode INTEGER NOT NULL,
+    remote_root_id TEXT NOT NULL,
+    initial_sync_direction TEXT NOT NULL CHECK (initial_sync_direction IN ('localToRemoteEmpty', 'remoteToLocalEmpty')),
+    binding_generation INTEGER NOT NULL DEFAULT 1 CHECK (binding_generation >= 1),
+    filter_version INTEGER NOT NULL DEFAULT 1 CHECK (filter_version >= 1),
+    bootstrap_state TEXT NOT NULL CHECK (bootstrap_state IN ('freshCreated', 'existingKnown', 'unknownOrLost')),
+    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (account_id, remote_root_id)
+);
+
+-- -----------------------------------------------------------------------------
+-- Items: File & Directory State Baseline and Observations
+-- Uses parent_id + name hierarchy; paths are reconstructed on-demand from parent edges.
+-- Stores Baseline (B), Local Observation (L), and Remote Observation (R).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    parent_id INTEGER REFERENCES items(item_id) ON DELETE RESTRICT,
+    name TEXT NOT NULL CHECK (length(name) > 0 AND instr(name, '/') = 0),
     entry_kind TEXT NOT NULL CHECK (entry_kind IN ('file', 'directory')),
-    phase TEXT NOT NULL CHECK (phase IN (
-        'idle', 'preparing', 'transferring', 'verifying', 'conflict',
-        'needsReconciliation', 'paused', 'canceled', 'failed'
+
+    -- Remote identity in Google Drive (folder ID or file ID)
+    remote_file_id TEXT,
+
+    -- Local filesystem identity from DirectoryScanner (dev_t + ino_t)
+    local_device INTEGER,
+    local_inode INTEGER,
+
+    -- Local metadata cache for fast change detection (§6.2)
+    -- local_mtime: nanoseconds since epoch (sec * 1_000_000_000 + nsec)
+    local_mtime INTEGER,
+    local_size INTEGER CHECK (local_size IS NULL OR local_size >= 0),
+
+    -- Baseline (B): Agreed synchronized state
+    base_sha256 TEXT CHECK (base_sha256 IS NULL OR length(base_sha256) = 64),
+    base_size INTEGER CHECK (base_size IS NULL OR base_size >= 0),
+    base_version INTEGER CHECK (base_version IS NULL OR base_version >= 0),
+    base_parent_id INTEGER REFERENCES items(item_id),
+    base_name TEXT,
+
+    -- Local Observation (L)
+    local_sha256 TEXT CHECK (local_sha256 IS NULL OR length(local_sha256) = 64),
+    local_generation INTEGER NOT NULL DEFAULT 0 CHECK (local_generation >= 0),
+    local_status TEXT NOT NULL DEFAULT 'unknown' CHECK (local_status IN ('present', 'absent', 'unstable', 'unknown')),
+
+    -- Remote Observation (R)
+    remote_sha256 TEXT CHECK (remote_sha256 IS NULL OR length(remote_sha256) = 64),
+    remote_size INTEGER CHECK (remote_size IS NULL OR remote_size >= 0),
+    remote_version INTEGER CHECK (remote_version IS NULL OR remote_version >= 0),
+    remote_parent_file_id TEXT,
+    remote_name TEXT,
+    remote_generation INTEGER NOT NULL DEFAULT 0 CHECK (remote_generation >= 0),
+    remote_status TEXT NOT NULL DEFAULT 'unknown' CHECK (remote_status IN ('present', 'trashed', 'absent', 'unknown')),
+
+    -- Lifecycle & Scheduling Phase (§10.1)
+    phase TEXT NOT NULL DEFAULT 'discovered' CHECK (phase IN (
+        'discovered', 'waitingEvidence', 'waitingParent', 'waitingInput',
+        'ready', 'inFlight', 'verify', 'unknownOutcome',
+        'committed', 'conflict', 'blocked'
     )),
-    run_id TEXT,
-    plan_id TEXT,
-    operation_id TEXT,
-    transfer_id TEXT,
-    direction TEXT CHECK (direction IN ('upload', 'download')),
-    attempt_epoch INTEGER NOT NULL DEFAULT 0 CHECK (attempt_epoch >= 0),
-    confirmed_offset INTEGER NOT NULL DEFAULT 0 CHECK (typeof(confirmed_offset) = 'integer' AND confirmed_offset >= 0),
-    transfer_size INTEGER CHECK (transfer_size IS NULL OR (typeof(transfer_size) = 'integer' AND transfer_size >= 0)),
-    -- Source/target identities, checksums, source version and current intent.
-    evidence BLOB NOT NULL CHECK (typeof(evidence) = 'blob' AND length(evidence) <= 2048),
-    remote_object_id TEXT CHECK (remote_object_id IS NULL OR (typeof(remote_object_id) = 'text' AND length(remote_object_id) > 0)),
-    -- Sealed snapshot/download partial metadata and authenticated session ciphertext, never plaintext URI.
-    transfer_context BLOB CHECK (transfer_context IS NULL OR
-        (typeof(transfer_context) = 'blob' AND length(transfer_context) <= 16384)),
-    -- Explicit conflict choice for this attempt; never a persistent force mode.
-    resolution TEXT CHECK (resolution IN ('localToRemote', 'remoteToLocal', 'merge')),
-    resolution_token TEXT,
-    merge_target TEXT CHECK (merge_target IN ('local', 'remote', 'both')),
-    queue_session_id TEXT,
-    queue_state TEXT NOT NULL DEFAULT 'none' CHECK (queue_state IN ('none', 'checking', 'queued', 'running', 'stopping', 'reconciling', 'blocked')),
-    desired_revision INTEGER NOT NULL DEFAULT 0 CHECK (desired_revision >= 0),
-    desired_action TEXT NOT NULL DEFAULT 'none' CHECK (desired_action IN ('none', 'recheck', 'upsert', 'absent')),
-    active_revision INTEGER NOT NULL DEFAULT 0 CHECK (active_revision >= 0),
-    payload_schema INTEGER NOT NULL CHECK (typeof(payload_schema) = 'integer' AND payload_schema > 0),
-    row_version INTEGER NOT NULL CHECK (typeof(row_version) = 'integer' AND row_version >= 1),
+    dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK (dirty_generation >= 0),
+    is_tombstone INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstone IN (0, 1)),
+    tombstone_generation INTEGER CHECK (tombstone_generation IS NULL OR tombstone_generation >= 0),
+
+    -- Conflict resolution tracking (§11.3)
+    conflict_id TEXT,
+    conflict_winner TEXT CHECK (conflict_winner IS NULL OR conflict_winner IN ('local', 'remote')),
+
+    created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    UNIQUE (job_id, binding_id, path_key),
-    CHECK (length(parent_path_key) = 0 OR substr(parent_path_key, -1) = x'00'),
-    CHECK (length(path_key) > length(parent_path_key) + 1 AND
-           substr(path_key, 1, length(parent_path_key)) = parent_path_key AND
-           instr(substr(path_key, length(parent_path_key) + 1), x'00') = length(path_key) - length(parent_path_key)),
-    CHECK ((transfer_size IS NULL AND confirmed_offset = 0) OR
-           (transfer_size IS NOT NULL AND confirmed_offset <= transfer_size)),
-    CHECK ((resolution IS NULL) = (resolution_token IS NULL)),
-    CHECK ((resolution IS 'merge') = (merge_target IS NOT NULL)),
-    CHECK (resolution IS NOT 'localToRemote' OR direction IS 'upload'),
-    CHECK (resolution IS NOT 'remoteToLocal' OR direction IS 'download'),
-    CHECK (transfer_id IS NULL OR
-           (entry_kind = 'file' AND direction IS NOT NULL AND attempt_epoch > 0)),
-    CHECK (phase <> 'transferring' OR
-           (transfer_id IS NOT NULL AND transfer_context IS NOT NULL AND transfer_size IS NOT NULL)),
-    -- Idle rows retain no active operation, selected conflict or old transfer evidence.
-    CHECK (phase <> 'idle' OR
-           (run_id IS NULL AND plan_id IS NULL AND operation_id IS NULL AND
-            transfer_id IS NULL AND direction IS NULL AND confirmed_offset = 0 AND
-            transfer_size IS NULL AND transfer_context IS NULL AND resolution IS NULL)),
-    CHECK (entry_kind <> 'directory' OR
-           (transfer_id IS NULL AND transfer_context IS NULL AND confirmed_offset = 0 AND
-            transfer_size IS NULL AND resolution IS NOT 'merge')),
-    CHECK (desired_revision >= active_revision)
+
+    CHECK (parent_id IS NOT NULL OR entry_kind = 'directory')
 );
 
-CREATE UNIQUE INDEX file_active_transfer ON file_state(transfer_id) WHERE transfer_id IS NOT NULL;
-CREATE UNIQUE INDEX file_remote_object ON file_state(job_id, binding_id, remote_object_id) WHERE remote_object_id IS NOT NULL;
-CREATE INDEX file_job_phase ON file_state(job_id, binding_id, phase);
-CREATE INDEX file_children ON file_state(job_id, binding_id, parent_path_key);
-CREATE INDEX file_run ON file_state(run_id, operation_id) WHERE run_id IS NOT NULL;
-CREATE INDEX file_plan ON file_state(plan_id, operation_id) WHERE plan_id IS NOT NULL;
-CREATE INDEX file_queue_session ON file_state(queue_session_id, queue_state) WHERE queue_session_id IS NOT NULL;
+-- Unique non-tombstone name under the same parent
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_parent_name
+    ON items(root_id, parent_id, name)
+    WHERE is_tombstone = 0 AND parent_id IS NOT NULL;
 
--- Task records for workspace/job/run-level objects.
-CREATE TABLE task_records (
-    record_key TEXT PRIMARY KEY NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN (
-        'registry', 'plan', 'permit', 'run', 'request', 'policy',
-        'initialization', 'directory-transaction', 'change-hint',
-        'dynamic-upload-session', 'mirror-index'
+-- Single root entry per synchronized pair
+CREATE UNIQUE INDEX IF NOT EXISTS idx_items_root_entry
+    ON items(root_id)
+    WHERE parent_id IS NULL AND is_tombstone = 0;
+
+-- Fast lookup by remote Drive fileId
+CREATE INDEX IF NOT EXISTS idx_items_remote_file_id
+    ON items(root_id, remote_file_id)
+    WHERE remote_file_id IS NOT NULL AND is_tombstone = 0;
+
+-- Fast lookup by local inode identity during scanner walk (§6.2)
+CREATE INDEX IF NOT EXISTS idx_items_local_identity
+    ON items(root_id, local_device, local_inode)
+    WHERE local_inode IS NOT NULL AND is_tombstone = 0;
+
+-- Dirty items query for scheduler/reconciler
+CREATE INDEX IF NOT EXISTS idx_items_dirty
+    ON items(root_id, dirty_generation)
+    WHERE dirty_generation > 0;
+
+-- Scheduling phase query
+CREATE INDEX IF NOT EXISTS idx_items_phase
+    ON items(root_id, phase);
+
+-- Child dependency query when parent directory becomes confirmed/ready (§4.3)
+CREATE INDEX IF NOT EXISTS idx_items_parent_id
+    ON items(root_id, parent_id);
+
+-- -----------------------------------------------------------------------------
+-- Operations: In-Flight and Durable Intent Records
+-- Intent must be committed before network requests are dispatched (§4.1, §5).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS operations (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
+    operation_type TEXT NOT NULL CHECK (operation_type IN (
+        'createDirectory', 'uploadMultipart', 'uploadResumable',
+        'download', 'move', 'rename', 'trashRemote', 'deleteLocal'
     )),
-    job_id TEXT,
-    plan_id TEXT,
-    is_pending INTEGER NOT NULL CHECK (is_pending IN (0, 1)),
-    recorded_at REAL,
-    row_version INTEGER NOT NULL CHECK (typeof(row_version) = 'integer' AND row_version >= 1),
-    payload_schema INTEGER NOT NULL CHECK (typeof(payload_schema) = 'integer' AND payload_schema > 0),
-    payload BLOB NOT NULL,
-    CHECK (kind <> 'mirror-index' OR (typeof(payload) = 'blob' AND length(payload) <= 4096 AND is_pending = 0 AND plan_id IS NULL AND job_id IS NOT NULL))
+    state TEXT NOT NULL CHECK (state IN (
+        'ready', 'inFlight', 'verify', 'unknownOutcome',
+        'completed', 'failed', 'cancelled'
+    )),
+    expected_local_generation INTEGER NOT NULL DEFAULT 0 CHECK (expected_local_generation >= 0),
+    expected_remote_version INTEGER CHECK (expected_remote_version IS NULL OR expected_remote_version >= 0),
+    expected_sha256 TEXT CHECK (expected_sha256 IS NULL OR length(expected_sha256) = 64),
+    target_remote_id TEXT,
+    target_parent_remote_id TEXT,
+    session_uri TEXT,
+    confirmed_offset INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_offset >= 0),
+    total_bytes INTEGER CHECK (total_bytes IS NULL OR total_bytes >= 0),
+    staging_path TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_error_code TEXT,
+    last_error_message TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
-CREATE INDEX task_job ON task_records(job_id, kind, record_key);
-CREATE INDEX task_pending ON task_records(job_id, kind, record_key) WHERE is_pending = 1;
-CREATE INDEX task_plan ON task_records(plan_id, kind, record_key) WHERE plan_id IS NOT NULL;
 
--- Per-operation run progress
-CREATE TABLE plan_operation_state (
-    plan_id TEXT NOT NULL,
-    operation_id TEXT NOT NULL,
-    job_id TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('completed')),
-    row_version INTEGER NOT NULL CHECK (typeof(row_version) = 'integer' AND row_version >= 1),
+CREATE INDEX IF NOT EXISTS idx_operations_item
+    ON operations(item_id);
+
+CREATE INDEX IF NOT EXISTS idx_operations_root_state
+    ON operations(root_id, state);
+
+CREATE INDEX IF NOT EXISTS idx_operations_target_remote
+    ON operations(target_remote_id)
+    WHERE target_remote_id IS NOT NULL;
+
+-- -----------------------------------------------------------------------------
+-- Directory Observations: Remote/Local Directory Scan Evidence
+-- Tracks pagination tokens, completeness, and proof of emptiness/enumeration (§9.3, §10.3).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS directory_observations (
+    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    item_id INTEGER REFERENCES items(item_id) ON DELETE CASCADE,
+    remote_folder_id TEXT NOT NULL,
+    local_scan_generation INTEGER NOT NULL DEFAULT 0 CHECK (local_scan_generation >= 0),
+    remote_scan_generation INTEGER NOT NULL DEFAULT 0 CHECK (remote_scan_generation >= 0),
+    next_page_token TEXT,
+    listing_status TEXT NOT NULL CHECK (listing_status IN (
+        'unscanned', 'inProgress', 'complete', 'unknownOrIncomplete'
+    )),
+    child_count INTEGER NOT NULL DEFAULT 0 CHECK (child_count >= 0),
+    evidence_status TEXT NOT NULL DEFAULT 'none' CHECK (evidence_status IN (
+        'none', 'emptyConfirmed', 'childrenEnumerated', 'pageIncomplete', 'accessDenied', 'notFound'
+    )),
+    evidence_summary TEXT,
     updated_at REAL NOT NULL,
-    PRIMARY KEY (plan_id, operation_id)
+    UNIQUE (root_id, remote_folder_id)
 );
-CREATE INDEX plan_operation_job ON plan_operation_state(job_id, plan_id);
 
--- Cleanup queue for transient/publication files
-CREATE TABLE cleanup_queue (
+CREATE INDEX IF NOT EXISTS idx_dir_obs_item
+    ON directory_observations(item_id);
+
+CREATE INDEX IF NOT EXISTS idx_dir_obs_status
+    ON directory_observations(root_id, listing_status);
+
+-- -----------------------------------------------------------------------------
+-- Cursors: Change Feed & Event Cursors
+-- Tracks Google Drive Changes token (C0...) and local FSEvents stream IDs (§3.3, §9.4, §10.3).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cursors (
+    cursor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    account_id TEXT NOT NULL,
+    cursor_kind TEXT NOT NULL CHECK (cursor_kind IN ('drive_changes', 'local_fsevents')),
+    token_value TEXT NOT NULL,
+    is_valid INTEGER NOT NULL DEFAULT 1 CHECK (is_valid IN (0, 1)),
+    last_event_at REAL,
+    updated_at REAL NOT NULL,
+    UNIQUE (root_id, cursor_kind)
+);
+
+-- -----------------------------------------------------------------------------
+-- Cleanup Queue: Staging Files and Transient Publication Cleanup
+-- Recycles staging files and canceled upload sessions after recovery check (§9.6, §10.5).
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS cleanup_queue (
     cleanup_id TEXT PRIMARY KEY NOT NULL,
-    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('temporaryFile', 'publicationFile')),
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('stagingFile', 'publicationFile', 'resumableSession')),
     resource_locator TEXT NOT NULL CHECK (length(resource_locator) > 0),
-    retired_commit_sequence INTEGER NOT NULL CHECK (typeof(retired_commit_sequence) = 'integer' AND retired_commit_sequence >= 0),
-    owner_job_id TEXT NOT NULL,
-    owner_binding_id TEXT NOT NULL,
-    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'blocked')),
-    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (typeof(retry_count) = 'integer' AND retry_count >= 0),
-    last_attempt_at REAL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'cleaning', 'completed', 'failed')),
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
     next_attempt_at REAL NOT NULL DEFAULT 0,
-    last_error_code TEXT CHECK (last_error_code IS NULL OR (
-        typeof(last_error_code) = 'text' AND length(last_error_code) <= 64 AND
-        last_error_code IN ('io', 'permission', 'credentialLocked', 'identityMismatch',
-                           'invalidPath', 'diskFull', 'unsupported', 'unknown')
-    )),
-    UNIQUE (resource_kind, resource_locator)
+    last_error TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 );
-CREATE INDEX cleanup_owner ON cleanup_queue(owner_job_id, owner_binding_id);
-CREATE INDEX cleanup_due ON cleanup_queue(next_attempt_at, cleanup_id) WHERE state = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_cleanup_due
+    ON cleanup_queue(state, next_attempt_at)
+    WHERE state = 'pending';
