@@ -86,8 +86,9 @@ public enum ReconcileDecision: Sendable, Equatable {
 }
 
 /// 三方状态协调决策引擎（Reconciler）
-/// 遵循 v1.md §9.1 核心状态决策规范：
-/// 以共同基线 B、本地观察 L、远端观察 R 进行无偏逐项比对，mtime 不决定谁覆盖谁
+/// 遵循 v1.md §9.1 核心状态决策规范及 A02 审计规范：
+/// 以共同基线 B、本地观察 L、远端观察 R 进行无偏逐项比对，mtime 不决定谁覆盖谁。
+/// 严格保证“存在性证据”与“内容证据”完备性：拒绝任何单侧 unknown 或缺少 SHA-256 摘要的无证据删除、覆盖决策。
 public struct Reconciler: Sendable {
     public static func decide(
         baseline: ItemBaseline?,
@@ -97,26 +98,45 @@ public struct Reconciler: Sendable {
         let localStatus = local?.status ?? .unknown
         let remoteStatus = remote?.status ?? .unknown
 
-        // 1. 任一侧状态不明或不稳定
+        // 1. 本地状态处于写入不稳定中，等待写入稳定
         if localStatus == .unstable {
             return .waitingEvidence(reason: "本地文件正文不稳定，正在写入")
         }
+
+        // 2. 任一侧状态未知 (unknown)：绝不把 unknown 当作未变化
         if localStatus == .unknown && remoteStatus == .unknown {
             return .waitingEvidence(reason: "两端观察状态未知")
+        }
+        if localStatus == .unknown {
+            return .waitingEvidence(reason: "本地观察状态未知，拒绝无证据决策")
+        }
+        if remoteStatus == .unknown {
+            return .waitingEvidence(reason: "远端观察状态未知，拒绝无证据决策")
+        }
+
+        // 3. 内容证据完备性检查：只要一侧状态为 present，必须具备有效 SHA-256 摘要证据
+        if localStatus == .present && (local?.sha256 == nil || local?.sha256?.isEmpty == true) {
+            return .waitingEvidence(reason: "本地文件正文 SHA-256 待获取")
+        }
+        if remoteStatus == .present && (remote?.sha256 == nil || remote?.sha256?.isEmpty == true) {
+            return .waitingEvidence(reason: "远端文件正文 SHA-256 待获取")
         }
 
         let baseSha = baseline?.sha256?.lowercased()
         let localSha = local?.sha256?.lowercased()
         let remoteSha = remote?.sha256?.lowercased()
 
-        // 2. 无共同基线 B（初次同步或新创文件）
+        // 4. 无共同基线 B（初次同步或新创文件）
         guard let baseSha else {
-            if localStatus == .present && (remoteStatus == .absent || remoteStatus == .unknown) {
+            // 本地存在，且远端已明确确认不存在 (absent)
+            if localStatus == .present && remoteStatus == .absent {
                 return .upload(reason: "本地新文件")
             }
-            if remoteStatus == .present && (localStatus == .absent || localStatus == .unknown) {
+            // 远端存在，且本地已明确确认不存在 (absent)
+            if remoteStatus == .present && localStatus == .absent {
                 return .download(reason: "远端新文件")
             }
+            // 双方皆存在但未有基线
             if localStatus == .present && remoteStatus == .present {
                 if let localSha, let remoteSha, localSha == remoteSha {
                     return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
@@ -125,47 +145,69 @@ public struct Reconciler: Sendable {
                     return .conflict(winner: .remote, conflictId: String(conflictId))
                 }
             }
-            return .unchanged
+            // 本地与远端皆不存在
+            if localStatus == .absent && remoteStatus == .absent {
+                return .unchanged
+            }
+            // 远端在回收站，本地不存在
+            if localStatus == .absent && remoteStatus == .trashed {
+                return .unchanged
+            }
+            // 远端在回收站，本地有新文件
+            if localStatus == .present && remoteStatus == .trashed {
+                return .keepModified(preferLocal: true)
+            }
+            return .waitingEvidence(reason: "无基线且状态未满足明确创建条件")
         }
 
-        // 3. 有共同基线 B：计算两端相对基线的变更状态
+        // 5. 有共同基线 B：计算两端相对基线的变更状态
+        // 此时由于前置完备性检查，present 状态下的 localSha 和 remoteSha 必然非空
         let localChanged = (localStatus == .present && localSha != baseSha)
         let remoteChanged = (remoteStatus == .present && remoteSha != baseSha)
+        let localUnchanged = (localStatus == .present && localSha == baseSha)
+        let remoteUnchanged = (remoteStatus == .present && remoteSha == baseSha)
+
         let localDeleted = (localStatus == .absent)
         let remoteDeleted = (remoteStatus == .absent || remoteStatus == .trashed)
 
-        // 3.1 删除场景
-        if localDeleted && !remoteDeleted {
-            if remoteChanged {
-                // 本地删除了，但远端又有了新的修改 -> 保留修改版本
-                return .keepModified(preferLocal: false)
-            } else {
-                // 本地删除，远端未变 -> 传播至远端回收站
-                return .trashRemote
-            }
-        }
-
-        if remoteDeleted && !localDeleted {
-            if localChanged {
-                // 远端删除了，但本地有了新的修改 -> 保留修改版本
-                return .keepModified(preferLocal: true)
-            } else {
-                // 远端删除，本地未变 -> 本地可恢复移除
-                return .deleteLocal
-            }
-        }
-
+        // 5.1 双端皆删除
         if localDeleted && remoteDeleted {
             return .unchanged
         }
 
-        // 3.2 内容变更场景
-        if localChanged && !remoteChanged {
+        // 5.2 本地已删除，远端未删除
+        if localDeleted && !remoteDeleted {
+            if remoteChanged {
+                // 本地删除了，但远端又有新修改 -> 保留修改版本
+                return .keepModified(preferLocal: false)
+            } else if remoteUnchanged {
+                // 本地删除，远端确认未变 -> 安全移入远端回收站
+                return .trashRemote
+            }
+        }
+
+        // 5.3 远端已删除，本地未删除
+        if remoteDeleted && !localDeleted {
+            if localChanged {
+                // 远端删除了，但本地又有新修改 -> 保留修改版本
+                return .keepModified(preferLocal: true)
+            } else if localUnchanged {
+                // 远端删除，本地确认未变 -> 安全删除本地文件
+                return .deleteLocal
+            }
+        }
+
+        // 5.4 内容变更场景
+        if localChanged && remoteUnchanged {
             return .upload(reason: "仅本地内容更新")
         }
 
-        if remoteChanged && !localChanged {
+        if remoteChanged && localUnchanged {
             return .download(reason: "仅远端内容更新")
+        }
+
+        if localUnchanged && remoteUnchanged {
+            return .unchanged
         }
 
         if localChanged && remoteChanged {
@@ -177,6 +219,6 @@ public struct Reconciler: Sendable {
             }
         }
 
-        return .unchanged
+        return .waitingEvidence(reason: "状态证据不满足任何明确决策路径")
     }
 }
