@@ -19,6 +19,33 @@ public struct SyncStats: Sendable {
     public var elapsedSeconds: Double = 0
 }
 
+/// SyncEngine 异常类型定义
+public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
+    case localRootNotFound(path: String)
+    case remoteRootLost(remoteId: String, reason: String)
+    case rootNotConfigured(remoteId: String)
+    case invalidDirectory(path: String)
+    case general(String)
+
+    public var errorDescription: String? {
+        description
+    }
+
+    public var description: String {
+        switch self {
+        case .localRootNotFound(let path):
+            return "本地同步根目录已不存在或不是有效目录: \(path)，已终止同步以保护云端文件不被扩散删除"
+        case .remoteRootLost(let remoteId, let reason):
+            return "远端同步根目录已被移除或移入回收站 (\(reason)): \(remoteId)，已终止同步以保护本地文件不被扩散删除"
+        case .rootNotConfigured(let remoteId):
+            return "未找到对应的同步根，请先执行初始化同步: \(remoteId)"
+        case .invalidDirectory(let path):
+            return "路径不是有效目录: \(path)"
+        case .general(let msg):
+            return msg
+        }
+    }
+}
 
 /// GDrive 核心同步引擎
 /// 遵循 v1.md 与 AGENTS.md 规范：
@@ -108,6 +135,9 @@ public final class SyncEngine: Sendable {
 
         // 探测远端目录：验证存在、是否为目录、是否包含非回收站子项
         let remoteFile = try await client.getFile(remoteId: remoteFolderId)
+        guard remoteFile.trashed != true else {
+            throw SyncEngineError.remoteRootLost(remoteId: remoteFolderId, reason: "trashed")
+        }
         guard remoteFile.isDirectory else {
             throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteFolderId)"])
         }
@@ -1323,6 +1353,46 @@ public final class SyncEngine: Sendable {
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
         let now = Date().timeIntervalSince1970
 
+        // -------------------------------------------------------------
+        // 0. 根目录防扩散安全校验 (§7.2, §9.1)
+        // -------------------------------------------------------------
+        // A. 本地根目录校验：若本地根目录消失，严禁做删除扩散，立即报错终止
+        var isDir: ObjCBool = false
+        let localExists = FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir)
+        guard localExists && isDir.boolValue else {
+            logger.error("[Sync] 本地同步根目录已不存在或不是有效目录: \(resolvedLocalPath)，终止同步以保护云端文件")
+            throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
+        }
+
+        // B. 远端根目录校验：若远端根目录被移入回收站或彻底删除，严禁做删除扩散，立即报错终止
+        let remoteRoot: DriveFile
+        do {
+            remoteRoot = try await client.getFile(remoteId: remoteRootId)
+        } catch let error as DriveError {
+            switch error {
+            case .notFound:
+                logger.error("[Sync] 远端同步根目录不存在 (404): \(remoteRootId)，终止同步以保护本地文件")
+                throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notFound")
+            default:
+                throw error
+            }
+        } catch {
+            let nsError = error as NSError
+            if (nsError.domain == "SyncEngine" || nsError.domain == "DriveError") && nsError.code == 404 {
+                logger.error("[Sync] 远端同步根目录不存在 (404): \(remoteRootId)，终止同步以保护本地文件")
+                throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notFound")
+            }
+            throw error
+        }
+
+        if remoteRoot.trashed == true {
+            logger.error("[Sync] 远端同步根目录已被移入回收站 (trashed): \(remoteRootId)，终止同步以保护本地文件")
+            throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "trashed")
+        }
+        guard remoteRoot.isDirectory else {
+            logger.error("[Sync] 远端同步根目录不是有效目录: \(remoteRootId)，终止同步以保护本地文件")
+            throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notDirectory")
+        }
 
         // -------------------------------------------------------------
         // 1. 构建目录拓扑映射 (在内存中快速维护，O(1) 路径与父项解析)
@@ -1450,6 +1520,15 @@ public final class SyncEngine: Sendable {
                     let page = try await client.listChanges(pageToken: activeToken)
                     for change in page.changes {
                         let fileId = change.fileId
+                        if fileId == remoteRootId {
+                            if change.file?.trashed == true || change.removed == true {
+                                let reason = change.removed == true ? "removed" : "trashed"
+                                self.logger.error("增量变更检测到远端同步根目录被移除或移入回收站 (\(reason)): \(fileId)，终止同步以保护本地文件")
+                                throw SyncEngineError.remoteRootLost(remoteId: fileId, reason: reason)
+                            }
+                            // 远端根目录自身的普通元数据更新无需作为子项处理
+                            continue
+                        }
                         if change.file?.trashed == true {
                             // 远端明确移入回收站
                             try await store.batchWrite { conn in
@@ -1649,6 +1728,8 @@ public final class SyncEngine: Sendable {
                         hasMorePages = false
                         latestNewStartToken = page.newStartPageToken
                     }
+                } catch let error as SyncEngineError {
+                    throw error
                 } catch {
                     self.logger.warning("获取 Changes 失败: \(error)")
                     hasMorePages = false
@@ -2007,6 +2088,13 @@ public final class SyncEngine: Sendable {
         }
 
         // 识别本地已删除的文件与目录 (§9.1)
+        // 再次核验本地根目录是否存在，避免在扫描期间本地目录被移除导致全部误判 absent 扩散删除
+        var isStillDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isStillDir), isStillDir.boolValue else {
+            logger.error("[Sync] 本地同步根目录在扫描期间消失: \(resolvedLocalPath)，终止同步以保护云端文件")
+            throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
+        }
+
         try await store.write { conn in
             // 1. 文件删除检测
             let stmt = try conn.cachedStatement("""
