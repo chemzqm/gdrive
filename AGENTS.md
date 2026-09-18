@@ -2,9 +2,7 @@
 
 核心原则如下：
 * 以 sqlite 数据库做为同步基线，远程和本地都与数据库比对来判定文件变化
-* 仅支持本地目录到远程空目录同步和远程目录到本地空目录同步
 * 效率优先，最大效率的并发方式实现上传和文件数据比对
 * 仅计算文件 sha256，以文件 sha256 变化做为判断文件是否需要同步唯一依据
-* 使用 使用 /Users/chemzqm/lib/scanner 实现高并发文件扫描
-* 需要支持文件续传，但仅支持大于 8MB 的文件续传
-* google driver 支持本地 file id，先调用 Google Drive 的 files.generateIds 批量拿到一批服务器认可的 ID，然后客户端本地缓存使用
+
+各 Swift 核心模块的架构设计与详细实现规范参见 [docs/design.md](docs/design.md)。
