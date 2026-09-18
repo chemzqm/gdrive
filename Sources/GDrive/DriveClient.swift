@@ -796,7 +796,6 @@ public final class DriveClient: Sendable {
 
     // MARK: - 回收站操作 (Trash)
 
-    /// 将远端对象移至回收站
     public func trash(remoteId: String) async throws {
         let token = try await getValidToken()
         let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
@@ -807,6 +806,22 @@ public final class DriveClient: Sendable {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let body = ["trashed": true]
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
+    }
+
+    /// 将远端对象移出回收站 (恢复)
+    public func untrash(remoteId: String) async throws {
+        let token = try await getValidToken()
+        let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "PATCH"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let body = ["trashed": false]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
