@@ -19,6 +19,7 @@ public struct SyncStats: Sendable {
     public var elapsedSeconds: Double = 0
 }
 
+
 /// GDrive 核心同步引擎
 /// 遵循 v1.md 与 AGENTS.md 规范：
 /// - 仅支持本地目录到远程空目录同步 (localToRemoteEmpty) 和远程目录到本地空目录同步 (remoteToLocalEmpty)
@@ -552,12 +553,14 @@ public final class SyncEngine: Sendable {
                                             root_id, parent_id, name, entry_kind, remote_file_id,
                                             local_device, local_inode, local_mtime, local_size, local_sha256,
                                             base_sha256, base_size,
+                                            remote_sha256, remote_size, remote_status,
                                             local_generation, local_status, phase, dirty_generation,
                                             created_at, updated_at
                                         ) VALUES (
                                             ?, ?, ?, 'file', ?,
                                             ?, ?, ?, ?, ?,
                                             ?, ?,
+                                            ?, ?, 'present',
                                             1, 'present', 'committed', 0,
                                             ?, ?
                                         )
@@ -571,6 +574,9 @@ public final class SyncEngine: Sendable {
                                             local_sha256 = excluded.local_sha256,
                                             base_sha256 = excluded.base_sha256,
                                             base_size = excluded.base_size,
+                                            remote_sha256 = excluded.remote_sha256,
+                                            remote_size = excluded.remote_size,
+                                            remote_status = 'present',
                                             phase = 'committed',
                                             dirty_generation = 0,
                                             updated_at = excluded.updated_at;
@@ -586,9 +592,11 @@ public final class SyncEngine: Sendable {
                                         itemStmt.bindText(sha256Hex, at: 9)
                                         itemStmt.bindText(sha256Hex, at: 10)
                                         itemStmt.bindInt64(fileSize, at: 11)
+                                        itemStmt.bindText(sha256Hex, at: 12)
+                                        itemStmt.bindInt64(fileSize, at: 13)
                                         let ts = Date().timeIntervalSince1970
-                                        itemStmt.bindDouble(ts, at: 12)
-                                        itemStmt.bindDouble(ts, at: 13)
+                                        itemStmt.bindDouble(ts, at: 14)
+                                        itemStmt.bindDouble(ts, at: 15)
                                         _ = try itemStmt.step()
                                         itemStmt.reset()
                                     }
@@ -667,6 +675,9 @@ public final class SyncEngine: Sendable {
                                         UPDATE items SET
                                             base_sha256 = ?,
                                             base_size = ?,
+                                            remote_sha256 = ?,
+                                            remote_size = ?,
+                                            remote_status = 'present',
                                             phase = 'committed',
                                             dirty_generation = 0,
                                             updated_at = ?
@@ -674,9 +685,11 @@ public final class SyncEngine: Sendable {
                                         """)
                                         updateStmt.bindText(sha256Hex, at: 1)
                                         updateStmt.bindInt64(fileSize, at: 2)
-                                        updateStmt.bindDouble(Date().timeIntervalSince1970, at: 3)
-                                        updateStmt.bindInt64(rootId, at: 4)
-                                        updateStmt.bindText(remoteFileId, at: 5)
+                                        updateStmt.bindText(sha256Hex, at: 3)
+                                        updateStmt.bindInt64(fileSize, at: 4)
+                                        updateStmt.bindDouble(Date().timeIntervalSince1970, at: 5)
+                                        updateStmt.bindInt64(rootId, at: 6)
+                                        updateStmt.bindText(remoteFileId, at: 7)
                                         _ = try updateStmt.step()
                                         updateStmt.reset()
                                     }
@@ -916,12 +929,14 @@ public final class SyncEngine: Sendable {
                                     root_id, parent_id, name, entry_kind, remote_file_id,
                                     local_mtime, local_size, local_sha256,
                                     base_sha256, base_size,
+                                    remote_sha256, remote_size, remote_status,
                                     local_generation, local_status, phase,
                                     created_at, updated_at
                                 ) VALUES (
                                     ?, ?, ?, 'file', ?,
                                     ?, ?, ?,
                                     ?, ?,
+                                    ?, ?, 'present',
                                     1, 'present', 'committed',
                                     ?, ?
                                 )
@@ -933,6 +948,9 @@ public final class SyncEngine: Sendable {
                                     local_sha256 = excluded.local_sha256,
                                     base_sha256 = excluded.base_sha256,
                                     base_size = excluded.base_size,
+                                    remote_sha256 = excluded.remote_sha256,
+                                    remote_size = excluded.remote_size,
+                                    remote_status = 'present',
                                     local_generation = excluded.local_generation,
                                     local_status = excluded.local_status,
                                     phase = excluded.phase,
@@ -947,9 +965,11 @@ public final class SyncEngine: Sendable {
                                 stmt.bindText(item.sha256Checksum, at: 7)
                                 stmt.bindText(item.sha256Checksum, at: 8)
                                 stmt.bindInt64(fileSize, at: 9)
+                                stmt.bindText(item.sha256Checksum, at: 10)
+                                stmt.bindInt64(fileSize, at: 11)
                                 let ts = Date().timeIntervalSince1970
-                                stmt.bindDouble(ts, at: 10)
-                                stmt.bindDouble(ts, at: 11)
+                                stmt.bindDouble(ts, at: 12)
+                                stmt.bindDouble(ts, at: 13)
                                 _ = try stmt.step()
                                 stmt.reset()
                             }
@@ -1303,6 +1323,7 @@ public final class SyncEngine: Sendable {
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
         let now = Date().timeIntervalSince1970
 
+
         // -------------------------------------------------------------
         // 1. 构建目录拓扑映射 (在内存中快速维护，O(1) 路径与父项解析)
         // -------------------------------------------------------------
@@ -1429,8 +1450,8 @@ public final class SyncEngine: Sendable {
                     let page = try await client.listChanges(pageToken: activeToken)
                     for change in page.changes {
                         let fileId = change.fileId
-                        if change.removed == true || change.file?.trashed == true {
-                            // 远端删除 / 放入回收站
+                        if change.file?.trashed == true {
+                            // 远端明确移入回收站
                             try await store.batchWrite { conn in
                                 let stmt = try conn.cachedStatement("""
                                 UPDATE items SET
@@ -1438,6 +1459,26 @@ public final class SyncEngine: Sendable {
                                     remote_generation = remote_generation + 1,
                                     dirty_generation = dirty_generation + 1,
                                     phase = 'ready',
+                                    updated_at = ?
+                                WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
+                                """)
+                                stmt.bindDouble(now, at: 1)
+                                stmt.bindInt64(rootId, at: 2)
+                                stmt.bindText(fileId, at: 3)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
+                        } else if change.removed == true {
+                            // 远端项失去访问权限或已被移除 (removed != trashed)
+                            // 遵循官方契约：removed 包括失去访问权限，绝不能单凭此字段判定文件已被用户删除而触发本地误删
+                            // 标记为 remote_status = 'unknown', phase = 'blocked'，绝不触发本地删除
+                            self.logger.info("远端项访问权限失效或被移除 (removed=true) [\(fileId)]，保护本地文件副本不予删除")
+                            try await store.batchWrite { conn in
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET
+                                    remote_status = 'unknown',
+                                    phase = 'blocked',
+                                    dirty_generation = 0,
                                     updated_at = ?
                                 WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
                                 """)
@@ -1564,11 +1605,13 @@ public final class SyncEngine: Sendable {
                                     INSERT INTO items (
                                         root_id, parent_id, name, entry_kind, remote_file_id,
                                         remote_name, remote_sha256, remote_size, remote_status,
+                                        local_status,
                                         remote_generation, phase, dirty_generation,
                                         created_at, updated_at
                                     ) VALUES (
                                         ?, ?, ?, 'file', ?,
                                         ?, ?, ?, 'present',
+                                        'absent',
                                         1, 'ready', 1,
                                         ?, ?
                                     )
@@ -1923,11 +1966,13 @@ public final class SyncEngine: Sendable {
                         INSERT INTO items (
                             root_id, parent_id, name, entry_kind,
                             local_device, local_inode, local_mtime, local_size, local_sha256,
+                            remote_status,
                             local_generation, local_status, phase, dirty_generation,
                             created_at, updated_at
                         ) VALUES (
                             ?, ?, ?, 'file',
                             ?, ?, ?, ?, ?,
+                            'absent',
                             1, 'present', 'ready', 1,
                             ?, ?
                         )
@@ -2094,10 +2139,12 @@ public final class SyncEngine: Sendable {
         for item in dirtyItems {
             let decision: ReconcileDecision
             if item.entryKind == "directory" {
-                if item.local?.status == .absent && item.remote?.status != .absent && item.remote?.status != .trashed {
+                if item.local?.status == .absent && item.remote?.status == .present {
                     decision = .trashRemote
                 } else if item.remote?.status == .trashed && item.local?.status == .present {
                     decision = .deleteLocal
+                } else if item.local?.status == .unknown || item.remote?.status == .unknown {
+                    decision = .waitingEvidence(reason: "目录单侧状态未知")
                 } else {
                     // 目录本身无需内容下载/上传，直接清除 dirty_generation
                     try await store.batchWrite { conn in
@@ -2211,6 +2258,9 @@ public final class SyncEngine: Sendable {
                                 local_size = ?,
                                 base_sha256 = ?,
                                 base_size = ?,
+                                remote_sha256 = ?,
+                                remote_size = ?,
+                                remote_status = 'present',
                                 phase = 'committed',
                                 dirty_generation = 0,
                                 updated_at = ?
@@ -2221,8 +2271,10 @@ public final class SyncEngine: Sendable {
                             stmt.bindInt64(fSize, at: 3)
                             stmt.bindText(sha256Hex, at: 4)
                             stmt.bindInt64(fSize, at: 5)
-                            stmt.bindDouble(now, at: 6)
-                            stmt.bindInt64(item.itemId, at: 7)
+                            stmt.bindText(sha256Hex, at: 6)
+                            stmt.bindInt64(fSize, at: 7)
+                            stmt.bindDouble(now, at: 8)
+                            stmt.bindInt64(item.itemId, at: 9)
                             _ = try stmt.step()
                             stmt.reset()
                         }
@@ -2276,6 +2328,7 @@ public final class SyncEngine: Sendable {
                                 local_size = remote_size,
                                 local_mtime = ?,
                                 local_status = 'present',
+                                remote_status = 'present',
                                 base_sha256 = remote_sha256,
                                 base_size = remote_size,
                                 phase = 'committed',
@@ -2343,24 +2396,40 @@ public final class SyncEngine: Sendable {
                 let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
                 let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                 let localFileURL = rootURL.appendingPathComponent(relPath)
+                var trashSucceeded = true
+
                 if FileManager.default.fileExists(atPath: localFileURL.path) {
                     var trashURL: NSURL?
                     do {
                         try FileManager.default.trashItem(at: localFileURL, resultingItemURL: &trashURL)
                     } catch {
-                        try? FileManager.default.removeItem(at: localFileURL)
+                        trashSucceeded = false
+                        self.logger.warning("无法将本地文件移入废纸篓 [\(relPath)]: \(error)，保留本地文件并标记为 blocked，绝不执行永久删除")
                     }
                 }
-                try await store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement("""
-                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                    """)
-                    stmt.bindDouble(now, at: 1)
-                    stmt.bindInt64(item.itemId, at: 2)
-                    _ = try stmt.step()
-                    stmt.reset()
+
+                if trashSucceeded {
+                    try await store.batchWrite { conn in
+                        let stmt = try conn.cachedStatement("""
+                        UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                        """)
+                        stmt.bindDouble(now, at: 1)
+                        stmt.bindInt64(item.itemId, at: 2)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+                    actionTracker.deleted += 1
+                } else {
+                    try await store.batchWrite { conn in
+                        let stmt = try conn.cachedStatement("""
+                        UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                        """)
+                        stmt.bindDouble(now, at: 1)
+                        stmt.bindInt64(item.itemId, at: 2)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
                 }
-                actionTracker.deleted += 1
 
             case .conflict(let winner, let conflictId):
                 syncGroup.enter()
