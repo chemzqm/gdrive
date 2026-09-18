@@ -15,6 +15,7 @@ public struct SyncStats: Sendable {
     public var bytesDownloaded: Int64 = 0
     public var filesDeleted: Int = 0
     public var conflictsResolved: Int = 0
+    public var filesFailed: Int = 0
     public var elapsedSeconds: Double = 0
 }
 
@@ -76,7 +77,8 @@ public final class SyncEngine: Sendable {
     public func sync(
         localPath: String,
         remoteFolderId: String,
-        concurrency: Int = 16
+        concurrency: Int = 16,
+        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
@@ -97,7 +99,7 @@ public final class SyncEngine: Sendable {
 
         if existingRootId != nil {
             logger.info("[Sync] 已有共同同步基线，自动执行增量双向同步: \(resolvedLocalPath) <-> \(remoteFolderId)")
-            return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency)
+            return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
         }
 
         // 2. 首次同步：自动探测本地与远端目录真实状态
@@ -126,10 +128,10 @@ public final class SyncEngine: Sendable {
         // 3. 根据探测结果安全分流
         if !isLocalEmpty && isRemoteEmpty {
             logger.info("[Sync] 检测到【本地包含文件，云端为空目录】，自动启动 localToRemoteEmpty 初始化上传")
-            return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency)
+            return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
         } else if isLocalEmpty && !isRemoteEmpty {
             logger.info("[Sync] 检测到【云端包含文件，本地为空目录】，自动启动 remoteToLocalEmpty 初始化下载")
-            return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency)
+            return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress)
         } else if isLocalEmpty && isRemoteEmpty {
             logger.info("[Sync] 检测到【本地与云端均为空目录】，建立初始空基线")
             let now = Date().timeIntervalSince1970
@@ -164,10 +166,12 @@ public final class SyncEngine: Sendable {
     public func syncLocalToRemoteEmpty(
         localPath: String,
         remoteRootId: String,
-        maxUploadConcurrency: Int = 16
+        maxUploadConcurrency: Int = 16,
+        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
+        let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
 
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
@@ -298,10 +302,67 @@ public final class SyncEngine: Sendable {
         let baselineCache = try await LocalBaselineCache.load(store: store, rootId: rootId)
 
         final class ProgressTracker: @unchecked Sendable {
-            var filesUploaded = 0
-            var filesSkipped = 0
-            var bytesUploaded: Int64 = 0
-            var dirsCreated = 0
+            private var _filesUploaded = 0
+            private var _filesSkipped = 0
+            private var _filesFailed = 0
+            private var _bytesUploaded: Int64 = 0
+            private var _dirsCreated = 0
+            private var lock = os_unfair_lock()
+
+            var filesUploaded: Int {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _filesUploaded
+            }
+
+            var filesSkipped: Int {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _filesSkipped
+            }
+
+            var filesFailed: Int {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _filesFailed
+            }
+
+            var bytesUploaded: Int64 {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _bytesUploaded
+            }
+
+            var dirsCreated: Int {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _dirsCreated
+            }
+
+            func recordSuccess(bytes: Int64) {
+                os_unfair_lock_lock(&lock)
+                _filesUploaded += 1
+                _bytesUploaded += bytes
+                os_unfair_lock_unlock(&lock)
+            }
+
+            func recordFailure() {
+                os_unfair_lock_lock(&lock)
+                _filesFailed += 1
+                os_unfair_lock_unlock(&lock)
+            }
+
+            func recordSkipped() {
+                os_unfair_lock_lock(&lock)
+                _filesSkipped += 1
+                os_unfair_lock_unlock(&lock)
+            }
+
+            func recordDirCreated() {
+                os_unfair_lock_lock(&lock)
+                _dirsCreated += 1
+                os_unfair_lock_unlock(&lock)
+            }
         }
         let progress = ProgressTracker()
 
@@ -397,7 +458,7 @@ public final class SyncEngine: Sendable {
 
                                 // 广播唤醒等待该目录的全部子项
                                 await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: remoteId)
-                                progress.dirsCreated += 1
+                                progress.recordDirCreated()
                             } catch {
                                 self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
                             }
@@ -410,11 +471,12 @@ public final class SyncEngine: Sendable {
 
                         // 快速变更检测 (§6.2)：dev + inode + mtime + size 匹配即跳过内容读取和哈希计算
                         if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
-                            progress.filesSkipped += 1
+                            progress.recordSkipped()
                             continue
                         }
 
                         // 文件处理：等待其直接父目录就绪后立即上传
+                        notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
@@ -423,6 +485,7 @@ public final class SyncEngine: Sendable {
                                 self.monitor.finishUpload(id: fullPath)
                                 uploadSemaphore.signal()
                                 uploadGroup.leave()
+                                notifier.addCompleted(files: 1, bytes: Int64(fileSize))
                             }
 
                             do {
@@ -438,65 +501,12 @@ public final class SyncEngine: Sendable {
                                 let ino = Int64(record.metadata?.identity.inode ?? 0)
                                 let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
 
-                                // 意图持久化
                                 let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
-                                let currentItemId: Int64 = try await self.store.write { conn in
-                                    let itemStmt = try conn.cachedStatement("""
-                                    INSERT INTO items (
-                                        root_id, parent_id, name, entry_kind, remote_file_id,
-                                        local_device, local_inode, local_mtime, local_size, local_sha256,
-                                        local_generation, local_status, phase, dirty_generation,
-                                        created_at, updated_at
-                                    ) VALUES (
-                                        ?, ?, ?, 'file', ?,
-                                        ?, ?, ?, ?, ?,
-                                        1, 'present', 'inFlight', 1,
-                                        ?, ?
-                                    )
-                                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                    DO UPDATE SET
-                                        remote_file_id = excluded.remote_file_id,
-                                        local_device = excluded.local_device,
-                                        local_inode = excluded.local_inode,
-                                        local_mtime = excluded.local_mtime,
-                                        local_size = excluded.local_size,
-                                        local_sha256 = excluded.local_sha256,
-                                        phase = excluded.phase,
-                                        dirty_generation = excluded.dirty_generation,
-                                        updated_at = excluded.updated_at;
-                                    """)
-                                    itemStmt.bindInt64(rootId, at: 1)
-                                    itemStmt.bindInt64(parentDirItemId, at: 2)
-                                    itemStmt.bindText(name, at: 3)
-                                    itemStmt.bindText(remoteFileId, at: 4)
-                                    itemStmt.bindInt64(dev, at: 5)
-                                    itemStmt.bindInt64(ino, at: 6)
-                                    itemStmt.bindInt64(mtime, at: 7)
-                                    itemStmt.bindInt64(fileSize, at: 8)
-                                    itemStmt.bindText(sha256Hex, at: 9)
-                                    let ts = Date().timeIntervalSince1970
-                                    itemStmt.bindDouble(ts, at: 10)
-                                    itemStmt.bindDouble(ts, at: 11)
-                                    _ = try itemStmt.step()
-                                    itemStmt.reset()
-
-                                    let qStmt = try conn.cachedStatement("""
-                                    SELECT item_id FROM items
-                                    WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                                    """)
-                                    qStmt.bindInt64(rootId, at: 1)
-                                    qStmt.bindInt64(parentDirItemId, at: 2)
-                                    qStmt.bindText(name, at: 3)
-                                    defer { qStmt.reset() }
-                                    if try qStmt.step(), let id = qStmt.columnInt64(at: 0) {
-                                        return id
-                                    }
-                                    return 0
-                                }
 
                                 // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
                                 let limit8MB: Int64 = 8 * 1024 * 1024
                                 if fileSize <= limit8MB {
+                                    // 小文件 (≤ 8MB)：上传前零数据库 I/O 阻塞，直接发起网络传输
                                     let fileData = try Data(contentsOf: fileURL)
                                     _ = try await self.client.uploadMultipart(
                                         name: name,
@@ -506,7 +516,110 @@ public final class SyncEngine: Sendable {
                                         expectedSha256: sha256Hex
                                     )
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
+
+                                    // 上传成功后，通过 batchWrite（Group Commit，合并 256 项或 5ms 刷盘）写入基线
+                                    try await self.store.batchWrite { conn in
+                                        let itemStmt = try conn.cachedStatement("""
+                                        INSERT INTO items (
+                                            root_id, parent_id, name, entry_kind, remote_file_id,
+                                            local_device, local_inode, local_mtime, local_size, local_sha256,
+                                            base_sha256, base_size,
+                                            local_generation, local_status, phase, dirty_generation,
+                                            created_at, updated_at
+                                        ) VALUES (
+                                            ?, ?, ?, 'file', ?,
+                                            ?, ?, ?, ?, ?,
+                                            ?, ?,
+                                            1, 'present', 'committed', 0,
+                                            ?, ?
+                                        )
+                                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                                        DO UPDATE SET
+                                            remote_file_id = excluded.remote_file_id,
+                                            local_device = excluded.local_device,
+                                            local_inode = excluded.local_inode,
+                                            local_mtime = excluded.local_mtime,
+                                            local_size = excluded.local_size,
+                                            local_sha256 = excluded.local_sha256,
+                                            base_sha256 = excluded.base_sha256,
+                                            base_size = excluded.base_size,
+                                            phase = 'committed',
+                                            dirty_generation = 0,
+                                            updated_at = excluded.updated_at;
+                                        """)
+                                        itemStmt.bindInt64(rootId, at: 1)
+                                        itemStmt.bindInt64(parentDirItemId, at: 2)
+                                        itemStmt.bindText(name, at: 3)
+                                        itemStmt.bindText(remoteFileId, at: 4)
+                                        itemStmt.bindInt64(dev, at: 5)
+                                        itemStmt.bindInt64(ino, at: 6)
+                                        itemStmt.bindInt64(mtime, at: 7)
+                                        itemStmt.bindInt64(fileSize, at: 8)
+                                        itemStmt.bindText(sha256Hex, at: 9)
+                                        itemStmt.bindText(sha256Hex, at: 10)
+                                        itemStmt.bindInt64(fileSize, at: 11)
+                                        let ts = Date().timeIntervalSince1970
+                                        itemStmt.bindDouble(ts, at: 12)
+                                        itemStmt.bindDouble(ts, at: 13)
+                                        _ = try itemStmt.step()
+                                        itemStmt.reset()
+                                    }
                                 } else {
+                                    // 大文件 (> 8MB)：上传前单次写入 inFlight 状态，获取 itemId 以支持断点分块续传
+                                    let currentItemId: Int64 = try await self.store.write { conn in
+                                        let itemStmt = try conn.cachedStatement("""
+                                        INSERT INTO items (
+                                            root_id, parent_id, name, entry_kind, remote_file_id,
+                                            local_device, local_inode, local_mtime, local_size, local_sha256,
+                                            local_generation, local_status, phase, dirty_generation,
+                                            created_at, updated_at
+                                        ) VALUES (
+                                            ?, ?, ?, 'file', ?,
+                                            ?, ?, ?, ?, ?,
+                                            1, 'present', 'inFlight', 1,
+                                            ?, ?
+                                        )
+                                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                                        DO UPDATE SET
+                                            remote_file_id = excluded.remote_file_id,
+                                            local_device = excluded.local_device,
+                                            local_inode = excluded.local_inode,
+                                            local_mtime = excluded.local_mtime,
+                                            local_size = excluded.local_size,
+                                            local_sha256 = excluded.local_sha256,
+                                            phase = excluded.phase,
+                                            dirty_generation = excluded.dirty_generation,
+                                            updated_at = excluded.updated_at;
+                                        """)
+                                        itemStmt.bindInt64(rootId, at: 1)
+                                        itemStmt.bindInt64(parentDirItemId, at: 2)
+                                        itemStmt.bindText(name, at: 3)
+                                        itemStmt.bindText(remoteFileId, at: 4)
+                                        itemStmt.bindInt64(dev, at: 5)
+                                        itemStmt.bindInt64(ino, at: 6)
+                                        itemStmt.bindInt64(mtime, at: 7)
+                                        itemStmt.bindInt64(fileSize, at: 8)
+                                        itemStmt.bindText(sha256Hex, at: 9)
+                                        let ts = Date().timeIntervalSince1970
+                                        itemStmt.bindDouble(ts, at: 10)
+                                        itemStmt.bindDouble(ts, at: 11)
+                                        _ = try itemStmt.step()
+                                        itemStmt.reset()
+
+                                        let qStmt = try conn.cachedStatement("""
+                                        SELECT item_id FROM items
+                                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                                        """)
+                                        qStmt.bindInt64(rootId, at: 1)
+                                        qStmt.bindInt64(parentDirItemId, at: 2)
+                                        qStmt.bindText(name, at: 3)
+                                        defer { qStmt.reset() }
+                                        if try qStmt.step(), let id = qStmt.columnInt64(at: 0) {
+                                            return id
+                                        }
+                                        return 0
+                                    }
+
                                     // 大文件 (> 8MB) Resumable 8MB 流式分块断点续传（每块落盘 offset）
                                     _ = try await self.performResumableUpload(
                                         rootId: rootId,
@@ -519,31 +632,31 @@ public final class SyncEngine: Sendable {
                                         name: name,
                                         isUpdate: false
                                     )
+
+                                    // 提交共同基线 B
+                                    try await self.store.batchWrite { conn in
+                                        let updateStmt = try conn.cachedStatement("""
+                                        UPDATE items SET
+                                            base_sha256 = ?,
+                                            base_size = ?,
+                                            phase = 'committed',
+                                            dirty_generation = 0,
+                                            updated_at = ?
+                                        WHERE root_id = ? AND remote_file_id = ?;
+                                        """)
+                                        updateStmt.bindText(sha256Hex, at: 1)
+                                        updateStmt.bindInt64(fileSize, at: 2)
+                                        updateStmt.bindDouble(Date().timeIntervalSince1970, at: 3)
+                                        updateStmt.bindInt64(rootId, at: 4)
+                                        updateStmt.bindText(remoteFileId, at: 5)
+                                        _ = try updateStmt.step()
+                                        updateStmt.reset()
+                                    }
                                 }
 
-                                // 提交共同基线 B
-                                try await self.store.batchWrite { conn in
-                                    let updateStmt = try conn.cachedStatement("""
-                                    UPDATE items SET
-                                        base_sha256 = ?,
-                                        base_size = ?,
-                                        phase = 'committed',
-                                        dirty_generation = 0,
-                                        updated_at = ?
-                                    WHERE root_id = ? AND remote_file_id = ?;
-                                    """)
-                                    updateStmt.bindText(sha256Hex, at: 1)
-                                    updateStmt.bindInt64(fileSize, at: 2)
-                                    updateStmt.bindDouble(Date().timeIntervalSince1970, at: 3)
-                                    updateStmt.bindInt64(rootId, at: 4)
-                                    updateStmt.bindText(remoteFileId, at: 5)
-                                    _ = try updateStmt.step()
-                                    updateStmt.reset()
-                                }
-
-                                progress.filesUploaded += 1
-                                progress.bytesUploaded += fileSize
+                                progress.recordSuccess(bytes: fileSize)
                             } catch {
+                                progress.recordFailure()
                                 self.logger.error("上传文件失败 [\(relPath)]: \(error)")
                             }
                         }
@@ -567,8 +680,10 @@ public final class SyncEngine: Sendable {
         stats.directoriesCreated = progress.dirsCreated
         stats.filesUploaded = progress.filesUploaded
         stats.filesSkipped = progress.filesSkipped
+        stats.filesFailed = progress.filesFailed
         stats.bytesUploaded = progress.bytesUploaded
         stats.elapsedSeconds = elapsed
+        notifier.finish()
 
         return stats
     }
@@ -580,10 +695,12 @@ public final class SyncEngine: Sendable {
     public func syncRemoteToLocalEmpty(
         localPath: String,
         remoteRootId: String,
-        maxDownloadConcurrency: Int = 16
+        maxDownloadConcurrency: Int = 16,
+        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
+        let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
 
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
@@ -733,7 +850,9 @@ public final class SyncEngine: Sendable {
                     try await traverseRemote(parentRemoteId: item.id, currentLocalURL: itemLocalURL, parentItemId: dirItemId)
                 } else {
                     // 文件：加入并发下载队列
-                    self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
+                    let downloadBytes = item.sizeBytes ?? 0
+                    notifier.addDiscovered(files: 1, bytes: downloadBytes)
+                    self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
                     downloadGroup.enter()
                     Task {
                         await downloadSemaphore.wait()
@@ -741,6 +860,7 @@ public final class SyncEngine: Sendable {
                             self.monitor.finishDownload(id: item.id)
                             downloadSemaphore.signal()
                             downloadGroup.leave()
+                            notifier.addCompleted(files: 1, bytes: downloadBytes)
                         }
 
                         do {
@@ -833,6 +953,7 @@ public final class SyncEngine: Sendable {
         stats.filesDownloaded = progress.filesDownloaded
         stats.bytesDownloaded = progress.bytesDownloaded
         stats.elapsedSeconds = elapsed
+        notifier.finish()
 
         return stats
     }
@@ -1088,7 +1209,8 @@ public final class SyncEngine: Sendable {
     public func syncIncremental(
         localPath: String,
         remoteRootId: String,
-        maxConcurrency: Int = 16
+        maxConcurrency: Int = 16,
+        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
@@ -1121,7 +1243,8 @@ public final class SyncEngine: Sendable {
             rootItemId: rootInfo.rootItemId,
             localPath: resolvedLocalPath,
             remoteRootId: remoteRootId,
-            maxConcurrency: maxConcurrency
+            maxConcurrency: maxConcurrency,
+            onProgress: onProgress
         )
     }
 
@@ -1132,10 +1255,12 @@ public final class SyncEngine: Sendable {
         rootItemId: Int64,
         localPath: String,
         remoteRootId: String,
-        maxConcurrency: Int = 16
+        maxConcurrency: Int = 16,
+        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
+        let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
         let now = Date().timeIntervalSince1970
@@ -1952,7 +2077,9 @@ public final class SyncEngine: Sendable {
 
             switch decision {
             case .upload, .keepModified(preferLocal: true):
-                self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: item.local?.size ?? 0)
+                let upBytes = item.local?.size ?? 0
+                notifier.addDiscovered(files: 1, bytes: upBytes)
+                self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
                 syncGroup.enter()
                 Task {
                     await syncSemaphore.wait()
@@ -1960,6 +2087,7 @@ public final class SyncEngine: Sendable {
                         self.monitor.finishUpload(id: item.name)
                         syncSemaphore.signal()
                         syncGroup.leave()
+                        notifier.addCompleted(files: 1, bytes: upBytes)
                     }
 
                     do {
@@ -2069,6 +2197,7 @@ public final class SyncEngine: Sendable {
             case .download, .keepModified(preferLocal: false):
                 let downId = item.remoteFileId ?? item.name
                 let downSize = item.remote?.size ?? 0
+                notifier.addDiscovered(files: 1, bytes: downSize)
                 self.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
                 syncGroup.enter()
                 Task {
@@ -2077,6 +2206,7 @@ public final class SyncEngine: Sendable {
                         self.monitor.finishDownload(id: downId)
                         syncSemaphore.signal()
                         syncGroup.leave()
+                        notifier.addCompleted(files: 1, bytes: downSize)
                     }
 
                     do {
@@ -2276,6 +2406,7 @@ public final class SyncEngine: Sendable {
         stats.filesDeleted = actionTracker.deleted
         stats.conflictsResolved = actionTracker.conflicts
         stats.elapsedSeconds = elapsed
+        notifier.finish()
 
         return stats
     }

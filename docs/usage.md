@@ -84,13 +84,18 @@ let localDir = "/Users/username/Documents/MyProject"
 let remoteFolderId = "1UCWm-xg7Ih8LL9C64pKdZJcIBhwx-z36" // Google Drive 目标文件夹 ID
 
 // 单一接口直接调用，引擎全自动感知与决策
+// 支持可选的 onProgress 回调（内置 500ms 防抖/节流合并，提供已完成与动态发现的总数）
 let stats = try await engine.sync(
     localPath: localDir,
     remoteFolderId: remoteFolderId,
-    concurrency: 16
+    concurrency: 16,
+    onProgress: { progress in
+        let pct = String(format: "%.1f", progress.percentage * 100)
+        print("进度: [\(pct)%] 已完成 \(progress.completedFiles) / 当前已发现 \(progress.totalDiscoveredFiles) 项 (\(progress.completedBytes)/\(progress.totalDiscoveredBytes) 字节)")
+    }
 )
 
-print("同步完成: 上传 \(stats.filesUploaded) 项, 下载 \(stats.filesDownloaded) 项, 耗时 \(String(format: "%.2f", stats.durationSeconds))s")
+print("同步完成: 上传 \(stats.filesUploaded) 项, 下载 \(stats.filesDownloaded) 项, 失败 \(stats.filesFailed) 项, 耗时 \(String(format: "%.2f", stats.elapsedSeconds))s")
 ```
 
 - **自动决策流程**：

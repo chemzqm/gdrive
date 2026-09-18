@@ -11,19 +11,13 @@ public final class AsyncSemaphore: @unchecked Sendable {
     }
 
     public func wait() async {
-        let shouldWait: Bool = {
+        await withCheckedContinuation { cont in
             os_unfair_lock_lock(&lock)
-            defer { os_unfair_lock_unlock(&lock) }
             if count > 0 {
                 count -= 1
-                return false
-            }
-            return true
-        }()
-
-        if shouldWait {
-            await withCheckedContinuation { cont in
-                os_unfair_lock_lock(&lock)
+                os_unfair_lock_unlock(&lock)
+                cont.resume()
+            } else {
                 waiters.append(cont)
                 os_unfair_lock_unlock(&lock)
             }
@@ -31,14 +25,14 @@ public final class AsyncSemaphore: @unchecked Sendable {
     }
 
     public func signal() {
-        var waiter: CheckedContinuation<Void, Never>?
         os_unfair_lock_lock(&lock)
         if !waiters.isEmpty {
-            waiter = waiters.removeFirst()
+            let waiter = waiters.removeFirst()
+            os_unfair_lock_unlock(&lock)
+            waiter.resume()
         } else {
             count += 1
+            os_unfair_lock_unlock(&lock)
         }
-        os_unfair_lock_unlock(&lock)
-        waiter?.resume()
     }
 }

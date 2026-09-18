@@ -7,6 +7,8 @@ public actor IDPool {
     private let api: DriveAPI?
     private var availableIds: [String] = []
 
+    private var inFlightFetch: Task<[String], Error>?
+
     public init(api: DriveAPI? = nil, initialIds: [String] = []) {
         self.api = api
         self.availableIds = initialIds
@@ -26,16 +28,30 @@ public actor IDPool {
         return sub
     }
 
-    /// 获取单个可用 ID（内存缓冲耗尽时自动向 Google Drive 批量补充 1000 个）
+    /// 获取单个可用 ID（内存缓冲耗尽时自动向 Google Drive 批量补充 1000 个，余量不足时后台自动预取）
     public func nextId() async throws -> String {
+        // 如果有现成 ID，直接返回，并在水位低时后台静默预取
         if let id = availableIds.popLast() {
+            if availableIds.count < 200 && inFlightFetch == nil, let api = self.api {
+                inFlightFetch = Task {
+                    try await api.generateIds(count: 1000)
+                }
+            }
             return id
         }
-        guard let api = self.api else {
+
+        // 内存耗尽：等待在途预取或发起新请求
+        if let inFlight = inFlightFetch {
+            let batch = try await inFlight.value
+            inFlightFetch = nil
+            availableIds.append(contentsOf: batch)
+        } else if let api = self.api {
+            let batch = try await api.generateIds(count: 1000)
+            availableIds.append(contentsOf: batch)
+        } else {
             throw NSError(domain: "IDPool", code: 1, userInfo: [NSLocalizedDescriptionKey: "ID 缓冲池已耗尽且未配置 API 客户端"])
         }
-        let batch = try await api.generateIds(count: 1000)
-        availableIds.append(contentsOf: batch)
+
         guard let id = availableIds.popLast() else {
             throw NSError(domain: "IDPool", code: 2, userInfo: [NSLocalizedDescriptionKey: "未能从 Google Drive 获取有效 ID"])
         }

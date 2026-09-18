@@ -107,7 +107,17 @@ public final class DriveClient: Sendable {
 
     public static let fields = "id,name,mimeType,parents,size,sha256Checksum,version,trashed"
 
-    public init(auth: Auth, session: URLSession = .shared) {
+    /// 创建针对高并发传输优化的专属 URLSession
+    public static func makeDefaultSession() -> URLSession {
+        let config = URLSessionConfiguration.default
+        config.httpMaximumConnectionsPerHost = 64
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 300
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config)
+    }
+
+    public init(auth: Auth, session: URLSession = DriveClient.makeDefaultSession()) {
         self.auth = auth
         self.session = session
     }
@@ -237,6 +247,7 @@ public final class DriveClient: Sendable {
 
         // 构造 multipart 请求体
         var body = Data()
+        body.reserveCapacity(content.count + 512)
         body.append("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".data(using: .utf8)!)
         body.append(metadataData)
         body.append("\r\n--\(boundary)\r\nContent-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
