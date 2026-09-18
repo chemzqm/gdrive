@@ -549,7 +549,8 @@ public final class DriveClient: Sendable {
     public func downloadFile(
         remoteId: String,
         destinationURL: URL,
-        expectedSha256: String? = nil
+        expectedSha256: String? = nil,
+        onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws {
         let token = try await auth.token()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
@@ -589,12 +590,14 @@ public final class DriveClient: Sendable {
             if buffer.count >= 64 * 1024 {
                 CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
                 try fileHandle.write(contentsOf: buffer)
+                onProgress?(Int64(buffer.count))
                 buffer.removeAll(keepingCapacity: true)
             }
         }
         if !buffer.isEmpty {
             CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
             try fileHandle.write(contentsOf: buffer)
+            onProgress?(Int64(buffer.count))
         }
         try fileHandle.close()
 

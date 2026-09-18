@@ -73,11 +73,41 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
 ## 3. 同步接口调用方法
 
-`SyncEngine` 遵循 `v1.md` 规范，对外暴露三种明确的同步意图接口：
+`SyncEngine` 提供了开箱即用的**统一同步入口**（内部自动探测状态并安全分流），同时也保留了底层明确意图的子接口：
 
-### 3.1 本地目录到远端空目录同步 (`syncLocalToRemoteEmpty`)
+### 3.1 统一智能同步入口 (`sync`) 【推荐】
 
-适用于首次将本地已有的大型项目或目录上传到 Google Drive 上一个全新的或空的远程目录。
+调用方**无需关心**远端是否为空或本地是否已有同步基线，`engine.sync` 会自动向云端和本地发起状态探测：
+
+```swift
+let localDir = "/Users/username/Documents/MyProject"
+let remoteFolderId = "1UCWm-xg7Ih8LL9C64pKdZJcIBhwx-z36" // Google Drive 目标文件夹 ID
+
+// 单一接口直接调用，引擎全自动感知与决策
+let stats = try await engine.sync(
+    localPath: localDir,
+    remoteFolderId: remoteFolderId,
+    concurrency: 16
+)
+
+print("同步完成: 上传 \(stats.filesUploaded) 项, 下载 \(stats.filesDownloaded) 项, 耗时 \(String(format: "%.2f", stats.durationSeconds))s")
+```
+
+- **自动决策流程**：
+  1. **已有基线**：自动执行增量双向同步 (`syncIncremental`)，毫秒级比对。
+  2. **首次同步**：
+     - 本地有文件且云端为空：自动路由至 `syncLocalToRemoteEmpty` 极速流式上传。
+     - 云端有文件且本地为空：自动路由至 `syncRemoteToLocalEmpty` 极速下载。
+     - 双端均为空：自动初始化空基线。
+     - 双端皆非空且无基线：抛出清晰异常拦截，杜绝盲合并导致覆盖已有文件。
+
+---
+
+### 3.2 底层显式同步接口（进阶）
+
+若调用方需要在特定业务流程中显式指定初始化方向，可调用专用子接口：
+
+#### (1) 本地目录到远端空目录同步 (`syncLocalToRemoteEmpty`)
 
 ```swift
 let localDir = "/Users/username/Documents/MyProject"
@@ -291,3 +321,35 @@ let watcher = DirectoryWatcher(path: localDir) {
    - 存在有效断点时，向 Google Drive 发送探测请求（`bytes */totalBytes`）核验云端真实确认的 offset。
    - 随后直接从该 offset 定位继续上传剩余分块，换线程、应用重启或网络中断后绝不重传已确认的数据块。
 
+---
+
+## 8. 实时传输与速率监控 (`TransferSnapshot`)
+
+同步引擎内置了线程安全的 `TransferMonitor`，并在内存中每 500ms 自动采样并刷新一次最新状态。UI 或监控定时器可随时直接同步获取当前状态，耗时 0ms（无磁盘/无网络 I/O）：
+
+```swift
+// 直接从内存获取最新快照
+let status = engine.transferStatus // 或 engine.getTransferStatus()
+
+// 1. 正在活跃传输的文件列表
+for item in status.activeUploads {
+    print("正在上传: \(item.name), 进度: \(String(format: "%.1f", item.progress * 100))% (\(item.transferredBytes)/\(item.totalBytes) bytes)")
+}
+for item in status.activeDownloads {
+    print("正在下载: \(item.name), 进度: \(String(format: "%.1f", item.progress * 100))% (\(item.transferredBytes)/\(item.totalBytes) bytes)")
+}
+
+// 2. 处于等待队列中的文件列表
+for item in status.queuedUploads {
+    print("排队上传: \(item.name), 大小: \(item.totalBytes) bytes")
+}
+for item in status.queuedDownloads {
+    print("排队下载: \(item.name), 大小: \(item.totalBytes) bytes")
+}
+
+// 3. 当前合计网络实时传输速率（每 500ms 滑动窗口计算）
+let uploadMBs = status.uploadSpeedBytesPerSecond / (1024 * 1024)
+let downloadMBs = status.downloadSpeedBytesPerSecond / (1024 * 1024)
+print("当前实时上传速度: \(String(format: "%.2f", uploadMBs)) MB/s")
+print("当前实时下载速度: \(String(format: "%.2f", downloadMBs)) MB/s")
+```

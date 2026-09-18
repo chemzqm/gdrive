@@ -575,4 +575,63 @@ struct SyncEngineTests {
         #expect(remoteChildren[0].sizeBytes == Int64(9 * 1024 * 1024))
         print("✅ [StaleSession] 脏断点自动安全废弃，重置并成功上传！")
     }
+
+    @Test("Unified engine.sync automatically detects empty remote and routes between initial and incremental")
+    func testUnifiedSyncAutoDetection() async throws {
+        let auth = try Auth()
+        let authData = await auth.authData()
+        guard let rootID = authData.rootID else {
+            print("未配置 rootID，跳过云端测试")
+            return
+        }
+
+        let client = DriveClient(auth: auth)
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_unified_test_\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let f1 = tempDir.appendingPathComponent("first.txt")
+        try "Unified Sync Initial Content\n".write(to: f1, atomically: true, encoding: .utf8)
+
+        let remoteTestDirName = "sync_unified_\(UUID().uuidString.prefix(8))"
+        let remoteRootGenIds = try await client.generateIds(count: 1)
+        let remoteRoot = try await client.createDirectory(name: remoteTestDirName, parentId: rootID, remoteId: remoteRootGenIds[0])
+        defer {
+            Task {
+                try? await client.trash(remoteId: remoteRoot.id)
+            }
+        }
+
+        let testDbPath = "/tmp/test_sync_unified_\(UUID().uuidString.prefix(8)).sqlite"
+        defer {
+            for ext in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: testDbPath + ext)
+            }
+        }
+
+        let testStore = try await StateStore(path: testDbPath)
+        let engine = try await SyncEngine(auth: auth, store: testStore, client: client)
+
+        print("🚀 [UnifiedSync] 首次调用 engine.sync：自动探测并执行 localToRemoteEmpty...")
+        let initialStats = try await engine.sync(localPath: tempDir.path, remoteFolderId: remoteRoot.id)
+        #expect(initialStats.filesUploaded == 1)
+
+        // 验证 transferStatus 可以在任何时刻直接读取
+        let status = engine.transferStatus
+        #expect(status.uploadSpeedBytesPerSecond >= 0)
+
+        // 本地新增一个文件
+        let f2 = tempDir.appendingPathComponent("second.txt")
+        try "Second File Content\n".write(to: f2, atomically: true, encoding: .utf8)
+
+        print("🚀 [UnifiedSync] 二次调用 engine.sync：自动识别已有基线并执行增量双向同步...")
+        let secondStats = try await engine.sync(localPath: tempDir.path, remoteFolderId: remoteRoot.id)
+        #expect(secondStats.filesUploaded == 1)
+        #expect(secondStats.filesSkipped >= 1)
+
+        print("✅ [UnifiedSync] 统一同步入口与状态探测实机测试 100% 成功！")
+    }
 }

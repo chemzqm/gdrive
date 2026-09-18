@@ -49,6 +49,114 @@ public final class SyncEngine: Sendable {
         self.idPool = idPool ?? IDPool(api: effectiveClient)
     }
 
+    /// 实时传输与速率监控器
+    public let monitor = TransferMonitor()
+
+    /// 获取当前正在传输、队列中等待以及实时滑动速度（每秒字节）的内存快照（每 500ms 自动刷新）
+    public var transferStatus: TransferSnapshot {
+        monitor.getSnapshot()
+    }
+
+    /// 外部直接调用获取当前传输状态快照
+    public func getTransferStatus() -> TransferSnapshot {
+        monitor.getSnapshot()
+    }
+
+    // MARK: - 统一同步入口 (自动状态探测与方向分流)
+
+    /// 统一双向同步入口：
+    /// - 自动检测该目录对在本地 SQLite 中是否已有同步基线
+    /// - 若已有基线：自动执行极速双向增量同步 (syncIncremental)
+    /// - 若首次同步：自动向云端与本地发起状态探测：
+    ///   - 本地有内容且云端为空：自动执行 localToRemoteEmpty 流式全量上传
+    ///   - 云端有内容且本地为空：自动执行 remoteToLocalEmpty 流式全量下载
+    ///   - 双端均为空：注册初始空基线
+    ///   - 双端均非空：抛出明确异常保护，杜绝无基线盲合并导致的数据覆盖
+    @discardableResult
+    public func sync(
+        localPath: String,
+        remoteFolderId: String,
+        concurrency: Int = 16
+    ) async throws -> SyncStats {
+        let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
+
+        // 1. 检查 SQLite 是否已存在处于激活状态的同步根
+        let existingRootId: Int64? = try await store.read { conn in
+            let stmt = try conn.cachedStatement("""
+            SELECT root_id FROM roots
+            WHERE local_root_path = ? AND remote_root_id = ? AND is_active = 1;
+            """)
+            stmt.bindText(resolvedLocalPath, at: 1)
+            stmt.bindText(remoteFolderId, at: 2)
+            defer { stmt.reset() }
+            if try stmt.step() {
+                return stmt.columnInt64(at: 0)
+            }
+            return nil
+        }
+
+        if existingRootId != nil {
+            logger.info("[Sync] 已有共同同步基线，自动执行增量双向同步: \(resolvedLocalPath) <-> \(remoteFolderId)")
+            return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency)
+        }
+
+        // 2. 首次同步：自动探测本地与远端目录真实状态
+        logger.info("[Sync] 未建立基线，开始探测本地与云端目录状态...")
+
+        // 探测远端目录：验证存在、是否为目录、是否包含非回收站子项
+        let remoteFile = try await client.getFile(remoteId: remoteFolderId)
+        guard remoteFile.isDirectory else {
+            throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteFolderId)"])
+        }
+        let remoteChildren = try await client.listChildren(parentId: remoteFolderId)
+        let isRemoteEmpty = remoteChildren.isEmpty
+
+        // 探测本地目录：是否包含非隐藏文件
+        var isDir: ObjCBool = false
+        let localExists = FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir)
+        var isLocalEmpty = true
+        if localExists && isDir.boolValue {
+            let localContents = (try? FileManager.default.contentsOfDirectory(atPath: resolvedLocalPath)) ?? []
+            let realFiles = localContents.filter { !$0.hasPrefix(".") }
+            isLocalEmpty = realFiles.isEmpty
+        } else if localExists && !isDir.boolValue {
+            throw NSError(domain: "SyncEngine", code: 102, userInfo: [NSLocalizedDescriptionKey: "本地路径已存在但不是目录: \(resolvedLocalPath)"])
+        }
+
+        // 3. 根据探测结果安全分流
+        if !isLocalEmpty && isRemoteEmpty {
+            logger.info("[Sync] 检测到【本地包含文件，云端为空目录】，自动启动 localToRemoteEmpty 初始化上传")
+            return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency)
+        } else if isLocalEmpty && !isRemoteEmpty {
+            logger.info("[Sync] 检测到【云端包含文件，本地为空目录】，自动启动 remoteToLocalEmpty 初始化下载")
+            return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency)
+        } else if isLocalEmpty && isRemoteEmpty {
+            logger.info("[Sync] 检测到【本地与云端均为空目录】，建立初始空基线")
+            let now = Date().timeIntervalSince1970
+            try await store.write { conn in
+                let stmt = try conn.cachedStatement("""
+                INSERT INTO roots (
+                    account_id, local_root_path, local_root_device, local_root_inode,
+                    remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at
+                ) VALUES ('default', ?, 1, 1, ?, 'localToRemoteEmpty', 'freshCreated', ?, ?)
+                ON CONFLICT (account_id, remote_root_id) DO UPDATE SET updated_at = excluded.updated_at;
+                """)
+                stmt.bindText(resolvedLocalPath, at: 1)
+                stmt.bindText(remoteFolderId, at: 2)
+                stmt.bindDouble(now, at: 3)
+                stmt.bindDouble(now, at: 4)
+                _ = try stmt.step()
+                stmt.reset()
+            }
+            return SyncStats()
+        } else {
+            // 双端皆非空
+            throw NSError(domain: "SyncEngine", code: 103, userInfo: [
+                NSLocalizedDescriptionKey: "双向同步初始基线要求其中一端必须为空目录。当前检测到本地路径(\(resolvedLocalPath))与远端文件夹(\(remoteFolderId))均包含已有文件。为避免盲合并导致数据覆盖或大规模冲突，请指定空目录进行首次初始化。"
+            ])
+        }
+    }
+
     // MARK: - 模式 1：本地目录 -> 远端空目录极速上传 (localToRemoteEmpty)
 
     /// 将本地非空目录流式全量同步至远端空目录
@@ -74,6 +182,20 @@ public final class SyncEngine: Sendable {
         let remoteRoot = try await client.getFile(remoteId: remoteRootId)
         guard remoteRoot.isDirectory else {
             throw NSError(domain: "SyncEngine", code: 2, userInfo: [NSLocalizedDescriptionKey: "远端目标不是目录: \(remoteRootId)"])
+        }
+
+        // 仅在首次初始化未建立根基线时校验远端是否为空目录
+        let rootExists: Bool = try await store.read { conn in
+            let stmt = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
+            stmt.bindText(remoteRootId, at: 1)
+            defer { stmt.reset() }
+            return try stmt.step()
+        }
+        if !rootExists {
+            let existingChildren = try await client.listChildren(parentId: remoteRootId)
+            guard existingChildren.isEmpty else {
+                throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "远端目标不是空目录，无法执行 localToRemoteEmpty: \(remoteRootId)"])
+            }
         }
 
         let now = Date().timeIntervalSince1970
@@ -293,10 +415,12 @@ public final class SyncEngine: Sendable {
                         }
 
                         // 文件处理：等待其直接父目录就绪后立即上传
+                        self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
                             await uploadSemaphore.wait()
                             defer {
+                                self.monitor.finishUpload(id: fullPath)
                                 uploadSemaphore.signal()
                                 uploadGroup.leave()
                             }
@@ -308,6 +432,7 @@ public final class SyncEngine: Sendable {
                                 // 恒定内存流式计算 SHA-256 与文件大小
                                 let fileURL = URL(fileURLWithPath: fullPath)
                                 let (sha256Hex, fileSize) = try SyncEngine.computeFileSha256(at: fileURL)
+                                self.monitor.startUpload(id: fullPath, name: name, totalBytes: fileSize)
 
                                 let dev = Int64(record.metadata?.identity.device ?? 1)
                                 let ino = Int64(record.metadata?.identity.inode ?? 0)
@@ -380,6 +505,7 @@ public final class SyncEngine: Sendable {
                                         content: fileData,
                                         expectedSha256: sha256Hex
                                     )
+                                    self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
                                 } else {
                                     // 大文件 (> 8MB) Resumable 8MB 流式分块断点续传（每块落盘 offset）
                                     _ = try await self.performResumableUpload(
@@ -607,20 +733,26 @@ public final class SyncEngine: Sendable {
                     try await traverseRemote(parentRemoteId: item.id, currentLocalURL: itemLocalURL, parentItemId: dirItemId)
                 } else {
                     // 文件：加入并发下载队列
+                    self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
                     downloadGroup.enter()
                     Task {
                         await downloadSemaphore.wait()
                         defer {
+                            self.monitor.finishDownload(id: item.id)
                             downloadSemaphore.signal()
                             downloadGroup.leave()
                         }
 
                         do {
+                            self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
                             // 流式下载并核验 SHA-256
                             try await self.client.downloadFile(
                                 remoteId: item.id,
                                 destinationURL: itemLocalURL,
-                                expectedSha256: item.sha256Checksum
+                                expectedSha256: item.sha256Checksum,
+                                onProgress: { delta in
+                                    self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
+                                }
                             )
 
                             // 获取本地落盘后的元数据
@@ -902,6 +1034,7 @@ public final class SyncEngine: Sendable {
             )
 
             currentOffset += Int64(chunkData.count)
+            self.monitor.reportUploadProgress(id: fileURL.path, additionalBytes: Int64(chunkData.count))
 
             // 每完成一个块，立即在数据库记录已确认 offset 与状态
             let isComplete = (currentOffset >= fileSize)
@@ -1819,10 +1952,12 @@ public final class SyncEngine: Sendable {
 
             switch decision {
             case .upload, .keepModified(preferLocal: true):
+                self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: item.local?.size ?? 0)
                 syncGroup.enter()
                 Task {
                     await syncSemaphore.wait()
                     defer {
+                        self.monitor.finishUpload(id: item.name)
                         syncSemaphore.signal()
                         syncGroup.leave()
                     }
@@ -1843,6 +1978,7 @@ public final class SyncEngine: Sendable {
                             sha256Hex = res.sha256Hex
                             fSize = res.fileSize
                         }
+                        self.monitor.startUpload(id: item.name, name: item.name, totalBytes: fSize)
 
                         let finalRemoteId: String
                         if let existingRemoteId = item.remoteFileId {
@@ -1855,6 +1991,7 @@ public final class SyncEngine: Sendable {
                                     content: data,
                                     expectedSha256: sha256Hex
                                 )
+                                self.monitor.reportUploadProgress(id: item.name, additionalBytes: fSize)
                             } else {
                                 _ = try await self.performResumableUpload(
                                     rootId: rootId,
@@ -1881,6 +2018,7 @@ public final class SyncEngine: Sendable {
                                     content: data,
                                     expectedSha256: sha256Hex
                                 )
+                                self.monitor.reportUploadProgress(id: item.name, additionalBytes: fSize)
                             } else {
                                 _ = try await self.performResumableUpload(
                                     rootId: rootId,
@@ -1901,19 +2039,22 @@ public final class SyncEngine: Sendable {
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET
                                 remote_file_id = ?,
-                                base_sha256 = local_sha256,
-                                base_size = local_size,
-                                remote_sha256 = local_sha256,
-                                remote_size = local_size,
-                                remote_status = 'present',
+                                local_sha256 = ?,
+                                local_size = ?,
+                                base_sha256 = ?,
+                                base_size = ?,
                                 phase = 'committed',
                                 dirty_generation = 0,
                                 updated_at = ?
                             WHERE item_id = ?;
                             """)
                             stmt.bindText(finalRemoteId, at: 1)
-                            stmt.bindDouble(Date().timeIntervalSince1970, at: 2)
-                            stmt.bindInt64(item.itemId, at: 3)
+                            stmt.bindText(sha256Hex, at: 2)
+                            stmt.bindInt64(fSize, at: 3)
+                            stmt.bindText(sha256Hex, at: 4)
+                            stmt.bindInt64(fSize, at: 5)
+                            stmt.bindDouble(now, at: 6)
+                            stmt.bindInt64(item.itemId, at: 7)
                             _ = try stmt.step()
                             stmt.reset()
                         }
@@ -1926,10 +2067,14 @@ public final class SyncEngine: Sendable {
                 }
 
             case .download, .keepModified(preferLocal: false):
+                let downId = item.remoteFileId ?? item.name
+                let downSize = item.remote?.size ?? 0
+                self.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
                 syncGroup.enter()
                 Task {
                     await syncSemaphore.wait()
                     defer {
+                        self.monitor.finishDownload(id: downId)
                         syncSemaphore.signal()
                         syncGroup.leave()
                     }
@@ -1940,10 +2085,14 @@ public final class SyncEngine: Sendable {
                         let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                         let localFileURL = rootURL.appendingPathComponent(relPath)
 
+                        self.monitor.startDownload(id: downId, name: item.name, totalBytes: downSize)
                         try await self.client.downloadFile(
                             remoteId: remoteFileId,
                             destinationURL: localFileURL,
-                            expectedSha256: item.remote?.sha256
+                            expectedSha256: item.remote?.sha256,
+                            onProgress: { delta in
+                                self.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
+                            }
                         )
 
                         let attrs = try FileManager.default.attributesOfItem(atPath: localFileURL.path)
