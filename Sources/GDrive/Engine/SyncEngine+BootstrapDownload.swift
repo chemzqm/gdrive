@@ -46,10 +46,10 @@ extension SyncEngine {
         }
 
         let rootExists = try await store.read { conn in
-            let q = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
-            defer { q.reset() }
-            q.bindText(remoteRootId, at: 1)
-            return try q.step()
+            let queryStatement = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
+            defer { queryStatement.reset() }
+            queryStatement.bindText(remoteRootId, at: 1)
+            return try queryStatement.step()
         }
 
         let now = Date().timeIntervalSince1970
@@ -142,9 +142,9 @@ extension SyncEngine {
                         stmt.bindInt64(parentItemId, at: 2)
                         stmt.bindText(item.name, at: 3)
                         stmt.bindText(item.id, at: 4)
-                        let ts = Date().timeIntervalSince1970
-                        stmt.bindDouble(ts, at: 5)
-                        stmt.bindDouble(ts, at: 6)
+                        let timestamp = Date().timeIntervalSince1970
+                        stmt.bindDouble(timestamp, at: 5)
+                        stmt.bindDouble(timestamp, at: 6)
                         _ = try stmt.step()
                         stmt.reset()
                         guard conn.changes == 1 else {
@@ -237,11 +237,11 @@ extension SyncEngine {
                                 stmt.bindInt64(fileSize, at: 9)
                                 stmt.bindText(item.sha256Checksum, at: 10)
                                 stmt.bindInt64(fileSize, at: 11)
-                                let ts = Date().timeIntervalSince1970
+                                let timestamp = Date().timeIntervalSince1970
                                 stmt.bindInt64(published.device, at: 12)
                                 stmt.bindInt64(published.inode, at: 13)
-                                stmt.bindDouble(ts, at: 14)
-                                stmt.bindDouble(ts, at: 15)
+                                stmt.bindDouble(timestamp, at: 14)
+                                stmt.bindDouble(timestamp, at: 15)
                                 _ = try stmt.step()
                                 stmt.reset()
                                 if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
@@ -277,12 +277,12 @@ extension SyncEngine {
         if let traversalError {
             // Preserve a durable recovery route for a partially downloaded bootstrap.
             try await store.write { conn in
-                let q = try conn.cachedStatement("INSERT INTO remote_directory_scans(root_id, remote_id, scan_id, state) VALUES (?, ?, ?, 'pending') ON CONFLICT(root_id, remote_id) DO UPDATE SET state = 'pending', page_token = NULL;")
-                q.bindInt64(rootId, at: 1)
-                q.bindText(remoteRootId, at: 2)
-                q.bindText(UUID().uuidString, at: 3)
-                _ = try q.step()
-                q.reset()
+                let queryStatement = try conn.cachedStatement("INSERT INTO remote_directory_scans(root_id, remote_id, scan_id, state) VALUES (?, ?, ?, 'pending') ON CONFLICT(root_id, remote_id) DO UPDATE SET state = 'pending', page_token = NULL;")
+                queryStatement.bindInt64(rootId, at: 1)
+                queryStatement.bindText(remoteRootId, at: 2)
+                queryStatement.bindText(UUID().uuidString, at: 3)
+                _ = try queryStatement.step()
+                queryStatement.reset()
             }
             throw traversalError
         }
@@ -309,5 +309,3 @@ extension SyncEngine {
     }
 
 }
-
-

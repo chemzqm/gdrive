@@ -3,20 +3,20 @@ import SQLite3
 
 /// Lightweight SQLite Connect wrapper, encapsulate libsqlite3 C Interface
 public final class SQLiteConnection: @unchecked Sendable {
-    private var db: OpaquePointer?
+    private var database: OpaquePointer?
 
     public init(path: String, readonly: Bool = false) throws {
         var flags = readonly ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
         flags |= SQLITE_OPEN_NOMUTEX // Use single-threaded lockless mode, concurrently connected by the outer connection pool and Actor Scheduling
 
         var pointer: OpaquePointer?
-        let rc = sqlite3_open_v2(path, &pointer, flags, nil)
-        guard rc == SQLITE_OK, let pointer else {
-            let msg = pointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open database (code \(rc))"
+        let resultCode = sqlite3_open_v2(path, &pointer, flags, nil)
+        guard resultCode == SQLITE_OK, let pointer else {
+            let msg = pointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open database (code \(resultCode))"
             if let pointer { sqlite3_close(pointer) }
-            throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
+            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: msg])
         }
-        self.db = pointer
+        self.database = pointer
 
         let functionRC = sqlite3_create_function_v2(pointer, "gdrive_name_key", 1,
             SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, args in
@@ -49,9 +49,9 @@ public final class SQLiteConnection: @unchecked Sendable {
 
     public func close() {
         statementCache.removeAll()
-        if let db {
-            sqlite3_close_v2(db)
-            self.db = nil
+        if let database {
+            sqlite3_close_v2(database)
+            self.database = nil
         }
     }
 
@@ -67,25 +67,25 @@ public final class SQLiteConnection: @unchecked Sendable {
     }
 
     public func execute(_ sql: String) throws {
-        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
+        guard let database else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
         var errMsg: UnsafeMutablePointer<CChar>?
-        let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
-        if rc != SQLITE_OK {
+        let resultCode = sqlite3_exec(database, sql, nil, nil, &errMsg)
+        if resultCode != SQLITE_OK {
             let msg = errMsg.flatMap { String(cString: $0) } ?? "Execution SQL Failed"
             sqlite3_free(errMsg)
-            throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "\(msg): \(sql)"])
+            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "\(msg): \(sql)"])
         }
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {
-        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
+        guard let database else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
         var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK, let stmt else {
-            let msg = String(cString: sqlite3_errmsg(db))
-            throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Prepare failed: \(msg) [\(sql)]"])
+        let resultCode = sqlite3_prepare_v2(database, sql, -1, &stmt, nil)
+        guard resultCode == SQLITE_OK, let stmt else {
+            let msg = String(cString: sqlite3_errmsg(database))
+            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "Prepare failed: \(msg) [\(sql)]"])
         }
-        return SQLiteStatement(stmt: stmt, db: db)
+        return SQLiteStatement(stmt: stmt, database: database)
     }
 
     /// Execute a block of code in a transaction
@@ -102,24 +102,24 @@ public final class SQLiteConnection: @unchecked Sendable {
     }
 
     public var lastInsertRowId: Int64 {
-        guard let db else { return 0 }
-        return sqlite3_last_insert_rowid(db)
+        guard let database else { return 0 }
+        return sqlite3_last_insert_rowid(database)
     }
 
     public var changes: Int {
-        guard let db else { return 0 }
-        return Int(sqlite3_changes(db))
+        guard let database else { return 0 }
+        return Int(sqlite3_changes(database))
     }
 }
 
 /// Precompiled SQL Statement Wrapping
 public final class SQLiteStatement: @unchecked Sendable {
     private let stmt: OpaquePointer
-    private let db: OpaquePointer
+    private let database: OpaquePointer
 
-    init(stmt: OpaquePointer, db: OpaquePointer) {
+    init(stmt: OpaquePointer, database: OpaquePointer) {
         self.stmt = stmt
-        self.db = db
+        self.database = database
     }
 
     deinit {
@@ -174,14 +174,14 @@ public final class SQLiteStatement: @unchecked Sendable {
     // MARK: - Execute & Read
 
     public func step() throws -> Bool {
-        let rc = sqlite3_step(stmt)
-        if rc == SQLITE_ROW {
+        let resultCode = sqlite3_step(stmt)
+        if resultCode == SQLITE_ROW {
             return true
-        } else if rc == SQLITE_DONE {
+        } else if resultCode == SQLITE_DONE {
             return false
         } else {
-            let msg = String(cString: sqlite3_errmsg(db))
-            throw NSError(domain: "SQLiteStatement", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Step failed: \(msg)"])
+            let msg = String(cString: sqlite3_errmsg(database))
+            throw NSError(domain: "SQLiteStatement", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "Step failed: \(msg)"])
         }
     }
 

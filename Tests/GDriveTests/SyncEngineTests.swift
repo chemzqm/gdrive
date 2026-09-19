@@ -28,13 +28,13 @@ struct SyncEngineTests {
         try FileManager.default.createDirectory(at: sub1, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: sub2Deep, withIntermediateDirectories: true)
 
-        let f1 = tempDir.appendingPathComponent("root_file.txt")
-        let f2 = sub1.appendingPathComponent("sub1_file.txt")
-        let f3 = sub2Deep.appendingPathComponent("deep_file.txt")
+        let firstFile = tempDir.appendingPathComponent("root_file.txt")
+        let secondFile = sub1.appendingPathComponent("sub1_file.txt")
+        let thirdFile = sub2Deep.appendingPathComponent("deep_file.txt")
 
-        try "Content of root file at \(Date())\n".write(to: f1, atomically: true, encoding: .utf8)
-        try "Content of sub1 file at \(Date())\n".write(to: f2, atomically: true, encoding: .utf8)
-        try "Content of deep nested file at \(Date())\n".write(to: f3, atomically: true, encoding: .utf8)
+        try "Content of root file at \(Date())\n".write(to: firstFile, atomically: true, encoding: .utf8)
+        try "Content of sub1 file at \(Date())\n".write(to: secondFile, atomically: true, encoding: .utf8)
+        try "Content of deep nested file at \(Date())\n".write(to: thirdFile, atomically: true, encoding: .utf8)
 
         // 2. in Google Drive Create a test target root directory on
         let remoteTestDirName = "sync_test_\(UUID().uuidString.prefix(8))"
@@ -146,11 +146,11 @@ struct SyncEngineTests {
 
         var initialSHAByName: [String: String] = [:]
         // Create 5 files
-        for i in 1...5 {
-            let f = tempDir.appendingPathComponent("file_\(i).txt")
-            let content = Data("Sample content for file \(i)\n".utf8)
-            try content.write(to: f, options: .atomic)
-            initialSHAByName[f.lastPathComponent] = SyncEngine.computeSha256(of: content)
+        for fileIndex in 1...5 {
+            let generatedFile = tempDir.appendingPathComponent("file_\(fileIndex).txt")
+            let content = Data("Sample content for file \(fileIndex)\n".utf8)
+            try content.write(to: generatedFile, options: .atomic)
+            initialSHAByName[generatedFile.lastPathComponent] = SyncEngine.computeSha256(of: content)
         }
 
         let remoteRootGenIds = try await client.generateIds(count: 1)
@@ -236,13 +236,13 @@ struct SyncEngineTests {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        let f1 = tempDir.appendingPathComponent("keep.txt")
-        let f2 = tempDir.appendingPathComponent("modify.txt")
-        let f3 = tempDir.appendingPathComponent("delete_me.txt")
+        let firstFile = tempDir.appendingPathComponent("keep.txt")
+        let secondFile = tempDir.appendingPathComponent("modify.txt")
+        let thirdFile = tempDir.appendingPathComponent("delete_me.txt")
 
-        try "Keep content".write(to: f1, atomically: true, encoding: .utf8)
-        try "Original modify content".write(to: f2, atomically: true, encoding: .utf8)
-        try "Delete me soon".write(to: f3, atomically: true, encoding: .utf8)
+        try "Keep content".write(to: firstFile, atomically: true, encoding: .utf8)
+        try "Original modify content".write(to: secondFile, atomically: true, encoding: .utf8)
+        try "Delete me soon".write(to: thirdFile, atomically: true, encoding: .utf8)
 
         let remoteRootGenIds = try await client.generateIds(count: 1)
         let remoteRootName = "inc_test_\(UUID().uuidString.prefix(8))"
@@ -270,10 +270,10 @@ struct SyncEngineTests {
 
         // 2. Locally generated modifications: Modifications f2,Delete f3,New f4
         print("🚀 Incremental changes occur locally: Modify 1 item, new 1 item, delete 1 item...")
-        try "New modify content at \(Date())".write(to: f2, atomically: true, encoding: .utf8)
-        try? FileManager.default.removeItem(at: f3)
-        let f4 = tempDir.appendingPathComponent("new_local.txt")
-        try "Newly added local file".write(to: f4, atomically: true, encoding: .utf8)
+        try "New modify content at \(Date())".write(to: secondFile, atomically: true, encoding: .utf8)
+        try? FileManager.default.removeItem(at: thirdFile)
+        let fourthFile = tempDir.appendingPathComponent("new_local.txt")
+        try "Newly added local file".write(to: fourthFile, atomically: true, encoding: .utf8)
 
         // 3. Perform incremental bidirectional synchronization
         let incStats = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
@@ -290,7 +290,7 @@ struct SyncEngineTests {
         // 4. Add files directly on the remote end and test that remote changes are incrementally pulled locally.
         print("🚀 Add files remotely and test Changes incremental download...")
         let remoteFileIds = try await client.generateIds(count: 1)
-        let remoteContent = "Content generated on Google Drive at \(Date())".data(using: .utf8)!
+        let remoteContent = Data("Content generated on Google Drive at \(Date())".utf8)
         var ctx = CC_SHA256_CTX()
         CC_SHA256_Init(&ctx)
         _ = remoteContent.withUnsafeBytes { CC_SHA256_Update(&ctx, $0.baseAddress, CC_LONG(remoteContent.count)) }
@@ -486,15 +486,21 @@ struct SyncEngineTests {
         #expect(stats.filesUploaded == 1)
 
         // Verify database operations table records breakpoint sessions and completed status and completeness offset
+        struct CompletedOperation: Sendable {
+            let id: String
+            let confirmedOffset: Int64
+            let totalBytes: Int64
+            let state: String
+        }
         let completedOps = try await testStore.read { conn in
             let stmt = try conn.cachedStatement("SELECT operation_id, confirmed_offset, total_bytes, state FROM operations;")
-            var rows: [(String, Int64, Int64, String)] = []
+            var rows: [CompletedOperation] = []
             while try stmt.step() {
-                rows.append((
-                    stmt.columnText(at: 0) ?? "",
-                    stmt.columnInt64(at: 1) ?? 0,
-                    stmt.columnInt64(at: 2) ?? 0,
-                    stmt.columnText(at: 3) ?? ""
+                rows.append(CompletedOperation(
+                    id: stmt.columnText(at: 0) ?? "",
+                    confirmedOffset: stmt.columnInt64(at: 1) ?? 0,
+                    totalBytes: stmt.columnInt64(at: 2) ?? 0,
+                    state: stmt.columnText(at: 3) ?? ""
                 ))
             }
             stmt.reset()
@@ -502,10 +508,10 @@ struct SyncEngineTests {
         }
 
         #expect(completedOps.count == 1)
-        if let op = completedOps.first {
-            #expect(op.1 == 9 * 1024 * 1024)
-            #expect(op.2 == 9 * 1024 * 1024)
-            #expect(op.3 == "completed")
+        if let operationStatement = completedOps.first {
+            #expect(operationStatement.confirmedOffset == 9 * 1024 * 1024)
+            #expect(operationStatement.totalBytes == 9 * 1024 * 1024)
+            #expect(operationStatement.state == "completed")
         }
 
         // Verify cloud files
@@ -742,8 +748,8 @@ struct SyncEngineTests {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        let f1 = tempDir.appendingPathComponent("first.txt")
-        try "Unified Sync Initial Content\n".write(to: f1, atomically: true, encoding: .utf8)
+        let firstFile = tempDir.appendingPathComponent("first.txt")
+        try "Unified Sync Initial Content\n".write(to: firstFile, atomically: true, encoding: .utf8)
 
         let remoteTestDirName = "sync_unified_\(UUID().uuidString.prefix(8))"
         let remoteRootGenIds = try await client.generateIds(count: 1)
@@ -773,8 +779,8 @@ struct SyncEngineTests {
         #expect(status.uploadSpeedBytesPerSecond >= 0)
 
         // Add a new file locally
-        let f2 = tempDir.appendingPathComponent("second.txt")
-        try "Second File Content\n".write(to: f2, atomically: true, encoding: .utf8)
+        let secondFile = tempDir.appendingPathComponent("second.txt")
+        try "Second File Content\n".write(to: secondFile, atomically: true, encoding: .utf8)
 
         print("🚀 [UnifiedSync] Second call engine.sync:Automatically identify existing baselines and perform incremental bidirectional synchronization...")
         let secondStats = try await engine.sync(localPath: tempDir.path, remoteFolderId: remoteRoot.id)

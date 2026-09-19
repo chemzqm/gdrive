@@ -200,12 +200,12 @@ public final class TransferMonitor: @unchecked Sendable {
             downloadSpeed = cachedSnapshot.downloadSpeedBytesPerSecond
         }
 
-        let curActiveUploads = activeUploads.map { k, v in
-            TransferItem(fileId: k, name: v.name, totalBytes: v.totalBytes, transferredBytes: v.transferredBytes, startedAt: v.startedAt)
+        let curActiveUploads = activeUploads.map { fileId, transfer in
+            TransferItem(fileId: fileId, name: transfer.name, totalBytes: transfer.totalBytes, transferredBytes: transfer.transferredBytes, startedAt: transfer.startedAt)
         }.sorted { $0.startedAt < $1.startedAt }
 
-        let curActiveDownloads = activeDownloads.map { k, v in
-            TransferItem(fileId: k, name: v.name, totalBytes: v.totalBytes, transferredBytes: v.transferredBytes, startedAt: v.startedAt)
+        let curActiveDownloads = activeDownloads.map { fileId, transfer in
+            TransferItem(fileId: fileId, name: transfer.name, totalBytes: transfer.totalBytes, transferredBytes: transfer.transferredBytes, startedAt: transfer.startedAt)
         }.sorted { $0.startedAt < $1.startedAt }
 
         let curQueuedUploads = Array(queuedUploads.values).sorted { $0.queuedAt < $1.queuedAt }

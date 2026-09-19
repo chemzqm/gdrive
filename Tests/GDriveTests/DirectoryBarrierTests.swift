@@ -6,11 +6,11 @@ import Testing
 final class MockDirectoryBarrierURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
 
-    override class func canInit(with request: URLRequest) -> Bool {
+    override static func canInit(with request: URLRequest) -> Bool {
         return true
     }
 
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
         return request
     }
 
@@ -181,11 +181,11 @@ struct DirectoryBarrierTests {
             if method == "PATCH" && url.contains("/drive/v3/files/\(parentDirRemoteId)") {
                 trashedRemoteFolders.append(parentDirRemoteId)
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (response, "{}".data(using: .utf8)!)
+                return (response, Data("{}".utf8))
             }
 
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, "{}".data(using: .utf8)!)
+            return (response, Data("{}".utf8))
         }
 
         // These cases exercise an established baseline; a missing cursor now correctly
@@ -320,7 +320,7 @@ struct DirectoryBarrierTests {
             if method == "PATCH" && url.contains("/drive/v3/files/\(parentDirRemoteId)") {
                 untrashedRemoteFolders.append(parentDirRemoteId)
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (response, "{}".data(using: .utf8)!)
+                return (response, Data("{}".utf8))
             }
 
             // Multipart upload
@@ -334,7 +334,7 @@ struct DirectoryBarrierTests {
             }
 
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, "{}".data(using: .utf8)!)
+            return (response, Data("{}".utf8))
         }
 
         // These cases exercise an established baseline; a missing cursor now correctly
@@ -504,11 +504,11 @@ struct DirectoryBarrierTests {
                     trashedRemoteOrder.append(parentDirRemoteId)
                 }
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (response, "{}".data(using: .utf8)!)
+                return (response, Data("{}".utf8))
             }
 
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, "{}".data(using: .utf8)!)
+            return (response, Data("{}".utf8))
         }
 
         // These cases exercise an established baseline; a missing cursor now correctly
@@ -670,11 +670,11 @@ struct DirectoryBarrierTests {
             if method == "PATCH" && url.contains("/drive/v3/files/\(parentDirRemoteId)") {
                 trashedRemoteFolders.append(parentDirRemoteId)
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-                return (response, "{}".data(using: .utf8)!)
+                return (response, Data("{}".utf8))
             }
 
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, "{}".data(using: .utf8)!)
+            return (response, Data("{}".utf8))
         }
 
         // These cases exercise an established baseline; a missing cursor now correctly
@@ -733,7 +733,7 @@ struct DirectoryBarrierTests {
         try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
 
         let childFile = subDir.appendingPathComponent("child.txt")
-        let contentData = "Content to delete".data(using: .utf8)!
+        let contentData = Data("Content to delete".utf8)
         try contentData.write(to: childFile)
         let validSha256 = SHA256.hash(data: contentData).map { String(format: "%02x", $0) }.joined()
 
@@ -834,7 +834,7 @@ struct DirectoryBarrierTests {
                 return (response, json.data(using: .utf8)!)
             }
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
-            return (response, "{}".data(using: .utf8)!)
+            return (response, Data("{}".utf8))
         }
 
         // These cases exercise an established baseline; a missing cursor now correctly

@@ -127,42 +127,7 @@ extension IncrementalSyncRun {
             )
             throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
         }
-        let remoteRoot: DriveFile
-        do {
-            remoteRoot = try await engine.client.getFile(remoteId: remoteRootID)
-        } catch let error as DriveError {
-            switch error {
-            case .notFound:
-                engine.logger.error(
-                    "[Sync] The remote sync root does not exist (404): \(remoteRootID). Stopping sync to protect local files."
-                )
-                throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notFound")
-            default: throw error
-            }
-        } catch {
-            let nsError = error as NSError
-            if (nsError.domain == "SyncEngine" || nsError.domain == "DriveError")
-                && nsError.code == 404
-            {
-                engine.logger.error(
-                    "[Sync] The remote sync root does not exist (404): \(remoteRootID). Stopping sync to protect local files."
-                )
-                throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notFound")
-            }
-            throw error
-        }
-        if remoteRoot.trashed == true {
-            engine.logger.error(
-                "[Sync] The remote sync root is trashed: \(remoteRootID). Stopping sync to protect local files."
-            )
-            throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "trashed")
-        }
-        guard remoteRoot.isDirectory else {
-            engine.logger.error(
-                "[Sync] The remote sync root is not a valid directory: \(remoteRootID). Stopping sync to protect local files."
-            )
-            throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notDirectory")
-        }
+        try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
             remoteRootID: remoteRootID, localRoot: rootURL)
         let pendingConflicts = try await ConflictOperation.pending(
@@ -171,10 +136,10 @@ extension IncrementalSyncRun {
         if !pendingConflicts.isEmpty {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 let limit = max(1, min(64, maxConcurrency))
-                for (index, op) in pendingConflicts.enumerated() {
+                for (index, pendingOperation) in pendingConflicts.enumerated() {
                     if index >= limit { try await group.next() }
                     group.addTask {
-                        try await engine.resolveConflict(op, temporaryDirectory: downloadDirectory)
+                        try await engine.resolveConflict(pendingOperation, temporaryDirectory: downloadDirectory)
                     }
                 }
                 try await group.waitForAll()
@@ -257,5 +222,45 @@ extension IncrementalSyncRun {
         stats.elapsedSeconds = elapsed
         notifier.finish()
         return stats
+    }
+}
+
+extension IncrementalSyncRun {
+    private static func validateRemoteRoot(engine: SyncEngine, remoteRootID: String) async throws {
+        let remoteRoot: DriveFile
+        do {
+            remoteRoot = try await engine.client.getFile(remoteId: remoteRootID)
+        } catch let error as DriveError {
+            switch error {
+            case .notFound:
+                engine.logger.error(
+                    "[Sync] The remote sync root does not exist (404): \(remoteRootID). Stopping sync to protect local files."
+                )
+                throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notFound")
+            default: throw error
+            }
+        } catch {
+            let nsError = error as NSError
+            if (nsError.domain == "SyncEngine" || nsError.domain == "DriveError")
+                && nsError.code == 404 {
+                engine.logger.error(
+                    "[Sync] The remote sync root does not exist (404): \(remoteRootID). Stopping sync to protect local files."
+                )
+                throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notFound")
+            }
+            throw error
+        }
+        if remoteRoot.trashed == true {
+            engine.logger.error(
+                "[Sync] The remote sync root is trashed: \(remoteRootID). Stopping sync to protect local files."
+            )
+            throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "trashed")
+        }
+        guard remoteRoot.isDirectory else {
+            engine.logger.error(
+                "[Sync] The remote sync root is not a valid directory: \(remoteRootID). Stopping sync to protect local files."
+            )
+            throw SyncEngineError.remoteRootLost(remoteId: remoteRootID, reason: "notDirectory")
+        }
     }
 }

@@ -27,9 +27,9 @@ extension SyncEngine {
     ) async throws -> DriveFile {
         if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteId) }
         let opId = "resumable_\(remoteId)"
-        var sessionURL: URL? = nil
+        var sessionURL: URL?
         var currentOffset: Int64 = 0
-        var completedFile: DriveFile? = nil
+        var completedFile: DriveFile?
 
         struct ExistingResumableOp {
             let sessionURL: URL
@@ -56,39 +56,42 @@ extension SyncEngine {
             return nil
         }
 
-        if let existing = existingOp {
-            // Key: Verify Breakpoint Session Expectations sha256 Whether the file size is strictly consistent with the current file!
-            // If the file has been modified in the middle, the old session will be immediately invalidated and reset to prevent incorrect resumption of data from splicing dirty data in the cloud.
-            let isSameFile = (existing.totalBytes == fileSize &&
-                              existing.expectedSha256.caseInsensitiveCompare(expectedSha256) == .orderedSame)
-            if isSameFile {
-                // Detect the valid data actually received by the server from the cloud. offset
-                do {
-                    switch try await client.queryResumableOffset(sessionURL: existing.sessionURL, totalBytes: fileSize) {
-                    case .complete(let file):
-                        completedFile = file
-                        sessionURL = existing.sessionURL
-                        currentOffset = fileSize
-                    case .incomplete(let serverOffset):
-                        guard serverOffset >= 0, serverOffset < fileSize else {
-                            throw DriveError.invalidResponse(message: "Resumable upload offset is out of bounds: \(serverOffset)/\(fileSize)")
+        func restoreExistingSession() async throws {
+            if let existing = existingOp {
+                // Key: Verify Breakpoint Session Expectations sha256 Whether the file size is strictly consistent with the current file!
+                // If the file has been modified in the middle, the old session will be immediately invalidated and reset to prevent incorrect resumption of data from splicing dirty data in the cloud.
+                let isSameFile = (existing.totalBytes == fileSize &&
+                                  existing.expectedSha256.caseInsensitiveCompare(expectedSha256) == .orderedSame)
+                if isSameFile {
+                    // Detect the valid data actually received by the server from the cloud. offset
+                    do {
+                        switch try await client.queryResumableOffset(sessionURL: existing.sessionURL, totalBytes: fileSize) {
+                        case .complete(let file):
+                            completedFile = file
+                            sessionURL = existing.sessionURL
+                            currentOffset = fileSize
+                        case .incomplete(let serverOffset):
+                            guard serverOffset >= 0, serverOffset < fileSize else {
+                                throw DriveError.invalidResponse(message: "Resumable upload offset is out of bounds: \(serverOffset)/\(fileSize)")
+                            }
+                            sessionURL = existing.sessionURL
+                            currentOffset = serverOffset
+                        case .expired:
+                            sessionURL = nil
+                            currentOffset = 0
                         }
-                        sessionURL = existing.sessionURL
-                        currentOffset = serverOffset
-                    case .expired:
-                        sessionURL = nil
-                        currentOffset = 0
+                    } catch {
+                        // Ad hoc network/Server-side failures must not discard sessions that may still be valid.
+                        throw error
                     }
-                } catch {
-                    // Ad hoc network/Server-side failures must not discard sessions that may still be valid.
-                    throw error
+                } else {
+                    // The file content or size has changed, the breakpoint will be invalidated, and a new upload will be initiated again.
+                    sessionURL = nil
+                    currentOffset = 0
                 }
-            } else {
-                // The file content or size has changed, the breakpoint will be invalidated, and a new upload will be initiated again.
-                sessionURL = nil
-                currentOffset = 0
             }
         }
+        try await restoreExistingSession()
 
         // 2. If there is no valid session, initiate a new Resumable Upload session and persist operation intent
         var activeSessionURL: URL
@@ -149,8 +152,7 @@ extension SyncEngine {
         var finalDriveFile: DriveFile? = completedFile
         var repeatedNoProgress = false
 
-        while currentOffset < fileSize {
-            // Detect whether the file is modified concurrently in the middle of uploading chunks
+        func validateSourceFile() async throws {
             if let currentAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path) {
                 let currentDiskSize = (currentAttrs[.size] as? NSNumber)?.int64Value ?? fileSize
                 let currentMtime = currentAttrs[.modificationDate] as? Date
@@ -169,6 +171,11 @@ extension SyncEngine {
                     throw DriveError.fileModifiedDuringUpload(path: fileURL.path)
                 }
             }
+        }
+
+        while currentOffset < fileSize {
+            // Detect whether the file is modified concurrently in the middle of uploading chunks
+            try await validateSourceFile()
 
             try fileHandle.seek(toOffset: UInt64(currentOffset))
             let bytesToRead = min(chunkSize, fileSize - currentOffset)
@@ -184,32 +191,35 @@ extension SyncEngine {
             )
 
             let previousOffset = currentOffset
-            switch result {
-            case .incomplete(let confirmedOffset):
-                guard confirmedOffset >= previousOffset,
-                      confirmedOffset <= previousOffset + Int64(chunkData.count),
-                      confirmedOffset < fileSize else {
-                    throw DriveError.invalidResponse(message: "Resumable upload confirmed an invalid offset: \(confirmedOffset); sent range \(previousOffset)-\(previousOffset + Int64(chunkData.count) - 1)")
-                }
-                if confirmedOffset == previousOffset {
-                    guard !repeatedNoProgress else {
-                        throw DriveError.invalidResponse(message: "Resumable upload repeatedly acknowledged no new bytes")
+            func applyChunkResult() async throws {
+                switch result {
+                case .incomplete(let confirmedOffset):
+                    guard confirmedOffset >= previousOffset,
+                          confirmedOffset <= previousOffset + Int64(chunkData.count),
+                          confirmedOffset < fileSize else {
+                        throw DriveError.invalidResponse(message: "Resumable upload confirmed an invalid offset: \(confirmedOffset); sent range \(previousOffset)-\(previousOffset + Int64(chunkData.count) - 1)")
                     }
-                    repeatedNoProgress = true
-                } else {
+                    if confirmedOffset == previousOffset {
+                        guard !repeatedNoProgress else {
+                            throw DriveError.invalidResponse(message: "Resumable upload repeatedly acknowledged no new bytes")
+                        }
+                        repeatedNoProgress = true
+                    } else {
+                        repeatedNoProgress = false
+                    }
+                    currentOffset = confirmedOffset
+                case .complete(let file):
+                    currentOffset = fileSize
+                    finalDriveFile = file
+                case .expired:
+                    activeSessionURL = isUpdate
+                        ? try await client.initiateResumableUpdate(remoteId: remoteId, totalBytes: fileSize)
+                        : try await client.initiateResumableUpload(name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
+                    currentOffset = 0
                     repeatedNoProgress = false
                 }
-                currentOffset = confirmedOffset
-            case .complete(let file):
-                currentOffset = fileSize
-                finalDriveFile = file
-            case .expired:
-                activeSessionURL = isUpdate
-                    ? try await client.initiateResumableUpdate(remoteId: remoteId, totalBytes: fileSize)
-                    : try await client.initiateResumableUpload(name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
-                currentOffset = 0
-                repeatedNoProgress = false
             }
+            try await applyChunkResult()
             let confirmedBytes = max(0, currentOffset - previousOffset)
             if confirmedBytes > 0 {
                 self.monitor.reportUploadProgress(id: fileURL.path, additionalBytes: confirmedBytes)
@@ -283,5 +293,3 @@ extension SyncEngine {
     }
 
 }
-
-

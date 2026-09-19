@@ -35,6 +35,12 @@ private final class IntentResultBox: @unchecked Sendable {
 }
 
 enum DurableCreateIntentStore {
+    private struct ItemIdentity: Sendable {
+        let itemID: Int64
+        let remoteID: String
+        let localGeneration: Int64
+    }
+
     private static let recoverableStates = "'ready', 'inFlight', 'verify', 'unknownOutcome'"
 
     enum FileUploadTransport: Sendable {
@@ -225,7 +231,7 @@ enum DurableCreateIntentStore {
         device: Int64,
         inode: Int64,
         now: Double
-    ) throws -> (itemID: Int64, remoteID: String, localGeneration: Int64) {
+    ) throws -> ItemIdentity {
         let stmt = try conn.cachedStatement("""
         INSERT INTO items (
             root_id, parent_id, name, entry_kind, remote_file_id,
@@ -269,7 +275,7 @@ enum DurableCreateIntentStore {
         sha256: String,
         operationType: String,
         now: Double
-    ) throws -> (itemID: Int64, remoteID: String, localGeneration: Int64) {
+    ) throws -> ItemIdentity {
         if let requestedItemID {
             let update = try conn.cachedStatement("""
             UPDATE items SET
@@ -339,7 +345,7 @@ enum DurableCreateIntentStore {
         rootID: Int64,
         parentItemID: Int64,
         name: String
-    ) throws -> (itemID: Int64, remoteID: String, localGeneration: Int64) {
+    ) throws -> ItemIdentity {
         let query = try conn.cachedStatement("""
         SELECT item_id, remote_file_id, local_generation
         FROM items
@@ -354,7 +360,7 @@ enum DurableCreateIntentStore {
               let remoteID = query.columnText(at: 1) else {
             throw SyncEngineError.general("Unable to read the corresponding creation intent item: \(name)")
         }
-        return (itemID, remoteID, query.columnInt64(at: 2) ?? 0)
+        return ItemIdentity(itemID: itemID, remoteID: remoteID, localGeneration: query.columnInt64(at: 2) ?? 0)
     }
 
     private static func upsertOperation(

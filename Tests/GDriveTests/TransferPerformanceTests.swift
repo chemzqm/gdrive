@@ -6,8 +6,8 @@ import os
 private final class PerformanceURLProtocol: URLProtocol, @unchecked Sendable {
     static let firstUpload = OSAllocatedUnfairLock(initialState: UInt64(0))
     static let content = Data(repeating: 65, count: 4096)
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         do {
             let url = request.url!
@@ -20,7 +20,7 @@ private final class PerformanceURLProtocol: URLProtocol, @unchecked Sendable {
                 data = try JSONSerialization.data(withJSONObject: ["ids": (0..<1000).map { "prefetch-\($0)" }])
             } else if url.path.contains("/upload/") {
                 Self.firstUpload.withLock { if $0 == 0 { $0 = DispatchTime.now().uptimeNanoseconds } }
-                let body = String(decoding: request.extractBodyData ?? Data(), as: UTF8.self)
+                let body = (String(bytes: request.extractBodyData ?? Data(), encoding: .utf8) ?? "Invalid UTF-8 data")
                 let start = try #require(body.firstIndex(of: "{"))
                 let end = try #require(body[start...].firstIndex(of: "}"))
                 let metadata = try #require(JSONSerialization.jsonObject(with: Data(body[start...end].utf8)) as? [String: Any])
@@ -75,9 +75,9 @@ struct TransferPerformanceTests {
             let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }))
             if incremental {
                 try await store.write { conn in
-                    let r = try conn.prepare("INSERT INTO roots(account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at) VALUES ('default', ?, 1, 1, 'root', 'localToRemoteEmpty', 'existingKnown', 1, 1);")
-                    r.bindText(local.path, at: 1)
-                    _ = try r.step()
+                    let rootStatement = try conn.prepare("INSERT INTO roots(account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at) VALUES ('default', ?, 1, 1, 'root', 'localToRemoteEmpty', 'existingKnown', 1, 1);")
+                    rootStatement.bindText(local.path, at: 1)
+                    _ = try rootStatement.step()
                     let rootID = conn.lastInsertRowId
                     try conn.execute("INSERT INTO items(root_id, name, entry_kind, remote_file_id, local_status, remote_status, phase, created_at, updated_at) VALUES (\(rootID), 'local', 'directory', 'root', 'present', 'present', 'committed', 1, 1);")
                     try conn.execute("INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) VALUES (\(rootID), 'default', 'drive_changes', 'start', 1);")

@@ -56,7 +56,7 @@ struct StreamingLiveTests {
         let contents: [String: Data] = [
             "first.txt": Data("first streaming payload".utf8),
             "second.txt": Data("second streaming payload".utf8),
-            "third.txt": Data("third streaming payload".utf8),
+            "third.txt": Data("third streaming payload".utf8)
         ]
         for (name, data) in contents {
             try data.write(to: localRoot.appendingPathComponent(name))
@@ -115,36 +115,42 @@ struct StreamingLiveTests {
         var firstUploaded: DriveFile?
         var pollingError: Error?
         let deadline = Date().addingTimeInterval(30)
-        do {
-            while Date() < deadline {
-                let children = try await client.listChildren(parentId: remoteRoot.id)
-                if let file = children.first(where: { !$0.isDirectory }) {
-                    firstUploaded = file
-                    break
+        func pollFirstUpload() async {
+            do {
+                while Date() < deadline {
+                    let children = try await client.listChildren(parentId: remoteRoot.id)
+                    if let file = children.first(where: { !$0.isDirectory }) {
+                        firstUploaded = file
+                        break
+                    }
+                    try await Task.sleep(for: .milliseconds(200))
                 }
-                try await Task.sleep(for: .milliseconds(200))
+            } catch {
+                pollingError = error
             }
-        } catch {
-            pollingError = error
         }
+        await pollFirstUpload()
 
-        let heldSnapshot = await barrier.snapshot()
-        if let firstUploaded {
-            #expect(heldSnapshot.batchesConsumed == 1, "A later scan batch was consumed before the barrier was released")
-            #expect(!heldSnapshot.scanCompleted, "The directory scan completed before the first upload became visible")
-            if let expectedFirstSHA = expectedSHA[firstUploaded.name] {
-                #expect(
-                    firstUploaded.sha256Checksum?.lowercased() == expectedFirstSHA.lowercased(),
-                    "The first visible remote file must match its local SHA-256"
-                )
+        func verifyFirstUpload() async {
+            let heldSnapshot = await barrier.snapshot()
+            if let firstUploaded {
+                #expect(heldSnapshot.batchesConsumed == 1, "A later scan batch was consumed before the barrier was released")
+                #expect(!heldSnapshot.scanCompleted, "The directory scan completed before the first upload became visible")
+                if let expectedFirstSHA = expectedSHA[firstUploaded.name] {
+                    #expect(
+                        firstUploaded.sha256Checksum?.lowercased() == expectedFirstSHA.lowercased(),
+                        "The first visible remote file must match its local SHA-256"
+                    )
+                } else {
+                    Issue.record("Unexpected first remote file: \(firstUploaded.name)")
+                }
+            } else if let pollingError {
+                Issue.record("Polling the real Drive directory failed before the first upload was observed: \(pollingError)")
             } else {
-                Issue.record("Unexpected first remote file: \(firstUploaded.name)")
+                Issue.record("No file became visible in the real Drive directory within 30 seconds while the scan remained blocked")
             }
-        } else if let pollingError {
-            Issue.record("Polling the real Drive directory failed before the first upload was observed: \(pollingError)")
-        } else {
-            Issue.record("No file became visible in the real Drive directory within 30 seconds while the scan remained blocked")
         }
+        await verifyFirstUpload()
 
         await barrier.release()
 

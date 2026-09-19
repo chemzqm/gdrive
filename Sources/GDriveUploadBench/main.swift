@@ -11,7 +11,7 @@ LoggingSystem.bootstrap { label in
 
 struct Config {
     var localPath: String = "/Users/chemzqm/lib/vim"
-    var remoteRootId: String? = nil
+    var remoteRootId: String?
     var concurrency: Int = 64
     var cleanAfter: Bool = false
     var dbPath: String = "/tmp/gdrive_vim_bench.sqlite"
@@ -105,49 +105,54 @@ func elapsedSeconds(from start: DispatchTime, to end: DispatchTime) -> Double {
     Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000.0
 }
 
+private func parseArgument(_ arg: String, args: [String], index argumentIndex: inout Int,
+                           config: inout Config, positionals: inout [String]) {
+    switch arg {
+    case "-h", "--help":
+        print("""
+        Usage: gdrive-upload [local_path] [remote_folder_id] [options]
+
+        Arguments:
+          local_path          Local directory to upload (default: /Users/chemzqm/lib/vim)
+          remote_folder_id    Google Drive destination folder ID (default: create a test folder under My Drive)
+
+        Options:
+          -c, --concurrency   Concurrent uploads (default: 64, maximum: 64)
+          --db <path>         SQLite test database path (default: /tmp/gdrive_vim_bench.sqlite)
+          --clean             Delete the remote test directory and local database after the run
+          -h, --help          Show this help
+        """)
+        exit(0)
+    case "-c", "--concurrency":
+        if argumentIndex + 1 < args.count, let val = Int(args[argumentIndex + 1]) {
+            config.concurrency = max(1, min(64, val))
+            argumentIndex += 1
+        }
+    case "--db":
+        if argumentIndex + 1 < args.count {
+            config.dbPath = args[argumentIndex + 1]
+            argumentIndex += 1
+        }
+    case "--clean":
+        config.cleanAfter = true
+    default:
+        if !arg.hasPrefix("-") {
+            positionals.append(arg)
+        }
+    }
+}
+
 func parseArguments() -> Config {
     var config = Config()
     let args = CommandLine.arguments
 
-    var i = 1
+    var argumentIndex = 1
     var positionals = [String]()
 
-    while i < args.count {
-        let arg = args[i]
-        switch arg {
-        case "-h", "--help":
-            print("""
-            Usage: gdrive-upload [local_path] [remote_folder_id] [options]
-
-            Arguments:
-              local_path          Local directory to upload (default: /Users/chemzqm/lib/vim)
-              remote_folder_id    Google Drive destination folder ID (default: create a test folder under My Drive)
-
-            Options:
-              -c, --concurrency   Concurrent uploads (default: 64, maximum: 64)
-              --db <path>         SQLite test database path (default: /tmp/gdrive_vim_bench.sqlite)
-              --clean             Delete the remote test directory and local database after the run
-              -h, --help          Show this help
-            """)
-            exit(0)
-        case "-c", "--concurrency":
-            if i + 1 < args.count, let val = Int(args[i + 1]) {
-                config.concurrency = max(1, min(64, val))
-                i += 1
-            }
-        case "--db":
-            if i + 1 < args.count {
-                config.dbPath = args[i + 1]
-                i += 1
-            }
-        case "--clean":
-            config.cleanAfter = true
-        default:
-            if !arg.hasPrefix("-") {
-                positionals.append(arg)
-            }
-        }
-        i += 1
+    while argumentIndex < args.count {
+        let arg = args[argumentIndex]
+        parseArgument(arg, args: args, index: &argumentIndex, config: &config, positionals: &positionals)
+        argumentIndex += 1
     }
 
     if positionals.count >= 1 {
@@ -161,11 +166,11 @@ func parseArguments() -> Config {
 }
 
 func formatBytes(_ bytes: Int64) -> String {
-    let mb = Double(bytes) / (1024.0 * 1024.0)
-    if mb >= 1024 {
-        return String(format: "%.2f GB", mb / 1024.0)
+    let megabytes = Double(bytes) / (1024.0 * 1024.0)
+    if megabytes >= 1024 {
+        return String(format: "%.2f GB", megabytes / 1024.0)
     }
-    return String(format: "%.2f MB", mb)
+    return String(format: "%.2f MB", megabytes)
 }
 
 func main() async -> Int32 {

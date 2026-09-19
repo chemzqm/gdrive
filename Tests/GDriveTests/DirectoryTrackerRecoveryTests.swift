@@ -9,8 +9,8 @@ final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
     private var isStopped = false
     private let lock = NSLock()
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let handler = Self.requestHandler else {
@@ -256,18 +256,18 @@ struct DirectoryTrackerRecoveryTests {
             let path = url.path
 
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if path.hasSuffix("/files/generateIds") {
                 let ids = (0..<100).map { "mock_id_\($0)" }
-                let json = try! JSONSerialization.data(withJSONObject: ["ids": ids])
+                let json = try JSONSerialization.data(withJSONObject: ["ids": ids])
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if request.httpMethod == "GET", path.contains("/files/\(remoteRootId)") {
-                let json = """
+                let json = Data("""
                 {
                     "id": "\(remoteRootId)",
                     "name": "local_root",
@@ -275,12 +275,12 @@ struct DirectoryTrackerRecoveryTests {
                     "parents": [],
                     "trashed": false
                 }
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if request.httpMethod == "GET", path.hasSuffix("/drive/v3/files") {
-                let json = #"{"files": []}"#.data(using: .utf8)!
+                let json = Data(#"{"files": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -289,13 +289,13 @@ struct DirectoryTrackerRecoveryTests {
                    let bodyStr = String(data: bodyData, encoding: .utf8),
                    bodyStr.contains("broken_dir") {
                     // Inject 403 Forbidden on broken_dir creation
-                    let errJson = #"{"error": {"code": 403, "message": "The user does not have sufficient permissions for broken_dir"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 403, "message": "The user does not have sufficient permissions for broken_dir"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 }
 
                 if path.contains("/upload/drive/v3/files") {
                     // Multipart upload of healthy file
-                    let json = """
+                    let json = Data("""
                     {
                         "id": "file3_uploaded_id",
                         "name": "file3.txt",
@@ -303,18 +303,18 @@ struct DirectoryTrackerRecoveryTests {
                         "size": "\(healthySize)",
                         "sha256Checksum": "\(healthySha256)"
                     }
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
                 }
 
                 // Healthy directory creation
-                let json = """
+                let json = Data("""
                 {
                     "id": "healthy_dir_id",
                     "name": "healthy_dir",
                     "mimeType": "application/vnd.google-apps.folder"
                 }
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -369,18 +369,18 @@ struct DirectoryTrackerRecoveryTests {
             let path = url.path
 
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if path.hasSuffix("/files/generateIds") {
                 let ids = (0..<100).map { "mock_id_\($0)" }
-                let json = try! JSONSerialization.data(withJSONObject: ["ids": ids])
+                let json = try JSONSerialization.data(withJSONObject: ["ids": ids])
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if request.httpMethod == "GET", path.contains("/files/\(remoteRootId)") {
-                let json = """
+                let json = Data("""
                 {
                     "id": "\(remoteRootId)",
                     "name": "local_root",
@@ -388,12 +388,12 @@ struct DirectoryTrackerRecoveryTests {
                     "parents": [],
                     "trashed": false
                 }
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if request.httpMethod == "GET", path.hasSuffix("/drive/v3/files") {
-                let json = #"{"files": []}"#.data(using: .utf8)!
+                let json = Data(#"{"files": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -402,12 +402,12 @@ struct DirectoryTrackerRecoveryTests {
                    let bodyStr = String(data: bodyData, encoding: .utf8),
                    bodyStr.contains("conflict_dir") {
                     // Inject 409 Conflict that cannot be verified (e.g. 500 on verify or non-folder)
-                    let errJson = #"{"error": {"code": 409, "message": "Conflict on conflict_dir"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 409, "message": "Conflict on conflict_dir"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 409, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 }
 
                 if path.contains("/upload/drive/v3/files") {
-                    let json = """
+                    let json = Data("""
                     {
                         "id": "healthy_file_id",
                         "name": "healthy_file.txt",
@@ -415,17 +415,17 @@ struct DirectoryTrackerRecoveryTests {
                         "size": "\(healthySize)",
                         "sha256Checksum": "\(healthySha256)"
                     }
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
                 }
 
-                let json = """
+                let json = Data("""
                 {
                     "id": "healthy_dir_id",
                     "name": "healthy_dir",
                     "mimeType": "application/vnd.google-apps.folder"
                 }
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -454,11 +454,11 @@ struct DirectoryTrackerRecoveryTests {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let localRootDir = tempDir.appendingPathComponent("local_root")
-        for i in 1...3 {
-            let sub = localRootDir.appendingPathComponent("dir_\(i)")
+        for directoryIndex in 1...3 {
+            let sub = localRootDir.appendingPathComponent("dir_\(directoryIndex)")
             try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
-            for j in 1...2 {
-                try "data".write(to: sub.appendingPathComponent("file_\(j).txt"), atomically: true, encoding: .utf8)
+            for fileIndex in 1...2 {
+                try "data".write(to: sub.appendingPathComponent("file_\(fileIndex).txt"), atomically: true, encoding: .utf8)
             }
         }
 
@@ -474,16 +474,16 @@ struct DirectoryTrackerRecoveryTests {
             let url = try #require(request.url)
             let path = url.path
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
                 let ids = (0..<100).map { "id_\($0)" }
-                let json = try! JSONSerialization.data(withJSONObject: ["ids": ids])
+                let json = try JSONSerialization.data(withJSONObject: ["ids": ids])
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "GET", path.contains("/files/\(remoteRootId)") {
-                let json = """
+                let json = Data("""
                 {
                     "id": "\(remoteRootId)",
                     "name": "local_root",
@@ -491,23 +491,23 @@ struct DirectoryTrackerRecoveryTests {
                     "parents": [],
                     "trashed": false
                 }
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "GET", path.hasSuffix("/drive/v3/files") {
-                let json = #"{"files": []}"#.data(using: .utf8)!
+                let json = Data(#"{"files": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             // For creation requests, sleep slightly to allow cancellation to happen mid-flight
             Thread.sleep(forTimeInterval: 0.05)
-            let json = """
+            let json = Data("""
             {
                 "id": "dir_mock",
                 "name": "dir",
                 "mimeType": "application/vnd.google-apps.folder"
             }
-            """.data(using: .utf8)!
+            """.utf8)
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
         }
 

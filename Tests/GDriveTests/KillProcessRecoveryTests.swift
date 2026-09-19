@@ -108,7 +108,7 @@ struct KillProcessRecoveryTests {
         let stderr = (process.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile() ?? Data()
         #expect(
             process.terminationReason == .exit && process.terminationStatus == 0,
-            "Helper failed: \(String(decoding: stderr, as: UTF8.self))"
+            "Helper failed: \((String(bytes: stderr, encoding: .utf8) ?? "Invalid UTF-8 data"))"
         )
     }
 
@@ -127,10 +127,10 @@ struct KillProcessRecoveryTests {
             process.waitUntilExit()
             let stderr = (process.standardError as? Pipe)?.fileHandleForReading.readDataToEndOfFile() ?? Data()
             throw CocoaError(.fileReadUnknown, userInfo: [
-                NSLocalizedDescriptionKey: "Helper exited before acknowledgement: \(String(decoding: stderr, as: UTF8.self))"
+                NSLocalizedDescriptionKey: "Helper exited before acknowledgement: \((String(bytes: stderr, encoding: .utf8) ?? "Invalid UTF-8 data"))"
             ])
         }
-        return String(decoding: data, as: UTF8.self)
+        return (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
     }
 
     private static func killAndWait(_ process: Process) throws {

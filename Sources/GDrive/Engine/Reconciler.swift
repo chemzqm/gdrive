@@ -105,6 +105,66 @@ public struct Reconciler: Sendable {
         let localStatus = local?.status ?? .unknown
         let remoteStatus = remote?.status ?? .unknown
 
+        if let decision = waitingForEvidence(localStatus: localStatus, remoteStatus: remoteStatus,
+                                             local: local, remote: remote) {
+            return decision
+        }
+
+        let baseSha = baseline?.sha256?.lowercased()
+        let localSha = local?.sha256?.lowercased()
+        let remoteSha = remote?.sha256?.lowercased()
+
+        // 4. No common baseline B(Initial sync or startup file)
+        guard let baseSha else {
+            return decideWithoutBaseline(baseSha: baseSha, localSha: localSha, remoteSha: remoteSha,
+                                         localStatus: localStatus, remoteStatus: remoteStatus, local: local)
+        }
+
+        // 5. Has common baseline B:Calculate the change status of both ends from baseline
+        // At this time, due to the pre-completeness check,present in the state of localSha and remoteSha Definitely not empty
+        let localChanged = (localStatus == .present && localSha != baseSha)
+        let remoteChanged = (remoteStatus == .present && remoteSha != baseSha)
+        let localUnchanged = (localStatus == .present && localSha == baseSha)
+        let remoteUnchanged = (remoteStatus == .present && remoteSha == baseSha)
+
+        let localDeleted = (localStatus == .absent)
+        let remoteDeleted = (remoteStatus == .absent || remoteStatus == .trashed)
+
+        if let decision = deletionDecision(localDeleted: localDeleted, remoteDeleted: remoteDeleted,
+                                           localChanged: localChanged, remoteChanged: remoteChanged,
+                                           localUnchanged: localUnchanged, remoteUnchanged: remoteUnchanged) {
+            return decision
+        }
+
+        // 5.4 Content Change Scenario
+        if localChanged && remoteUnchanged {
+            return .upload(reason: "Only local content changed")
+        }
+
+        if remoteChanged && localUnchanged {
+            return .download(reason: "Only remote content changed")
+        }
+
+        if localUnchanged && remoteUnchanged {
+            return .unchanged
+        }
+
+        if localChanged && remoteChanged {
+            if let localSha, let remoteSha, localSha == remoteSha {
+                return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
+            } else {
+                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
+                return .conflict(winner: .remote, conflictId: String(conflictId))
+            }
+        }
+
+        return .waitingEvidence(reason: "Status evidence does not satisfy any explicit decision path")
+    }
+
+    private static func waitingForEvidence(
+        localStatus: LocalObservation.Status, remoteStatus: RemoteObservation.Status,
+        local: LocalObservation?, remote: RemoteObservation?
+    ) -> ReconcileDecision? {
         // 1. Local state is in write instability, waiting for write stability
         if localStatus == .unstable {
             return .waitingEvidence(reason: "Local file body is unstable, writing")
@@ -128,55 +188,51 @@ public struct Reconciler: Sendable {
         if remoteStatus == .present && (remote?.sha256 == nil || remote?.sha256?.isEmpty == true) {
             return .waitingEvidence(reason: "Remote file body SHA-256 To be acquired")
         }
+        return nil
+    }
 
-        let baseSha = baseline?.sha256?.lowercased()
-        let localSha = local?.sha256?.lowercased()
-        let remoteSha = remote?.sha256?.lowercased()
-
-        // 4. No common baseline B(Initial sync or startup file)
-        guard let baseSha else {
-            // Locally present and remotely explicitly confirmed not to exist (absent)
-            if localStatus == .present && remoteStatus == .absent {
-                return .upload(reason: "New local file")
-            }
-            // Remotely present and locally explicitly confirmed not to exist (absent)
-            if remoteStatus == .present && localStatus == .absent {
-                return .download(reason: "New remote file")
-            }
-            // Both present but no baseline
-            if localStatus == .present && remoteStatus == .present {
-                if let localSha, let remoteSha, localSha == remoteSha {
-                    return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
-                } else {
-                    let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                    return .conflict(winner: .remote, conflictId: String(conflictId))
-                }
-            }
-            // Neither local nor remote
-            if localStatus == .absent && remoteStatus == .absent {
-                return .unchanged
-            }
-            // Remote end in trash, local does not exist
-            if localStatus == .absent && remoteStatus == .trashed {
-                return .unchanged
-            }
-            // Remote end in Trash, new file locally
-            if localStatus == .present && remoteStatus == .trashed {
-                return .keepModified(preferLocal: true)
-            }
-            return .waitingEvidence(reason: "No baseline and status does not meet explicit creation criteria")
+    private static func decideWithoutBaseline(
+        baseSha: String?, localSha: String?, remoteSha: String?,
+        localStatus: LocalObservation.Status, remoteStatus: RemoteObservation.Status,
+        local: LocalObservation?
+    ) -> ReconcileDecision {
+        // Locally present and remotely explicitly confirmed not to exist (absent)
+        if localStatus == .present && remoteStatus == .absent {
+            return .upload(reason: "New local file")
         }
+        // Remotely present and locally explicitly confirmed not to exist (absent)
+        if remoteStatus == .present && localStatus == .absent {
+            return .download(reason: "New remote file")
+        }
+        // Both present but no baseline
+        if localStatus == .present && remoteStatus == .present {
+            if let localSha, let remoteSha, localSha == remoteSha {
+                return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
+            } else {
+                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
+                return .conflict(winner: .remote, conflictId: String(conflictId))
+            }
+        }
+        // Neither local nor remote
+        if localStatus == .absent && remoteStatus == .absent {
+            return .unchanged
+        }
+        // Remote end in trash, local does not exist
+        if localStatus == .absent && remoteStatus == .trashed {
+            return .unchanged
+        }
+        // Remote end in Trash, new file locally
+        if localStatus == .present && remoteStatus == .trashed {
+            return .keepModified(preferLocal: true)
+        }
+        return .waitingEvidence(reason: "No baseline and status does not meet explicit creation criteria")
+    }
 
-        // 5. Has common baseline B:Calculate the change status of both ends from baseline
-        // At this time, due to the pre-completeness check,present in the state of localSha and remoteSha Definitely not empty
-        let localChanged = (localStatus == .present && localSha != baseSha)
-        let remoteChanged = (remoteStatus == .present && remoteSha != baseSha)
-        let localUnchanged = (localStatus == .present && localSha == baseSha)
-        let remoteUnchanged = (remoteStatus == .present && remoteSha == baseSha)
-
-        let localDeleted = (localStatus == .absent)
-        let remoteDeleted = (remoteStatus == .absent || remoteStatus == .trashed)
-
+    private static func deletionDecision(
+        localDeleted: Bool, remoteDeleted: Bool,
+        localChanged: Bool, remoteChanged: Bool,
+        localUnchanged: Bool, remoteUnchanged: Bool
+    ) -> ReconcileDecision? {
         // 5.1 Delete on both ends
         if localDeleted && remoteDeleted {
             return .unchanged
@@ -203,29 +259,6 @@ public struct Reconciler: Sendable {
                 return .deleteLocal
             }
         }
-
-        // 5.4 Content Change Scenario
-        if localChanged && remoteUnchanged {
-            return .upload(reason: "Only local content changed")
-        }
-
-        if remoteChanged && localUnchanged {
-            return .download(reason: "Only remote content changed")
-        }
-
-        if localUnchanged && remoteUnchanged {
-            return .unchanged
-        }
-
-        if localChanged && remoteChanged {
-            if let localSha, let remoteSha, localSha == remoteSha {
-                return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
-            } else {
-                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                return .conflict(winner: .remote, conflictId: String(conflictId))
-            }
-        }
-
-        return .waitingEvidence(reason: "Status evidence does not satisfy any explicit decision path")
+        return nil
     }
 }

@@ -31,7 +31,7 @@ struct DriveClientTests {
 
         // 2. Upload a small file and verify it SHA-256
         let fileName = "hello.txt"
-        let fileContent = "Hello Google Drive from GDrive client at \(Date())!\n".data(using: .utf8)!
+        let fileContent = Data("Hello Google Drive from GDrive client at \(Date())!\n".utf8)
 
         var ctx = CC_SHA256_CTX()
         CC_SHA256_Init(&ctx)

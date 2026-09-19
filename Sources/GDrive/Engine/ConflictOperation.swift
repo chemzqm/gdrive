@@ -25,12 +25,12 @@ struct ConflictOperation: Codable, Sendable {
 
     static func pending(store: StateStore, rootID: Int64) async throws -> [Self] {
         try await store.read { conn in
-            let q = try conn.cachedStatement("SELECT payload FROM operations INDEXED BY idx_operations_conflict_pending_root WHERE root_id = ? AND operation_type = 'resolveConflict' AND state IN (\(activeStates));")
-            defer { q.reset() }
-            q.bindInt64(rootID, at: 1)
+            let queryStatement = try conn.cachedStatement("SELECT payload FROM operations INDEXED BY idx_operations_conflict_pending_root WHERE root_id = ? AND operation_type = 'resolveConflict' AND state IN (\(activeStates));")
+            defer { queryStatement.reset() }
+            queryStatement.bindInt64(rootID, at: 1)
             var result: [Self] = []
-            while try q.step() {
-                guard let text = q.columnText(at: 0) else { throw SyncEngineError.general("Missing conflict intent") }
+            while try queryStatement.step() {
+                guard let text = queryStatement.columnText(at: 0) else { throw SyncEngineError.general("Missing conflict intent") }
                 result.append(try JSONDecoder().decode(Self.self, from: Data(text.utf8)))
             }
             return result
@@ -96,7 +96,7 @@ struct ConflictOperation: Codable, Sendable {
             intent.bindText(id, at: 1)
             intent.bindInt64(rootID, at: 2)
             intent.bindInt64(itemID, at: 3)
-            intent.bindText(String(decoding: try JSONEncoder().encode(operation), as: UTF8.self), at: 4)
+            intent.bindText((String(bytes: try JSONEncoder().encode(operation), encoding: .utf8) ?? "Invalid UTF-8 data"), at: 4)
             let now = Date().timeIntervalSince1970
             intent.bindDouble(now, at: 5)
             intent.bindDouble(now, at: 6)
@@ -109,17 +109,17 @@ struct ConflictOperation: Codable, Sendable {
     }
 
     func validatePlan(_ conn: SQLiteConnection) throws {
-        let q = try conn.cachedStatement("""
+        let queryStatement = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
                 AND dirty_generation = ? AND is_tombstone = 0 AND conflict_id = ?;
             """)
-        defer { q.reset() }
-        q.bindInt64(itemID, at: 1)
-        q.bindInt64(localGeneration, at: 2)
-        q.bindInt64(remoteGeneration, at: 3)
-        q.bindInt64(dirtyGeneration, at: 4)
-        q.bindText(id, at: 5)
-        guard try q.step() else { throw SyncEngineError.general("Conflict plan is stale; pending state was preserved") }
+        defer { queryStatement.reset() }
+        queryStatement.bindInt64(itemID, at: 1)
+        queryStatement.bindInt64(localGeneration, at: 2)
+        queryStatement.bindInt64(remoteGeneration, at: 3)
+        queryStatement.bindInt64(dirtyGeneration, at: 4)
+        queryStatement.bindText(id, at: 5)
+        guard try queryStatement.step() else { throw SyncEngineError.general("Conflict plan is stale; pending state was preserved") }
         let copy = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND remote_file_id = ? AND root_id = ?
                 AND local_generation = 0 AND remote_generation = 0 AND dirty_generation = 1
@@ -138,7 +138,7 @@ enum ConflictCheckpoint: String, Sendable, CaseIterable {
 }
 
 extension SyncEngine {
-    func resolveConflict(_ op: ConflictOperation,
+    func resolveConflict(_ conflictOperation: ConflictOperation,
                          temporaryDirectory: URL? = nil,
                          checkpoint: (@Sendable (ConflictCheckpoint) throws -> Void)? = nil) async throws {
         let downloadDirectory: URL
@@ -148,7 +148,7 @@ extension SyncEngine {
             let root = try await store.read { conn -> (String, String) in
                 let query = try conn.cachedStatement("SELECT remote_root_id, local_root_path FROM roots WHERE root_id = ?;")
                 defer { query.reset() }
-                query.bindInt64(op.rootID, at: 1)
+                query.bindInt64(conflictOperation.rootID, at: 1)
                 guard try query.step(), let remoteID = query.columnText(at: 0),
                       let localPath = query.columnText(at: 1) else {
                     throw SyncEngineError.general("Conflict recovery is missing its sync root")
@@ -158,82 +158,87 @@ extension SyncEngine {
             downloadDirectory = try await downloadStagingDirectory(remoteRootID: root.0,
                 localRoot: URL(fileURLWithPath: (root.1 as NSString).expandingTildeInPath))
         }
-        let original = URL(fileURLWithPath: op.originalPath)
-        let copy = URL(fileURLWithPath: op.copyPath)
-        try await store.read { try op.validatePlan($0) }
+        let original = URL(fileURLWithPath: conflictOperation.originalPath)
+        let copy = URL(fileURLWithPath: conflictOperation.copyPath)
+        try await store.read { try conflictOperation.validatePlan($0) }
         try checkpoint?(.intent)
-        if !FileManager.default.fileExists(atPath: copy.path) {
-            guard let before = try LocalFileVersion.read(at: original) else { throw CocoaError(.fileNoSuchFile) }
-            // APFS clone is exclusive and constant-space; keep the original available until
-            // the remote copy is confirmed. Never fall back to a full large-file disk copy.
-            guard clonefile(original.path, copy.path, UInt32(CLONE_NOFOLLOW)) == 0 else {
-                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        func ensureConflictCopy() throws {
+            if !FileManager.default.fileExists(atPath: copy.path) {
+                guard let before = try LocalFileVersion.read(at: original) else { throw CocoaError(.fileNoSuchFile) }
+                // APFS clone is exclusive and constant-space; keep the original available until
+                // the remote copy is confirmed. Never fall back to a full large-file disk copy.
+                guard clonefile(original.path, copy.path, UInt32(CLONE_NOFOLLOW)) == 0 else {
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                try before.validate(at: original)
             }
-            try before.validate(at: original)
         }
+        try ensureConflictCopy()
         try checkpoint?(.copy)
         let input = try StableUploadInput.capture(at: copy)
-        guard input.sha256 == op.localSHA else {
-            throw DriveError.checksumMismatch(expected: op.localSHA, actual: input.sha256)
+        guard input.sha256 == conflictOperation.localSHA else {
+            throw DriveError.checksumMismatch(expected: conflictOperation.localSHA, actual: input.sha256)
         }
         // Probe the reserved ID first: includes create-success/response-loss and completed
         // resumable sessions. Only a confirmed 404 permits a create, always with the same ID.
-        let uploaded: DriveFile
-        do {
-            uploaded = try await client.getFile(remoteId: op.copyRemoteID)
-        } catch DriveError.notFound {
-            if let bytes = input.data {
-                uploaded = try await client.uploadMultipart(name: copy.lastPathComponent,
-                    parentId: op.parentRemoteID, remoteId: op.copyRemoteID,
-                    content: bytes, expectedSha256: op.localSHA)
-            } else {
-                uploaded = try await performResumableUpload(rootId: op.rootID, itemId: op.copyItemID,
-                    fileURL: input.fileURL, fileSize: input.size, expectedSha256: op.localSHA,
-                    remoteId: op.copyRemoteID, parentId: op.parentRemoteID,
-                    name: copy.lastPathComponent, isUpdate: false)
+        func uploadConflictCopy() async throws -> DriveFile {
+            do {
+                return try await client.getFile(remoteId: conflictOperation.copyRemoteID)
+            } catch DriveError.notFound {
+                if let bytes = input.data {
+                    return try await client.uploadMultipart(name: copy.lastPathComponent,
+                        parentId: conflictOperation.parentRemoteID, remoteId: conflictOperation.copyRemoteID,
+                        content: bytes, expectedSha256: conflictOperation.localSHA)
+                } else {
+                    return try await performResumableUpload(rootId: conflictOperation.rootID, itemId: conflictOperation.copyItemID,
+                        fileURL: input.fileURL, fileSize: input.size, expectedSha256: conflictOperation.localSHA,
+                        remoteId: conflictOperation.copyRemoteID, parentId: conflictOperation.parentRemoteID,
+                        name: copy.lastPathComponent, isUpdate: false)
+                }
             }
         }
-        guard uploaded.sha256Checksum?.lowercased() == op.localSHA,
+        let uploaded = try await uploadConflictCopy()
+        guard uploaded.sha256Checksum?.lowercased() == conflictOperation.localSHA,
               uploaded.sizeBytes == input.size, uploaded.trashed != true,
               uploaded.name == copy.lastPathComponent,
-              uploaded.parents?.contains(op.parentRemoteID) == true else {
-            throw SyncEngineError.general("Conflicting remote copy verification failed: \(op.copyRemoteID)")
+              uploaded.parents?.contains(conflictOperation.parentRemoteID) == true else {
+            throw SyncEngineError.general("Conflicting remote copy verification failed: \(conflictOperation.copyRemoteID)")
         }
         try checkpoint?(.upload)
         guard let originalVersion = try LocalFileVersion.read(at: original) else { throw CocoaError(.fileNoSuchFile) }
         let digest = try Self.computeFileSha256(at: original)
         try originalVersion.validate(at: original)
         let published: LocalFileVersion
-        if digest.sha256Hex == op.remoteSHA {
+        if digest.sha256Hex == conflictOperation.remoteSHA {
             // Publication succeeded before the previous process stopped.
             published = originalVersion
         } else {
-            guard digest.sha256Hex == op.localSHA else {
+            guard digest.sha256Hex == conflictOperation.localSHA else {
                 throw DriveError.fileModifiedDuringUpload(path: original.path)
             }
-            published = try await client.downloadFileSafely(remoteId: op.remoteID,
-                destinationURL: original, expectedSha256: op.remoteSHA,
+            published = try await client.downloadFileSafely(remoteId: conflictOperation.remoteID,
+                destinationURL: original, expectedSha256: conflictOperation.remoteSHA,
                 expectedDestination: originalVersion, temporaryDirectory: downloadDirectory, beforePublish: {
                     try input.version.validate(at: copy)
-                    try await self.store.read { try op.validatePlan($0) }
+                    try await self.store.read { try conflictOperation.validatePlan($0) }
                 })
         }
         try checkpoint?(.publish)
-        let remote = try await client.getFile(remoteId: op.remoteID)
-        guard remote.sha256Checksum?.lowercased() == op.remoteSHA, remote.trashed != true,
+        let remote = try await client.getFile(remoteId: conflictOperation.remoteID)
+        guard remote.sha256Checksum?.lowercased() == conflictOperation.remoteSHA, remote.trashed != true,
               remote.name == original.lastPathComponent,
-              remote.parents?.contains(op.parentRemoteID) == true else {
+              remote.parents?.contains(conflictOperation.parentRemoteID) == true else {
             throw SyncEngineError.general("During the conflict, the remote original file changes again and is retained pending Status")
         }
         try checkpoint?(.beforeCommit)
-        try await store.batchWrite { conn in
-            try op.validatePlan(conn)
+        @Sendable func commitConflict(_ conn: SQLiteConnection) throws {
+            try conflictOperation.validatePlan(conn)
             try published.validate(at: original)
             try input.version.validate(at: copy)
             // Both baselines and the completion receipt commit in the same transaction.
             for (itemID, sha, version, remoteVersion) in [
-                (op.itemID, op.remoteSHA, published, remote.versionNumber),
-                (op.copyItemID, op.localSHA, input.version, uploaded.versionNumber)
+                (conflictOperation.itemID, conflictOperation.remoteSHA, published, remote.versionNumber),
+                (conflictOperation.copyItemID, conflictOperation.localSHA, input.version, uploaded.versionNumber)
             ] {
                 let update = try conn.cachedStatement("""
                     UPDATE items SET base_sha256 = ?, local_sha256 = ?, remote_sha256 = ?,
@@ -242,8 +247,8 @@ extension SyncEngine {
                         local_status = 'present', remote_status = 'present', phase = 'committed', dirty_generation = 0
                     WHERE item_id = ?;
                     """)
-                for i: Int32 in 1...3 { update.bindText(sha, at: i) }
-                for i: Int32 in 4...6 { update.bindInt64(version.size, at: i) }
+                for bindingIndex: Int32 in 1...3 { update.bindText(sha, at: bindingIndex) }
+                for bindingIndex: Int32 in 4...6 { update.bindInt64(version.size, at: bindingIndex) }
                 update.bindInt64(version.device, at: 7)
                 update.bindInt64(version.inode, at: 8)
                 update.bindInt64(version.mtime, at: 9)
@@ -255,9 +260,10 @@ extension SyncEngine {
                 update.reset()
             }
             let done = try conn.cachedStatement("UPDATE operations SET state = 'completed', updated_at = strftime('%s','now') WHERE operation_id = ? AND operation_type = 'resolveConflict';")
-            done.bindText(op.id, at: 1)
+            done.bindText(conflictOperation.id, at: 1)
             _ = try done.step()
             done.reset()
         }
+        try await store.batchWrite(commitConflict)
     }
 }

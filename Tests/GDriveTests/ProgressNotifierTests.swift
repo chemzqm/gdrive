@@ -10,9 +10,9 @@ struct ProgressNotifierTests {
             var calls = [SyncProgress]()
             private var lock = os_unfair_lock()
 
-            func record(_ p: SyncProgress) {
+            func record(_ progress: SyncProgress) {
                 os_unfair_lock_lock(&lock)
-                calls.append(p)
+                calls.append(progress)
                 os_unfair_lock_unlock(&lock)
             }
 
@@ -35,9 +35,9 @@ struct ProgressNotifierTests {
         }
 
         // 1. Intensive and rapid triggering 100 Updates (simulating uploading while scanning)
-        for i in 1...100 {
+        for index in 1...100 {
             notifier.addDiscovered(files: 1, bytes: 1024)
-            if i % 2 == 0 {
+            if index % 2 == 0 {
                 notifier.addCompleted(files: 1, bytes: 1024)
             }
         }

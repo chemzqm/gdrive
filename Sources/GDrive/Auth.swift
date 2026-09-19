@@ -187,7 +187,7 @@ public actor Auth {
 
         let (respData, response) = try await session.data(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let detail = String(decoding: respData, as: UTF8.self)
+            let detail = (String(bytes: respData, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw NSError(domain: "GDriveAuth", code: 4, userInfo: [NSLocalizedDescriptionKey: "Token request failed: \(detail)"])
         }
 
@@ -200,8 +200,8 @@ public actor Auth {
         let decoded = try JSONDecoder().decode(TokenResponse.self, from: respData)
         data.accessToken = decoded.access_token
         data.expiresAt = Date().addingTimeInterval(decoded.expires_in)
-        if let rt = decoded.refresh_token, !rt.isEmpty {
-            data.refreshToken = rt
+        if let refreshToken = decoded.refresh_token, !refreshToken.isEmpty {
+            data.refreshToken = refreshToken
         }
 
         try save()
@@ -233,16 +233,16 @@ public actor Auth {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    private func urlEncode(_ s: String) -> String {
-        s.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? s
+    private func urlEncode(_ string: String) -> String {
+        string.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? string
     }
 
     private func bindLoopback() throws -> (serverFD: Int32, port: UInt16) {
-        let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw NSError(domain: "GDriveAuth", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create socket"]) }
+        let socketFD = socket(AF_INET, SOCK_STREAM, 0)
+        guard socketFD >= 0 else { throw NSError(domain: "GDriveAuth", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create socket"]) }
 
         var reuse: Int32 = 1
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
         addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -251,23 +251,23 @@ public actor Auth {
         addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
         guard withUnsafePointer(to: &addr, {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }) == 0 else {
-            close(fd)
+            close(socketFD)
             throw NSError(domain: "GDriveAuth", code: 6, userInfo: [NSLocalizedDescriptionKey: "Failed to bind port"])
         }
 
-        guard listen(fd, 1) == 0 else {
-            close(fd)
+        guard listen(socketFD, 1) == 0 else {
+            close(socketFD)
             throw NSError(domain: "GDriveAuth", code: 7, userInfo: [NSLocalizedDescriptionKey: "Failed to listen on port"])
         }
 
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        getsockname(fd, withUnsafeMutablePointer(to: &addr) {
+        getsockname(socketFD, withUnsafeMutablePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
         }, &len)
 
-        return (fd, UInt16(bigEndian: addr.sin_port))
+        return (socketFD, UInt16(bigEndian: addr.sin_port))
     }
 
     private func waitForCode(serverFD: Int32, expectedState: String, timeout: Int) async throws -> String {
@@ -290,8 +290,8 @@ public actor Auth {
                 defer { close(clientFD) }
 
                 var buffer = [UInt8](repeating: 0, count: 4096)
-                let n = read(clientFD, &buffer, buffer.count)
-                guard n > 0, let reqText = String(bytes: buffer[0..<n], encoding: .utf8) else {
+                let bytesRead = read(clientFD, &buffer, buffer.count)
+                guard bytesRead > 0, let reqText = String(bytes: buffer[0..<bytesRead], encoding: .utf8) else {
                     continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 10, userInfo: [NSLocalizedDescriptionKey: "Failed to read callback data"]))
                     return
                 }
@@ -304,7 +304,7 @@ public actor Auth {
                     return
                 }
 
-                let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { a, _ in a })
+                let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { first, _ in first })
                 guard query["state"] == expectedState else {
                     continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 12, userInfo: [NSLocalizedDescriptionKey: "OAuth state validation failed"]))
                     return

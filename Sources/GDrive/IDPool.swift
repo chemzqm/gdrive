@@ -36,10 +36,10 @@ public actor IDPool {
 
     /// Get a batch of available ID
     public func takeIds(count: Int) -> [String] {
-        let n = min(count, availableIds.count)
-        guard n > 0 else { return [] }
-        let sub = Array(availableIds.suffix(n))
-        availableIds.removeLast(n)
+        let availableCount = min(count, availableIds.count)
+        guard availableCount > 0 else { return [] }
+        let sub = Array(availableIds.suffix(availableCount))
+        availableIds.removeLast(availableCount)
         triggerPrefetchIfNeeded()
         return sub
     }
@@ -103,7 +103,7 @@ public actor IDPool {
         currentGeneration &+= 1
         let gen = currentGeneration
 
-        let task = Task { [weak self, api] () -> Void in
+        let task = Task { [weak self, api] in
             do {
                 let ids = try await api.generateIds(count: 1000, space: "drive")
                 guard let self else { return }

@@ -18,11 +18,11 @@ final class MockBootstrapSafetyURLProtocol: URLProtocol, @unchecked Sendable {
         return requestHandler
     }
 
-    override class func canInit(with request: URLRequest) -> Bool {
+    override static func canInit(with request: URLRequest) -> Bool {
         return true
     }
 
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest {
         return request
     }
 
@@ -171,27 +171,27 @@ struct BootstrapResumeSafetyTests {
             _ = try stmt.step()
             stmt.reset()
 
-            let q = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = 'mock_root_remote';")
-            guard try q.step(), let rId = q.columnInt64(at: 0) else { throw NSError(domain: "test", code: 1) }
-            q.reset()
+            let queryStatement = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = 'mock_root_remote';")
+            guard try queryStatement.step(), let rId = queryStatement.columnInt64(at: 0) else { throw NSError(domain: "test", code: 1) }
+            queryStatement.reset()
             return rId
         }
 
-        let sha256_64 = String(repeating: "a", count: 64)
+        let sha256Digest = String(repeating: "a", count: 64)
 
         let rootItemId: Int64 = try await store.write { conn in
-            let s = try conn.cachedStatement("""
+            let statement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
             ) VALUES (?, NULL, 'mock_root', 'directory', 'mock_root_remote', 1, 1);
             """)
-            s.bindInt64(rootId, at: 1)
-            _ = try s.step()
-            s.reset()
-            let q = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
-            q.bindInt64(rootId, at: 1)
-            defer { q.reset() }
-            if try q.step(), let id = q.columnInt64(at: 0) { return id }
+            statement.bindInt64(rootId, at: 1)
+            _ = try statement.step()
+            statement.reset()
+            let queryStatement = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
+            queryStatement.bindInt64(rootId, at: 1)
+            defer { queryStatement.reset() }
+            if try queryStatement.step(), let id = queryStatement.columnInt64(at: 0) { return id }
             return 1
         }
 
@@ -201,48 +201,48 @@ struct BootstrapResumeSafetyTests {
         // 3. committed,remote_status = 'present',dirty_generation = 0 Confirmed baseline files for
         try await store.write { conn in
             // File 1: inFlight Unfinished upload
-            let s1 = try conn.cachedStatement("""
+            let inFlightStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
                 local_device, local_inode, local_mtime, local_size, local_sha256,
                 phase, dirty_generation, created_at, updated_at
             ) VALUES (?, ?, 'inflight.bin', 'file', 'r_inflight', 1, 1001, 100, 500, ?, 'inFlight', 1, 1, 1);
             """)
-            s1.bindInt64(rootId, at: 1)
-            s1.bindInt64(rootItemId, at: 2)
-            s1.bindText(sha256_64, at: 3)
-            _ = try s1.step()
-            s1.reset()
+            inFlightStatement.bindInt64(rootId, at: 1)
+            inFlightStatement.bindInt64(rootItemId, at: 2)
+            inFlightStatement.bindText(sha256Digest, at: 3)
+            _ = try inFlightStatement.step()
+            inFlightStatement.reset()
 
             // File 2: committed But there are local changes (dirty_generation = 1)
-            let s2 = try conn.cachedStatement("""
+            let dirtyStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
                 local_device, local_inode, local_mtime, local_size, local_sha256,
                 base_sha256, base_size, remote_status, phase, dirty_generation, created_at, updated_at
             ) VALUES (?, ?, 'dirty.txt', 'file', 'r_dirty', 1, 1002, 200, 600, ?, ?, 600, 'present', 'committed', 1, 1, 1);
             """)
-            s2.bindInt64(rootId, at: 1)
-            s2.bindInt64(rootItemId, at: 2)
-            s2.bindText(sha256_64, at: 3)
-            s2.bindText(sha256_64, at: 4)
-            _ = try s2.step()
-            s2.reset()
+            dirtyStatement.bindInt64(rootId, at: 1)
+            dirtyStatement.bindInt64(rootItemId, at: 2)
+            dirtyStatement.bindText(sha256Digest, at: 3)
+            dirtyStatement.bindText(sha256Digest, at: 4)
+            _ = try dirtyStatement.step()
+            dirtyStatement.reset()
 
             // File 3: Fully synchronized baseline (phase = 'committed', dirty_generation = 0, base_sha256 != nil)
-            let s3 = try conn.cachedStatement("""
+            let syncedStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
                 local_device, local_inode, local_mtime, local_size, local_sha256,
                 base_sha256, base_size, remote_status, phase, dirty_generation, created_at, updated_at
             ) VALUES (?, ?, 'synced.txt', 'file', 'r_synced', 1, 1003, 300, 700, ?, ?, 700, 'present', 'committed', 0, 1, 1);
             """)
-            s3.bindInt64(rootId, at: 1)
-            s3.bindInt64(rootItemId, at: 2)
-            s3.bindText(sha256_64, at: 3)
-            s3.bindText(sha256_64, at: 4)
-            _ = try s3.step()
-            s3.reset()
+            syncedStatement.bindInt64(rootId, at: 1)
+            syncedStatement.bindInt64(rootItemId, at: 2)
+            syncedStatement.bindText(sha256Digest, at: 3)
+            syncedStatement.bindText(sha256Digest, at: 4)
+            _ = try syncedStatement.step()
+            syncedStatement.reset()
         }
 
         let cache = try await LocalBaselineCache.load(store: store, rootId: rootId)
@@ -283,7 +283,7 @@ struct BootstrapResumeSafetyTests {
         let recorder = RequestEventRecorder()
         let idCounter = SafeCounter(100)
 
-        MockBootstrapSafetyURLProtocol.setHandler { request in
+        @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             guard let url = request.url else {
                 return (HTTPURLResponse(url: URL(string: "https://invalid")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
             }
@@ -293,25 +293,25 @@ struct BootstrapResumeSafetyTests {
                 let count = 10
                 let start = idCounter.next(count: count)
                 let ids = (start..<(start + count)).map { "drive_id_\($0)" }
-                let json = try! JSONSerialization.data(withJSONObject: ["ids": ids])
+                let json = try JSONSerialization.data(withJSONObject: ["ids": ids])
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if path.hasSuffix("/files/mock_remote_root") {
-                let json = """
+                let json = Data("""
                 {"id": "mock_remote_root", "name": "mock_remote_root", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if path.hasSuffix("/files") && request.httpMethod == "GET" {
                 // listChildren of remote root
-                let json = #"{"files": []}"#.data(using: .utf8)!
+                let json = Data(#"{"files": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -320,14 +320,14 @@ struct BootstrapResumeSafetyTests {
                 let reqId = "uploaded_file_\(idCounter.next())"
                 recorder.recordFileCreate(id: reqId)
                 let body = request.extractBodyData ?? Data()
-                let bodyStr = String(decoding: body, as: UTF8.self)
+                let bodyStr = (String(bytes: body, encoding: .utf8) ?? "Invalid UTF-8 data")
                 let isFile1 = bodyStr.contains("file 1")
                 let contentData = (isFile1 ? "Content of file 1\n" : "Content of file 2\n").data(using: .utf8)!
                 let sha = SyncEngine.computeSha256(of: contentData)
                 let name = isFile1 ? "test1.txt" : "test2.txt"
-                let json = """
+                let json = Data("""
                 {"id": "\(reqId)", "name": "\(name)", "size": "\(contentData.count)", "sha256Checksum": "\(sha)"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -340,14 +340,15 @@ struct BootstrapResumeSafetyTests {
                     reqId = id
                 }
                 recorder.recordDirCreate(id: reqId)
-                let json = """
+                let json = Data("""
                 {"id": "\(reqId)", "name": "dir", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
+        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
@@ -360,20 +361,20 @@ struct BootstrapResumeSafetyTests {
 
         // Verify SQLite in bootstrap_state has been set to existingKnown
         let bootstrapStateRound1: String? = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT bootstrap_state FROM roots WHERE remote_root_id = 'mock_remote_root';")
-            defer { s.reset() }
-            if try s.step() { return s.columnText(at: 0) }
+            let statement = try conn.cachedStatement("SELECT bootstrap_state FROM roots WHERE remote_root_id = 'mock_remote_root';")
+            defer { statement.reset() }
+            if try statement.step() { return statement.columnText(at: 0) }
             return nil
         }
         #expect(bootstrapStateRound1 == "existingKnown")
 
         // record Round 1 all produced remote_file_id
         let itemRemoteIdsRound1: [String] = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
-            defer { s.reset() }
+            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
+            defer { statement.reset() }
             var res: [String] = []
-            while try s.step() {
-                if let r = s.columnText(at: 0) { res.append(r) }
+            while try statement.step() {
+                if let remoteFileID = statement.columnText(at: 0) { res.append(remoteFileID) }
             }
             return res
         }
@@ -399,11 +400,11 @@ struct BootstrapResumeSafetyTests {
 
         // Assert:SQLite in remote_file_id The sequence is completely unchanged and never regenerated ID!
         let itemRemoteIdsRound3: [String] = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
-            defer { s.reset() }
+            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
+            defer { statement.reset() }
             var res: [String] = []
-            while try s.step() {
-                if let r = s.columnText(at: 0) { res.append(r) }
+            while try statement.step() {
+                if let remoteFileID = statement.columnText(at: 0) { res.append(remoteFileID) }
             }
             return res
         }
@@ -441,32 +442,32 @@ struct BootstrapResumeSafetyTests {
             let path = url.path
 
             if path.hasSuffix("/files/generateIds") {
-                let json = #"{"ids": ["id_gen_1", "id_gen_2"]}"#.data(using: .utf8)!
+                let json = Data(#"{"ids": ["id_gen_1", "id_gen_2"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             if path.hasSuffix("/files/mock_remote_root") {
-                let json = """
+                let json = Data("""
                 {"id": "mock_remote_root", "name": "mock_remote_root", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             if path.hasSuffix("/files") && request.httpMethod == "GET" {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"files": []}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"files": []}"#.utf8))
             }
 
             if path.hasSuffix("/changes/startPageToken") {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"startPageToken": "token_1"}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"startPageToken": "token_1"}"#.utf8))
             }
 
             // POST /upload/drive/v3/files (Multipart Create new file)
             if request.httpMethod == "POST" && url.absoluteString.contains("/upload/drive/v3/files") {
                 recorder.recordFileCreate(id: fixedFileId)
                 let v1Sha = SyncEngine.computeSha256(of: v1Content.data(using: .utf8)!)
-                let json = """
+                let json = Data("""
                 {"id": "\(fixedFileId)", "name": "document.txt", "size": "\(v1Content.utf8.count)", "sha256Checksum": "\(v1Sha)"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
@@ -475,13 +476,13 @@ struct BootstrapResumeSafetyTests {
                 recorder.recordFilePatch()
                 let body = request.extractBodyData ?? Data()
                 let v2Sha = SyncEngine.computeSha256(of: body)
-                let json = """
+                let json = Data("""
                 {"id": "\(fixedFileId)", "name": "document.txt", "size": "\(body.count)", "sha256Checksum": "\(v2Sha)"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
@@ -507,14 +508,22 @@ struct BootstrapResumeSafetyTests {
         #expect(recorder.filePatchCount == 0)
 
         // assert SQLite in items The table only has 1 file items, and their remote_file_id remain as fixedFileId
-        let (itemCount, currentRemoteId, currentBaseSha): (Int, String?, String?) = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT COUNT(*), remote_file_id, base_sha256 FROM items WHERE entry_kind = 'file' AND is_tombstone = 0;")
-            defer { s.reset() }
-            if try s.step() {
-                return (Int(s.columnInt64(at: 0) ?? 0), s.columnText(at: 1), s.columnText(at: 2))
-            }
-            return (0, nil, nil)
+        struct FileBaseline: Sendable {
+            let itemCount: Int
+            let currentRemoteId: String?
+            let currentBaseSha: String?
         }
+        let storedFile: FileBaseline = try await store.read { conn in
+            let statement = try conn.cachedStatement("SELECT COUNT(*), remote_file_id, base_sha256 FROM items WHERE entry_kind = 'file' AND is_tombstone = 0;")
+            defer { statement.reset() }
+            if try statement.step() {
+                return FileBaseline(itemCount: Int(statement.columnInt64(at: 0) ?? 0), currentRemoteId: statement.columnText(at: 1), currentBaseSha: statement.columnText(at: 2))
+            }
+            return FileBaseline(itemCount: 0, currentRemoteId: nil, currentBaseSha: nil)
+        }
+        let itemCount = storedFile.itemCount
+        let currentRemoteId = storedFile.currentRemoteId
+        let currentBaseSha = storedFile.currentBaseSha
         #expect(itemCount == 1)
         #expect(currentRemoteId == fixedFileId)
         let expectedV1Sha = SyncEngine.computeSha256(of: v1Content.data(using: .utf8)!)
@@ -601,58 +610,63 @@ struct BootstrapResumeSafetyTests {
         let recorder = RequestEventRecorder()
         let resumedChunkAttempt = SafeCounter(0)
 
-        MockBootstrapSafetyURLProtocol.setHandler { request in
+        @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             guard let url = request.url else {
                 return (HTTPURLResponse(url: URL(string: "https://invalid")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
             }
             let path = url.path
 
             if path.hasSuffix("/files/mock_remote_root") {
-                let json = """
+                let json = Data("""
                 {"id": "mock_remote_root", "name": "mock_remote_root", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             if path.hasSuffix("/files") && request.httpMethod == "GET" {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"files": []}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"files": []}"#.utf8))
             }
 
             if path.hasSuffix("/changes/startPageToken") {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"startPageToken": "token_1"}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"startPageToken": "token_1"}"#.utf8))
             }
 
             // queryResumableOffset (PUT Arrive sessionURIString,bring Content-Range: bytes */total)
-            if url.absoluteString == sessionURIString {
-                if let contentRange = request.value(forHTTPHeaderField: "Content-Range") {
-                    if contentRange.starts(with: "bytes */") {
-                        // Detection request, the server confirms that it has been received 0-4194303 (4MB)
-                        let headers = ["Range": "bytes=0-4194303"]
-                        return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: headers)!, Data())
-                    } else if contentRange.starts(with: "bytes 4194304-") && resumedChunkAttempt.next() == 0 {
-                        // The server only confirms 6MB;The engine must press Range Instead of sending length advance.
-                        recorder.recordResumedRange(start: 4194304)
-                        return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-6291455"])!, Data())
-                    } else if contentRange.starts(with: "bytes 6291456-") {
-                        recorder.recordResumedRange(start: 6291456)
-                        let json = """
-                        {"id": "\(persistentRemoteId)", "name": "large_9mb.bin", "size": "\(totalSize)", "sha256Checksum": "\(expectedSha256)"}
-                        """.data(using: .utf8)!
-                        return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
+            func sessionResponse() -> (HTTPURLResponse, Data)? {
+                if url.absoluteString == sessionURIString {
+                    if let contentRange = request.value(forHTTPHeaderField: "Content-Range") {
+                        if contentRange.starts(with: "bytes */") {
+                            // Detection request, the server confirms that it has been received 0-4194303 (4MB)
+                            let headers = ["Range": "bytes=0-4194303"]
+                            return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: headers)!, Data())
+                        } else if contentRange.starts(with: "bytes 4194304-") && resumedChunkAttempt.next() == 0 {
+                            // The server only confirms 6MB;The engine must press Range Instead of sending length advance.
+                            recorder.recordResumedRange(start: 4194304)
+                            return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-6291455"])!, Data())
+                        } else if contentRange.starts(with: "bytes 6291456-") {
+                            recorder.recordResumedRange(start: 6291456)
+                            let json = Data("""
+                            {"id": "\(persistentRemoteId)", "name": "large_9mb.bin", "size": "\(totalSize)", "sha256Checksum": "\(expectedSha256)"}
+                            """.utf8)
+                            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
+                        }
                     }
                 }
+                return nil
             }
+            if let response = sessionResponse() { return response }
 
             // It is strictly prohibited to initiate a regeneration ID Or create a new one session request
             if path.hasSuffix("/files/generateIds") {
-                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, #"{"error": "Should not generate new ID"}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data(#"{"error": "Should not generate new ID"}"#.utf8))
             }
             if request.httpMethod == "POST" && url.absoluteString.contains("uploadType=resumable") {
-                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, #"{"error": "Should not initiate new session"}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data(#"{"error": "Should not initiate new session"}"#.utf8))
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
+        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
@@ -666,25 +680,35 @@ struct BootstrapResumeSafetyTests {
         #expect(recorder.resumedRangeStarts.contains(6291456))
 
         // Assert:SQLite The files in have been converted to committed and remote_file_id strictly maintained as persistentRemoteId
-        let (phase, dirtyGen, baseSha, finalRemoteId): (String?, Int64?, String?, String?) = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256, remote_file_id FROM items WHERE name = 'large_9mb.bin';")
-            defer { s.reset() }
-            if try s.step() {
-                return (s.columnText(at: 0), s.columnInt64(at: 1), s.columnText(at: 2), s.columnText(at: 3))
-            }
-            return (nil, nil, nil, nil)
+        struct FileState: Sendable {
+            let phase: String?
+            let dirtyGen: Int64?
+            let baseSha: String?
+            let finalRemoteId: String?
         }
+        let storedFile: FileState = try await store.read { conn in
+            let statement = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256, remote_file_id FROM items WHERE name = 'large_9mb.bin';")
+            defer { statement.reset() }
+            if try statement.step() {
+                return FileState(phase: statement.columnText(at: 0), dirtyGen: statement.columnInt64(at: 1), baseSha: statement.columnText(at: 2), finalRemoteId: statement.columnText(at: 3))
+            }
+            return FileState(phase: nil, dirtyGen: nil, baseSha: nil, finalRemoteId: nil)
+        }
+        let phase = storedFile.phase
+        let dirtyGen = storedFile.dirtyGen
+        let baseSha = storedFile.baseSha
+        let finalRemoteId = storedFile.finalRemoteId
         #expect(phase == "committed")
         #expect(dirtyGen == 0)
         #expect(baseSha == expectedSha256)
         #expect(finalRemoteId == persistentRemoteId)
 
         let operation: (Int64, String)? = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT confirmed_offset, state FROM operations WHERE operation_id = ?;")
-            s.bindText("resumable_\(persistentRemoteId)", at: 1)
-            defer { s.reset() }
-            guard try s.step() else { return nil }
-            return (s.columnInt64(at: 0) ?? -1, s.columnText(at: 1) ?? "")
+            let statement = try conn.cachedStatement("SELECT confirmed_offset, state FROM operations WHERE operation_id = ?;")
+            statement.bindText("resumable_\(persistentRemoteId)", at: 1)
+            defer { statement.reset() }
+            guard try statement.step() else { return nil }
+            return (statement.columnInt64(at: 0) ?? -1, statement.columnText(at: 1) ?? "")
         }
         #expect(operation?.0 == totalSize)
         #expect(operation?.1 == "completed")
@@ -699,10 +723,10 @@ struct BootstrapResumeSafetyTests {
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
         let total: Int64 = 1024
-        let finalJSON = #"{"id":"file","name":"file.bin","size":"1024","sha256Checksum":"abc"}"#.data(using: .utf8)!
+        let finalJSON = Data(#"{"id":"file","name":"file.bin","size":"1024","sha256Checksum":"abc"}"#.utf8)
         let transientAttempts = SafeCounter(0)
 
-        MockBootstrapSafetyURLProtocol.setHandler { request in
+        @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             let url = request.url!
             switch url.lastPathComponent {
             case "no-range":
@@ -724,6 +748,7 @@ struct BootstrapResumeSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data())
             }
         }
+        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
 
         if case .incomplete(let offset) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/no-range")!, totalBytes: total) {
             #expect(offset == 0)
@@ -814,30 +839,30 @@ struct BootstrapResumeSafetyTests {
             let path = url.path
 
             if path.hasSuffix("/files/mock_remote_root") {
-                let json = """
+                let json = Data("""
                 {"id": "mock_remote_root", "name": "mock_remote_root", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             if path.hasSuffix("/files") && request.httpMethod == "GET" {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"files": []}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"files": []}"#.utf8))
             }
 
             if path.hasSuffix("/changes/startPageToken") {
-                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"startPageToken": "token_1"}"#.data(using: .utf8)!)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data(#"{"startPageToken": "token_1"}"#.utf8))
             }
 
             if request.httpMethod == "POST" && url.absoluteString.contains("/upload/drive/v3/files") {
                 recorder.recordFileCreate(id: "r_unfin_50")
                 let sha = SyncEngine.computeSha256(of: content.data(using: .utf8)!)
-                let json = """
+                let json = Data("""
                 {"id": "r_unfin_50", "name": "unfinished.txt", "size": "\(content.utf8.count)", "sha256Checksum": "\(sha)"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
@@ -850,14 +875,22 @@ struct BootstrapResumeSafetyTests {
         #expect(recorder.fileCreateCount == 1)
 
         // Verify SQLite finally at committed
-        let (phase, dirtyGen, baseSha): (String?, Int64?, String?) = try await store.read { conn in
-            let s = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256 FROM items WHERE name = 'unfinished.txt';")
-            defer { s.reset() }
-            if try s.step() {
-                return (s.columnText(at: 0), s.columnInt64(at: 1), s.columnText(at: 2))
-            }
-            return (nil, nil, nil)
+        struct FileState: Sendable {
+            let phase: String?
+            let dirtyGen: Int64?
+            let baseSha: String?
         }
+        let storedFile: FileState = try await store.read { conn in
+            let statement = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256 FROM items WHERE name = 'unfinished.txt';")
+            defer { statement.reset() }
+            if try statement.step() {
+                return FileState(phase: statement.columnText(at: 0), dirtyGen: statement.columnInt64(at: 1), baseSha: statement.columnText(at: 2))
+            }
+            return FileState(phase: nil, dirtyGen: nil, baseSha: nil)
+        }
+        let phase = storedFile.phase
+        let dirtyGen = storedFile.dirtyGen
+        let baseSha = storedFile.baseSha
         #expect(phase == "committed")
         #expect(dirtyGen == 0)
         #expect(baseSha != nil)

@@ -108,7 +108,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         }
         lastNotifiedDiscovered = totalDiscoveredFiles
         lastNotifiedCompleted = completedFiles
-        let p = SyncProgress(
+        let progress = SyncProgress(
             completedFiles: completedFiles,
             totalDiscoveredFiles: totalDiscoveredFiles,
             completedBytes: completedBytes,
@@ -116,7 +116,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         )
         os_unfair_lock_unlock(&lock)
 
-        onProgress(p)
+        onProgress(progress)
     }
 
     /// Synchronize All, Stop Background Polling and Force Brush Final 100% Progress
@@ -126,7 +126,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         tickerTask = nil
 
         os_unfair_lock_lock(&lock)
-        let p = SyncProgress(
+        let progress = SyncProgress(
             completedFiles: completedFiles,
             totalDiscoveredFiles: totalDiscoveredFiles,
             completedBytes: completedBytes,
@@ -136,6 +136,6 @@ public final class ProgressNotifier: @unchecked Sendable {
         lastNotifiedCompleted = completedFiles
         os_unfair_lock_unlock(&lock)
 
-        onProgress(p)
+        onProgress(progress)
     }
 }

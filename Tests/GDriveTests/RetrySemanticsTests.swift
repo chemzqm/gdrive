@@ -9,8 +9,8 @@ private final class RetrySemanticsURLProtocol: URLProtocol, @unchecked Sendable 
 
     static let handler = OSAllocatedUnfairLock<Handler?>(initialState: nil)
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let handler = Self.handler.withLock({ $0 }) else {
@@ -50,6 +50,30 @@ struct RetrySemanticsTests {
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(credentials).write(to: file)
         return (try Auth(path: file.path, session: session), directory)
+    }
+
+    @Test("HTTP error text preserves UTF-8 and explicitly reports invalid UTF-8", arguments: [false, true])
+    func errorBodyDecoding(invalidUTF8: Bool) async throws {
+        let expected = invalidUTF8 ? "Invalid UTF-8 data" : "服务器错误: café"
+        let body = invalidUTF8 ? Data([0x61, 0xFF, 0x62]) : Data(expected.utf8)
+        RetrySemanticsURLProtocol.handler.withLock { handler in
+            handler = { request in
+                (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!, body)
+            }
+        }
+        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session)
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+        do {
+            _ = try await client.executeRequest(request, maxRetries: 0)
+            Issue.record("Expected HTTP error")
+        } catch DriveError.serverError(let status, let message) {
+            #expect(status == 400)
+            #expect(message == expected)
+        }
     }
 
     @Test("401 forces one refresh and retries with the new token")

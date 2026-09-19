@@ -35,7 +35,4 @@ extension SyncEngine {
         }
         return digest.map { String(format: "%02x", $0) }.joined()
     }
-
 }
-
-

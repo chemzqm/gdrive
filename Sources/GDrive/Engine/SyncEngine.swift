@@ -7,6 +7,12 @@ import os
 
 // Core synchronization logic. Public entry points and root locking live in SyncEngineAPI.swift.
 extension SyncEngine {
+    private struct ExistingSyncRoot: Sendable {
+        let rootId: Int64
+        let bootstrapState: String
+        let initialDir: String
+    }
+
     // MARK: - Unified synchronization portal (Automatic status detection and direction diversion)
 
     func syncUnlocked(
@@ -18,7 +24,7 @@ extension SyncEngine {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
         // 1. Check SQLite Whether there is already an active synchronization root
-        let existingRoot: (rootId: Int64, bootstrapState: String, initialDir: String)? = try await store.read { conn in
+        let existingRoot: ExistingSyncRoot? = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
             SELECT root_id, bootstrap_state, initial_sync_direction FROM roots
             WHERE local_root_path = ? AND remote_root_id = ? AND is_active = 1;
@@ -27,10 +33,10 @@ extension SyncEngine {
             stmt.bindText(remoteFolderId, at: 2)
             defer { stmt.reset() }
             if try stmt.step() {
-                return (
-                    stmt.columnInt64(at: 0) ?? 0,
-                    stmt.columnText(at: 1) ?? "freshCreated",
-                    stmt.columnText(at: 2) ?? "localToRemoteEmpty"
+                return ExistingSyncRoot(
+                    rootId: stmt.columnInt64(at: 0) ?? 0,
+                    bootstrapState: stmt.columnText(at: 1) ?? "freshCreated",
+                    initialDir: stmt.columnText(at: 2) ?? "localToRemoteEmpty"
                 )
             }
             return nil
@@ -151,21 +157,27 @@ extension SyncEngine {
             }
             if name == "." || name == ".." { continue }
             if name == ".git" {
-                var type = entry.pointee.d_type
-                if type == UInt8(DT_UNKNOWN) {
-                    var metadata = stat()
-                    guard fstatat(dirfd(directory), name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
-                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-                    }
-                    if metadata.st_mode & S_IFMT == S_IFDIR { type = UInt8(DT_DIR) }
-                }
-                if type == UInt8(DT_DIR) { continue }
+                if try isDirectoryEntry(entry, named: name, in: directory) { continue }
             }
             return false
         }
     }
 
     // MARK: - mode 3:Existing root directory incremental bidirectional synchronization (syncIncremental)
+
+    private static func isDirectoryEntry(
+        _ entry: UnsafeMutablePointer<dirent>, named name: String, in directory: UnsafeMutablePointer<DIR>
+    ) throws -> Bool {
+        var type = entry.pointee.d_type
+        if type == UInt8(DT_UNKNOWN) {
+            var metadata = stat()
+            guard fstatat(dirfd(directory), name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            if metadata.st_mode & S_IFMT == S_IFDIR { type = UInt8(DT_DIR) }
+        }
+        return type == UInt8(DT_DIR)
+    }
 
     func syncIncrementalUnlocked(
         localPath: String,

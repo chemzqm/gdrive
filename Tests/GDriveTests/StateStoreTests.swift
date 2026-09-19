@@ -73,8 +73,8 @@ struct StateStoreTests {
             group.addTask {
                 for batch in 0..<(writeCount / 50) {
                     try await store.write { conn in
-                        for i in 0..<50 {
-                            let itemId = batch * 50 + i + 1
+                        for iteration in 0..<50 {
+                            let itemId = batch * 50 + iteration + 1
                             let stmt = try conn.prepare("""
                                 INSERT INTO items (root_id, parent_id, name, entry_kind, local_device, local_inode, local_mtime, local_size, phase, created_at, updated_at)
                                 VALUES (?, 1, ?, 'file', 1, ?, 1000, 1024, 'ready', 0, 0);
@@ -143,7 +143,7 @@ struct StateStoreTests {
         // 1. test 150 independent concurrent batchWrite Call (automatically merge into a full batch 64*2 + last batch)
         let concurrentWrites = 150
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for i in 0..<concurrentWrites {
+            for iteration in 0..<concurrentWrites {
                 group.addTask {
                     try await store.batchWrite { conn in
                         let stmt = try conn.prepare("""
@@ -151,8 +151,8 @@ struct StateStoreTests {
                             VALUES (?, 1, ?, 'file', 1, ?, 1000, 1024, 'ready', 0, 0);
                         """)
                         stmt.bindInt64(rootId, at: 1)
-                        stmt.bindText("gc_file_\(i).txt", at: 2)
-                        stmt.bindInt64(Int64(i + 2000), at: 3)
+                        stmt.bindText("gc_file_\(iteration).txt", at: 2)
+                        stmt.bindInt64(Int64(iteration + 2000), at: 3)
                         _ = try stmt.step()
                     }
                 }
@@ -169,15 +169,15 @@ struct StateStoreTests {
         #expect(count1 == Int64(concurrentWrites))
 
         // 2. Test for small writes less than the batch limit (5), verify 5ms Automatically trigger on timeout commit
-        for i in 0..<5 {
+        for iteration in 0..<5 {
             try await store.batchWrite { conn in
                 let stmt = try conn.prepare("""
                     INSERT INTO items (root_id, parent_id, name, entry_kind, local_device, local_inode, local_mtime, local_size, phase, created_at, updated_at)
                     VALUES (?, 1, ?, 'file', 1, ?, 1000, 1024, 'ready', 0, 0);
                 """)
                 stmt.bindInt64(rootId, at: 1)
-                stmt.bindText("timeout_file_\(i).txt", at: 2)
-                stmt.bindInt64(Int64(i + 3000), at: 3)
+                stmt.bindText("timeout_file_\(iteration).txt", at: 2)
+                stmt.bindInt64(Int64(iteration + 3000), at: 3)
                 _ = try stmt.step()
             }
         }

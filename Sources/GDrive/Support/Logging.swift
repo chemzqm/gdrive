@@ -2,12 +2,12 @@ import Foundation
 import Logging
 
 public enum GDriveLogComponent: String, Sendable, CaseIterable {
-    case auth = "auth"
-    case drive = "drive"
-    case transfer = "transfer"
-    case runtime = "runtime"
-    case storage = "storage"
-    case workspace = "workspace"
+    case auth
+    case drive
+    case transfer
+    case runtime
+    case storage
+    case workspace
 }
 
 public struct GDriveLogger: Sendable {

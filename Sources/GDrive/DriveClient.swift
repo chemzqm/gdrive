@@ -237,22 +237,7 @@ public final class DriveClient: Sendable {
             }
 
             // Check current limiting (429, 503, or 403 Contains rateLimitExceeded / userRateLimitExceeded / quotaExceeded)
-            let isRateLimit: Bool
-            var retryDelay: Double? = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-
-            if http.statusCode == 429 || http.statusCode == 503 {
-                isRateLimit = true
-            } else if http.statusCode == 403 {
-                let detail = String(decoding: data, as: UTF8.self)
-                if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") || detail.contains("quotaExceeded") {
-                    isRateLimit = true
-                    if retryDelay == nil { retryDelay = 2.0 }
-                } else {
-                    isRateLimit = false
-                }
-            } else {
-                isRateLimit = false
-            }
+            let (isRateLimit, retryDelay) = rateLimitStatus(data: data, response: http)
 
             if isRateLimit {
                 if attempt <= retryLimit {
@@ -281,9 +266,30 @@ public final class DriveClient: Sendable {
             }
 
             // Other HTTP Error Status
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
+    }
+
+    private func rateLimitStatus(data: Data, response http: HTTPURLResponse) -> (Bool, Double?) {
+        let isRateLimit: Bool
+        var retryDelay: Double? = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+
+        if http.statusCode == 429 || http.statusCode == 503 {
+            isRateLimit = true
+        } else if http.statusCode == 403 {
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
+            if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") || detail.contains("quotaExceeded") {
+                isRateLimit = true
+                if retryDelay == nil { retryDelay = 2.0 }
+            } else {
+                isRateLimit = false
+            }
+        } else {
+            isRateLimit = false
+        }
+
+        return (isRateLimit, retryDelay)
     }
 
     private func refreshAuthorization(in request: inout URLRequest) async throws {
@@ -475,11 +481,11 @@ public final class DriveClient: Sendable {
         // Construction multipart Request body
         var body = Data()
         body.reserveCapacity(content.count + metadataData.count + 256)
-        body.append("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".data(using: .utf8)!)
+        body.append(Data("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".utf8))
         body.append(metadataData)
-        body.append("\r\n--\(boundary)\r\nContent-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
+        body.append(Data("\r\n--\(boundary)\r\nContent-Type: \(mimeType)\r\n\r\n".utf8))
         body.append(content)
-        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
 
         req.httpBody = body
 
@@ -592,7 +598,7 @@ public final class DriveClient: Sendable {
 
         let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
         guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: "Failed to create resumable upload session: \(detail)")
         }
 
@@ -623,7 +629,7 @@ public final class DriveClient: Sendable {
         } else if http.statusCode == 404 {
             return .expired
         } else {
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: "Chunked upload failed: \(detail)")
         }
     }
@@ -645,7 +651,7 @@ public final class DriveClient: Sendable {
         case 404:
             return .expired
         default:
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
     }
@@ -953,14 +959,14 @@ public final class DriveClient: Sendable {
             throw DriveError.rateLimited(retryAfter: retryAfter)
         }
         if http.statusCode == 403 {
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") {
                 throw DriveError.rateLimited(retryAfter: 1.0)
             }
             throw DriveError.serverError(statusCode: 403, message: detail)
         }
         if !(200..<300).contains(http.statusCode) {
-            let detail = String(decoding: data, as: UTF8.self)
+            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
     }

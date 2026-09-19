@@ -125,51 +125,60 @@ extension SyncEngine {
         }
         let localDirMap = LocalDirMap(rootItemId: rootItemId)
 
-        // in advance from SQLite Load all known subdirectory mappings, restore bootstrap Or reuse it resolutely when re-running to avoid blindly re-creating
-        let existingDirs: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = try await store.read { conn in
-            let stmt = try conn.cachedStatement("""
-            SELECT item_id, parent_id, name, remote_file_id
-            FROM items
-            WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
-            """)
-            stmt.bindInt64(rootId, at: 1)
-            defer { stmt.reset() }
-            var list: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = []
-            while try stmt.step() {
-                if let id = stmt.columnInt64(at: 0),
-                   let pId = stmt.columnInt64(at: 1),
-                   let name = stmt.columnText(at: 2),
-                   let rId = stmt.columnText(at: 3) {
-                    list.append((id, pId, name, rId))
+        func restoreKnownDirectories() async throws {
+            // in advance from SQLite Load all known subdirectory mappings, restore bootstrap Or reuse it resolutely when re-running to avoid blindly re-creating
+            struct ExistingDirectory: Sendable {
+                let id: Int64
+                let parentId: Int64
+                let name: String
+                let remoteId: String
+            }
+            let existingDirs: [ExistingDirectory] = try await store.read { conn in
+                let stmt = try conn.cachedStatement("""
+                SELECT item_id, parent_id, name, remote_file_id
+                FROM items
+                WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
+                """)
+                stmt.bindInt64(rootId, at: 1)
+                defer { stmt.reset() }
+                var list: [ExistingDirectory] = []
+                while try stmt.step() {
+                    if let id = stmt.columnInt64(at: 0),
+                       let pId = stmt.columnInt64(at: 1),
+                       let name = stmt.columnText(at: 2),
+                       let rId = stmt.columnText(at: 3) {
+                        list.append(ExistingDirectory(id: id, parentId: pId, name: name, remoteId: rId))
+                    }
+                }
+                return list
+            }
+
+            var dirPathsById: [Int64: String] = [rootItemId: ""]
+            var registered = Set<Int64>([rootItemId])
+            var remainingDirs = existingDirs
+            var topoProgress = true
+            while !remainingDirs.isEmpty && topoProgress {
+                topoProgress = false
+                remainingDirs.removeAll { dir in
+                    if registered.contains(dir.parentId), let parentPath = dirPathsById[dir.parentId] {
+                        let relPath = parentPath.isEmpty ? dir.name : "\(parentPath)/\(dir.name)"
+                        dirPathsById[dir.id] = relPath
+                        localDirMap.set(relPath, id: dir.id)
+                        registered.insert(dir.id)
+                        topoProgress = true
+                        return true
+                    }
+                    return false
                 }
             }
-            return list
-        }
 
-        var dirPathsById: [Int64: String] = [rootItemId: ""]
-        var registered = Set<Int64>([rootItemId])
-        var remainingDirs = existingDirs
-        var topoProgress = true
-        while !remainingDirs.isEmpty && topoProgress {
-            topoProgress = false
-            remainingDirs.removeAll { dir in
-                if registered.contains(dir.parentId), let parentPath = dirPathsById[dir.parentId] {
-                    let relPath = parentPath.isEmpty ? dir.name : "\(parentPath)/\(dir.name)"
-                    dirPathsById[dir.id] = relPath
-                    localDirMap.set(relPath, id: dir.id)
-                    registered.insert(dir.id)
-                    topoProgress = true
-                    return true
+            for (id, relPath) in dirPathsById where id != rootItemId {
+                if let dir = existingDirs.first(where: { $0.id == id }) {
+                    await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: dir.remoteId)
                 }
-                return false
             }
         }
-
-        for (id, relPath) in dirPathsById where id != rootItemId {
-            if let dir = existingDirs.first(where: { $0.id == id }) {
-                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: dir.remoteId)
-            }
-        }
+        try await restoreKnownDirectories()
 
         // 3. Set up a bounded concurrent upload pipeline (strict upper limit 64 Concurrency)
         let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
@@ -266,7 +275,418 @@ extension SyncEngine {
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
-        try await directoryScan(request) { batch in
+        @Sendable func uploadFile(fullPath: String, relPath: String, parentRel: String, name: String, fileSize: Int64) async {
+            defer {
+                bootstrapTaskWindow.signal()
+                uploadGroup.leave()
+            }
+            var createIntent: DurableCreateIntent?
+            var didAcquireSemaphore = false
+
+            defer {
+                if didAcquireSemaphore {
+                    uploadSemaphore.signal()
+                }
+                self.monitor.finishUpload(id: fullPath)
+                notifier.addCompleted(files: 1, bytes: Int64(fileSize))
+            }
+
+            do {
+                // First wait for the direct parent directory to be in Google Drive The remote end is ready to avoid occupying concurrent upload slots.
+                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+
+                await uploadSemaphore.wait()
+                didAcquireSemaphore = true
+
+                let fileURL = URL(fileURLWithPath: fullPath)
+                let limit8MB: Int64 = 8 * 1024 * 1024
+
+                let input = try StableUploadInput.capture(at: fileURL)
+                let sha256Hex = input.sha256
+                let fileSize = input.size
+                let smallContent = input.data
+
+                self.monitor.startUpload(id: fullPath, name: name, totalBytes: fileSize)
+
+                let dev = input.version.device
+                let ino = input.version.inode
+                let mtime = input.version.mtime
+
+                let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
+
+                // Check whether the file is already in SQLite recorded (whether it has been committed Still unfinished inFlight)
+                struct ExistingFileTarget {
+                    let itemID: Int64
+                    let remoteID: String?
+                    let phase: String
+                    let remoteStatus: String
+                    let hasBaseline: Bool
+                    let localGeneration: Int64
+                    let remoteGeneration: Int64
+                    let dirtyGeneration: Int64
+                }
+
+                let existingTarget: ExistingFileTarget? = try await self.store.read { conn in
+                    let stmt = try conn.cachedStatement("""
+                    SELECT item_id, remote_file_id, phase, remote_status, base_sha256,
+                           local_generation, remote_generation, dirty_generation
+                    FROM items
+                    WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                    """)
+                    stmt.bindInt64(rootId, at: 1)
+                    stmt.bindInt64(parentDirItemId, at: 2)
+                    stmt.bindText(name, at: 3)
+                    defer { stmt.reset() }
+                    if try stmt.step(), let iId = stmt.columnInt64(at: 0) {
+                        return ExistingFileTarget(
+                            itemID: iId,
+                            remoteID: stmt.columnText(at: 1),
+                            phase: stmt.columnText(at: 2) ?? "discovered",
+                            remoteStatus: stmt.columnText(at: 3) ?? "unknown",
+                            hasBaseline: stmt.columnText(at: 4) != nil,
+                            localGeneration: stmt.columnInt64(at: 5) ?? 0,
+                            remoteGeneration: stmt.columnInt64(at: 6) ?? 0,
+                            dirtyGeneration: stmt.columnInt64(at: 7) ?? 0
+                        )
+                    }
+                    return nil
+                }
+
+                // Perform upload based on file size:≤ 8MB go Multipart,> 8MB go Resumable
+                if let existingTarget, existingTarget.hasBaseline, let remoteID = existingTarget.remoteID {
+                    throw DriveError.unsafeOverwrite(fileId: remoteID)
+                }
+                let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+                let expectedRemoteGeneration = existingTarget?.remoteGeneration ?? 0
+                let expectedDirtyGeneration = max(existingTarget?.dirtyGeneration ?? 0, 1)
+                func uploadSmallFile(_ content: Data) async throws {
+                    let uploadedFile: DriveFile
+                    let committedItemID: Int64
+                    if let existing = existingTarget, let existingRemoteId = existing.remoteID,
+                       existing.phase == "committed" && existing.remoteStatus == "present" {
+                        // The content of the file submitted in the cloud has changed: call directly updateMultipart Update existing remote objects, never create new ones Drive Object!
+                        uploadedFile = try await self.client.updateMultipart(
+                            remoteId: existingRemoteId,
+                            content: content,
+                            expectedSha256: sha256Hex
+                        )
+                        committedItemID = existing.itemID
+                    } else {
+                        // Create new files or rerun unfinished files: Prioritize reusing existing files remote_file_id,avoid regeneration
+                        let targetRemoteId: String
+                        if let existingRemoteId = existingTarget?.remoteID {
+                            targetRemoteId = existingRemoteId
+                        } else {
+                            targetRemoteId = try await self.idPool.nextId()
+                        }
+                        let intent = try await DurableCreateIntentStore.prepareFileUpload(
+                            store: self.store,
+                            rootID: rootId,
+                            itemID: existingTarget?.itemID,
+                            parentItemID: parentDirItemId,
+                            name: name,
+                            targetParentRemoteID: remoteParentId,
+                            candidateRemoteID: targetRemoteId,
+                            device: dev,
+                            inode: ino,
+                            mtime: mtime,
+                            size: fileSize,
+                            sha256: sha256Hex,
+                            transport: .multipart
+                        )
+                        createIntent = intent
+
+                        do {
+                            uploadedFile = try await self.client.uploadMultipart(
+                                name: name,
+                                parentId: intent.targetParentRemoteID,
+                                remoteId: intent.targetRemoteID,
+                                content: content,
+                                expectedSha256: sha256Hex
+                            )
+                        } catch let error as DriveError {
+                            switch error {
+                            case .conflict:
+                                // The remote end may have successfully written the ID metadata, converted to update text
+                                uploadedFile = try await self.client.updateMultipart(
+                                    remoteId: intent.targetRemoteID,
+                                    content: content,
+                                    expectedSha256: sha256Hex
+                                )
+                            case .serverError(let code, _) where code == 400 || code == 409:
+                                uploadedFile = try await self.client.updateMultipart(
+                                    remoteId: intent.targetRemoteID,
+                                    content: content,
+                                    expectedSha256: sha256Hex
+                                )
+                            default:
+                                throw error
+                            }
+                        }
+                        committedItemID = intent.itemID
+                    }
+                    self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
+
+                    // After the upload is successful, pass batchWrite(Group Commit,merge 256 item or 5ms Flush the disk) and write the baseline
+                    try input.version.validate(at: fileURL)
+                    let completedCreateIntent = createIntent
+                    let expectedLocalGeneration = completedCreateIntent?.expectedLocalGeneration ?? existingTarget?.localGeneration ?? 1
+                    try await self.store.batchWrite { conn in
+                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
+                        let itemStmt = try conn.cachedStatement("""
+                        UPDATE items SET
+                            remote_file_id = ?,
+                            local_device = ?, local_inode = ?, local_mtime = ?,
+                            local_size = ?, local_sha256 = ?,
+                            base_sha256 = ?, base_size = ?,
+                            remote_sha256 = ?, remote_size = ?, remote_status = 'present',
+                            local_status = 'present', phase = 'committed', dirty_generation = 0,
+                            updated_at = ?
+                        WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                            AND dirty_generation = ? AND is_tombstone = 0;
+                        """)
+                        itemStmt.bindText(uploadedFile.id, at: 1)
+                        itemStmt.bindInt64(dev, at: 2)
+                        itemStmt.bindInt64(ino, at: 3)
+                        itemStmt.bindInt64(mtime, at: 4)
+                        itemStmt.bindInt64(fileSize, at: 5)
+                        itemStmt.bindText(sha256Hex, at: 6)
+                        itemStmt.bindText(sha256Hex, at: 7)
+                        itemStmt.bindInt64(fileSize, at: 8)
+                        itemStmt.bindText(sha256Hex, at: 9)
+                        itemStmt.bindInt64(fileSize, at: 10)
+                        let timestamp = Date().timeIntervalSince1970
+                        itemStmt.bindDouble(timestamp, at: 11)
+                        itemStmt.bindInt64(committedItemID, at: 12)
+                        itemStmt.bindInt64(expectedLocalGeneration, at: 13)
+                        itemStmt.bindInt64(expectedRemoteGeneration, at: 14)
+                        itemStmt.bindInt64(expectedDirtyGeneration, at: 15)
+                        _ = try itemStmt.step()
+                        itemStmt.reset()
+                        guard conn.changes == 1 else { return }
+                        receiptApplied.withLock { $0 = true }
+                        if let createIntent = completedCreateIntent {
+                            try DurableCreateIntentStore.completeOperation(
+                                conn: conn,
+                                operationID: createIntent.operationID,
+                                now: timestamp
+                            )
+                        }
+                    }
+                }
+
+                func uploadLargeFile() async throws {
+                    // large files (> 8MB):Reuse existing remote_file_id with breakpoints, no blind replacement ID!
+                    let remoteFileId: String
+                    if let existingRemoteId = existingTarget?.remoteID {
+                        remoteFileId = existingRemoteId
+                    } else {
+                        remoteFileId = try await self.idPool.nextId()
+                    }
+                    let isUpdate = existingTarget?.hasBaseline == true || (existingTarget?.phase == "committed" && existingTarget?.remoteStatus == "present")
+                    if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteFileId) }
+
+                    let currentItemId: Int64 = try await self.store.write { conn in
+                        let itemStmt = try conn.cachedStatement("""
+                        INSERT INTO items (
+                            root_id, parent_id, name, entry_kind, remote_file_id,
+                            local_device, local_inode, local_mtime, local_size, local_sha256,
+                            local_generation, local_status, phase, dirty_generation,
+                            created_at, updated_at
+                        ) VALUES (
+                            ?, ?, ?, 'file', ?,
+                            ?, ?, ?, ?, ?,
+                            1, 'present', 'inFlight', 1,
+                            ?, ?
+                        )
+                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                        DO UPDATE SET
+                            remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
+                            local_device = excluded.local_device,
+                            local_inode = excluded.local_inode,
+                            local_mtime = excluded.local_mtime,
+                            local_size = excluded.local_size,
+                            local_sha256 = excluded.local_sha256,
+                            phase = 'inFlight',
+                            dirty_generation = MAX(items.dirty_generation, 1),
+                            updated_at = excluded.updated_at;
+                        """)
+                        itemStmt.bindInt64(rootId, at: 1)
+                        itemStmt.bindInt64(parentDirItemId, at: 2)
+                        itemStmt.bindText(name, at: 3)
+                        itemStmt.bindText(remoteFileId, at: 4)
+                        itemStmt.bindInt64(dev, at: 5)
+                        itemStmt.bindInt64(ino, at: 6)
+                        itemStmt.bindInt64(mtime, at: 7)
+                        itemStmt.bindInt64(fileSize, at: 8)
+                        itemStmt.bindText(sha256Hex, at: 9)
+                        let timestamp = Date().timeIntervalSince1970
+                        itemStmt.bindDouble(timestamp, at: 10)
+                        itemStmt.bindDouble(timestamp, at: 11)
+                        _ = try itemStmt.step()
+                        itemStmt.reset()
+
+                        let qStmt = try conn.cachedStatement("""
+                        SELECT item_id FROM items
+                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                        """)
+                        qStmt.bindInt64(rootId, at: 1)
+                        qStmt.bindInt64(parentDirItemId, at: 2)
+                        qStmt.bindText(name, at: 3)
+                        defer { qStmt.reset() }
+                        if try qStmt.step(), let id = qStmt.columnInt64(at: 0) {
+                            return id
+                        }
+                        return 0
+                    }
+
+                    // large files (> 8MB) Resumable 8MB Streaming block-based breakpoint resumption (each block is placed on the disk) offset)
+                    _ = try await self.performResumableUpload(
+                        rootId: rootId,
+                        itemId: currentItemId,
+                        fileURL: input.fileURL,
+                        fileSize: fileSize,
+                        expectedSha256: sha256Hex,
+                        remoteId: remoteFileId,
+                        parentId: remoteParentId,
+                        name: name,
+                        isUpdate: isUpdate
+                    )
+
+                    // Submit a common baseline B
+                    try input.version.validate(at: fileURL)
+                    let expectedLocalGeneration = existingTarget?.localGeneration ?? 1
+                    try await self.store.batchWrite { conn in
+                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
+                        let updateStmt = try conn.cachedStatement("""
+                        UPDATE items SET
+                            base_sha256 = ?,
+                            base_size = ?,
+                            remote_sha256 = ?,
+                            remote_size = ?,
+                            remote_status = 'present',
+                            phase = 'committed',
+                            dirty_generation = 0,
+                            updated_at = ?
+                        WHERE root_id = ? AND remote_file_id = ? AND local_generation = ?
+                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                        """)
+                        updateStmt.bindText(sha256Hex, at: 1)
+                        updateStmt.bindInt64(fileSize, at: 2)
+                        updateStmt.bindText(sha256Hex, at: 3)
+                        updateStmt.bindInt64(fileSize, at: 4)
+                        updateStmt.bindDouble(Date().timeIntervalSince1970, at: 5)
+                        updateStmt.bindInt64(rootId, at: 6)
+                        updateStmt.bindText(remoteFileId, at: 7)
+                        updateStmt.bindInt64(expectedLocalGeneration, at: 8)
+                        updateStmt.bindInt64(expectedRemoteGeneration, at: 9)
+                        updateStmt.bindInt64(expectedDirtyGeneration, at: 10)
+                        _ = try updateStmt.step()
+                        updateStmt.reset()
+                        if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
+                    }
+                }
+
+                if fileSize <= limit8MB, let content = smallContent {
+                    try await uploadSmallFile(content)
+                } else {
+                    try await uploadLargeFile()
+                }
+
+                guard receiptApplied.withLock({ $0 }) else {
+                    throw SyncEngineError.general("The upload receipt is stale; the newer generation remains pending: \(name)")
+                }
+                progress.recordSuccess(bytes: fileSize)
+            } catch {
+                if let createIntent {
+                    await DurableCreateIntentStore.markUnknownOutcome(
+                        store: self.store,
+                        operationID: createIntent.operationID,
+                        error: error
+                    )
+                }
+                progress.recordFailure()
+                if case DriveError.unsafeOverwrite = error {
+                    let parentID = localDirMap.get(parentRel) ?? rootItemId
+                    try? await self.store.batchWrite { conn in
+                        let stmt = try conn.cachedStatement("""
+                        UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
+                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                        """)
+                        stmt.bindInt64(rootId, at: 1)
+                        stmt.bindInt64(parentID, at: 2)
+                        stmt.bindText(name, at: 3)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+                }
+                self.logger.error("Failed to upload file [\(relPath)]: \(error)")
+            }
+        }
+
+        @Sendable func createDirectory(relPath: String, parentRel: String, name: String, metadata: FileMetadata?) async {
+            defer {
+                bootstrapTaskWindow.signal()
+                uploadGroup.leave()
+            }
+            var createIntent: DurableCreateIntent?
+            do {
+                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                await directorySemaphore.wait()
+                defer { directorySemaphore.signal() }
+                let candidateRemoteId = try await self.idPool.nextId()
+                let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
+                let intent = try await DurableCreateIntentStore.prepareDirectory(
+                    store: self.store,
+                    rootID: rootId,
+                    parentItemID: grandParentItemId,
+                    name: name,
+                    targetParentRemoteID: remoteParentId,
+                    candidateRemoteID: candidateRemoteId,
+                    device: Int64(metadata?.identity.device ?? 1),
+                    inode: Int64(metadata?.identity.inode ?? 0)
+                )
+                createIntent = intent
+
+                // Intent of group-commit Only after confirmation can the remote creation request be issued.
+                _ = try await self.client.createDirectory(
+                    name: name,
+                    parentId: intent.targetParentRemoteID,
+                    remoteId: intent.targetRemoteID
+                )
+
+                try await self.store.batchWrite { conn in
+                    let timestamp = Date().timeIntervalSince1970
+                    let stmt = try conn.cachedStatement("""
+                    UPDATE items SET
+                        remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                    WHERE item_id = ?;
+                    """)
+                    stmt.bindDouble(timestamp, at: 1)
+                    stmt.bindInt64(intent.itemID, at: 2)
+                    _ = try stmt.step()
+                    stmt.reset()
+                    try DurableCreateIntentStore.completeOperation(conn: conn, operationID: intent.operationID, now: timestamp)
+                }
+                localDirMap.set(relPath, id: intent.itemID)
+
+                // Broadcast wake-up waiting for all children of the directory
+                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
+                progress.recordDirCreated()
+            } catch {
+                await directoryTracker.markDirectoryFailed(relPath: relPath, error: error)
+                if let createIntent {
+                    await DurableCreateIntentStore.markUnknownOutcome(
+                        store: self.store,
+                        operationID: createIntent.operationID,
+                        error: error
+                    )
+                }
+                self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
+            }
+        }
+
+        @Sendable func processBatch(_ batch: ScanBatch) async throws {
             struct BootstrapScanRecord: Sendable {
                 let type: EntryType
                 let metadata: FileMetadata?
@@ -311,67 +731,7 @@ extension SyncEngine {
                         }
                         await bootstrapTaskWindow.wait()
                         uploadGroup.enter()
-                        Task {
-                            defer {
-                                bootstrapTaskWindow.signal()
-                                uploadGroup.leave()
-                            }
-                            var createIntent: DurableCreateIntent?
-                            do {
-                                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
-                                await directorySemaphore.wait()
-                                defer { directorySemaphore.signal() }
-                                let candidateRemoteId = try await self.idPool.nextId()
-                                let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
-                                let intent = try await DurableCreateIntentStore.prepareDirectory(
-                                    store: self.store,
-                                    rootID: rootId,
-                                    parentItemID: grandParentItemId,
-                                    name: name,
-                                    targetParentRemoteID: remoteParentId,
-                                    candidateRemoteID: candidateRemoteId,
-                                    device: Int64(record.metadata?.identity.device ?? 1),
-                                    inode: Int64(record.metadata?.identity.inode ?? 0)
-                                )
-                                createIntent = intent
-
-                                // Intent of group-commit Only after confirmation can the remote creation request be issued.
-                                _ = try await self.client.createDirectory(
-                                    name: name,
-                                    parentId: intent.targetParentRemoteID,
-                                    remoteId: intent.targetRemoteID
-                                )
-
-                                try await self.store.batchWrite { conn in
-                                    let ts = Date().timeIntervalSince1970
-                                    let stmt = try conn.cachedStatement("""
-                                    UPDATE items SET
-                                        remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
-                                    WHERE item_id = ?;
-                                    """)
-                                    stmt.bindDouble(ts, at: 1)
-                                    stmt.bindInt64(intent.itemID, at: 2)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                    try DurableCreateIntentStore.completeOperation(conn: conn, operationID: intent.operationID, now: ts)
-                                }
-                                localDirMap.set(relPath, id: intent.itemID)
-
-                                // Broadcast wake-up waiting for all children of the directory
-                                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
-                                progress.recordDirCreated()
-                            } catch {
-                                await directoryTracker.markDirectoryFailed(relPath: relPath, error: error)
-                                if let createIntent {
-                                    await DurableCreateIntentStore.markUnknownOutcome(
-                                        store: self.store,
-                                        operationID: createIntent.operationID,
-                                        error: error
-                                    )
-                                }
-                                self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
-                            }
-                        }
+                        Task { await createDirectory(relPath: relPath, parentRel: parentRel, name: name, metadata: record.metadata) }
                     } else if record.type == .file {
                         let dev = Int64(record.metadata?.identity.device ?? 1)
                         let ino = Int64(record.metadata?.identity.inode ?? 0)
@@ -379,7 +739,7 @@ extension SyncEngine {
                         let fileSize = record.metadata?.fileSize ?? 0
 
                         // Rapid change detection (§6.2):dev + inode + mtime + size Matching skips content reading and hash calculations
-                        if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
+                        if baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) != nil {
                             progress.recordSkipped()
                             continue
                         }
@@ -389,349 +749,11 @@ extension SyncEngine {
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
-                        Task {
-                            defer {
-                                bootstrapTaskWindow.signal()
-                                uploadGroup.leave()
-                            }
-                            var createIntent: DurableCreateIntent?
-                            var didAcquireSemaphore = false
-
-                            defer {
-                                if didAcquireSemaphore {
-                                    uploadSemaphore.signal()
-                                }
-                                self.monitor.finishUpload(id: fullPath)
-                                notifier.addCompleted(files: 1, bytes: Int64(fileSize))
-                            }
-
-                            do {
-                                // First wait for the direct parent directory to be in Google Drive The remote end is ready to avoid occupying concurrent upload slots.
-                                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
-
-                                await uploadSemaphore.wait()
-                                didAcquireSemaphore = true
-
-                                let fileURL = URL(fileURLWithPath: fullPath)
-                                let limit8MB: Int64 = 8 * 1024 * 1024
-
-                                let input = try StableUploadInput.capture(at: fileURL)
-                                let sha256Hex = input.sha256
-                                let fileSize = input.size
-                                let smallContent = input.data
-
-                                self.monitor.startUpload(id: fullPath, name: name, totalBytes: fileSize)
-
-                                let dev = input.version.device
-                                let ino = input.version.inode
-                                let mtime = input.version.mtime
-
-                                let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
-
-                                // Check whether the file is already in SQLite recorded (whether it has been committed Still unfinished inFlight)
-                                struct ExistingFileTarget {
-                                    let itemID: Int64
-                                    let remoteID: String?
-                                    let phase: String
-                                    let remoteStatus: String
-                                    let hasBaseline: Bool
-                                    let localGeneration: Int64
-                                    let remoteGeneration: Int64
-                                    let dirtyGeneration: Int64
-                                }
-
-                                let existingTarget: ExistingFileTarget? = try await self.store.read { conn in
-                                    let stmt = try conn.cachedStatement("""
-                                    SELECT item_id, remote_file_id, phase, remote_status, base_sha256,
-                                           local_generation, remote_generation, dirty_generation
-                                    FROM items
-                                    WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                                    """)
-                                    stmt.bindInt64(rootId, at: 1)
-                                    stmt.bindInt64(parentDirItemId, at: 2)
-                                    stmt.bindText(name, at: 3)
-                                    defer { stmt.reset() }
-                                    if try stmt.step(), let iId = stmt.columnInt64(at: 0) {
-                                        return ExistingFileTarget(
-                                            itemID: iId,
-                                            remoteID: stmt.columnText(at: 1),
-                                            phase: stmt.columnText(at: 2) ?? "discovered",
-                                            remoteStatus: stmt.columnText(at: 3) ?? "unknown",
-                                            hasBaseline: stmt.columnText(at: 4) != nil,
-                                            localGeneration: stmt.columnInt64(at: 5) ?? 0,
-                                            remoteGeneration: stmt.columnInt64(at: 6) ?? 0,
-                                            dirtyGeneration: stmt.columnInt64(at: 7) ?? 0
-                                        )
-                                    }
-                                    return nil
-                                }
-
-                                // Perform upload based on file size:≤ 8MB go Multipart,> 8MB go Resumable
-                                if let existingTarget, existingTarget.hasBaseline, let remoteID = existingTarget.remoteID {
-                                    throw DriveError.unsafeOverwrite(fileId: remoteID)
-                                }
-                                let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                                let expectedRemoteGeneration = existingTarget?.remoteGeneration ?? 0
-                                let expectedDirtyGeneration = max(existingTarget?.dirtyGeneration ?? 0, 1)
-                                if fileSize <= limit8MB, let content = smallContent {
-                                    let uploadedFile: DriveFile
-                                    let committedItemID: Int64
-                                    if let existing = existingTarget, let existingRemoteId = existing.remoteID,
-                                       existing.phase == "committed" && existing.remoteStatus == "present" {
-                                        // The content of the file submitted in the cloud has changed: call directly updateMultipart Update existing remote objects, never create new ones Drive Object!
-                                        uploadedFile = try await self.client.updateMultipart(
-                                            remoteId: existingRemoteId,
-                                            content: content,
-                                            expectedSha256: sha256Hex
-                                        )
-                                        committedItemID = existing.itemID
-                                    } else {
-                                        // Create new files or rerun unfinished files: Prioritize reusing existing files remote_file_id,avoid regeneration
-                                        let targetRemoteId: String
-                                        if let existingRemoteId = existingTarget?.remoteID {
-                                            targetRemoteId = existingRemoteId
-                                        } else {
-                                            targetRemoteId = try await self.idPool.nextId()
-                                        }
-                                        let intent = try await DurableCreateIntentStore.prepareFileUpload(
-                                            store: self.store,
-                                            rootID: rootId,
-                                            itemID: existingTarget?.itemID,
-                                            parentItemID: parentDirItemId,
-                                            name: name,
-                                            targetParentRemoteID: remoteParentId,
-                                            candidateRemoteID: targetRemoteId,
-                                            device: dev,
-                                            inode: ino,
-                                            mtime: mtime,
-                                            size: fileSize,
-                                            sha256: sha256Hex,
-                                            transport: .multipart
-                                        )
-                                        createIntent = intent
-
-                                        do {
-                                            uploadedFile = try await self.client.uploadMultipart(
-                                                name: name,
-                                                parentId: intent.targetParentRemoteID,
-                                                remoteId: intent.targetRemoteID,
-                                                content: content,
-                                                expectedSha256: sha256Hex
-                                            )
-                                        } catch let error as DriveError {
-                                            switch error {
-                                            case .conflict:
-                                                // The remote end may have successfully written the ID metadata, converted to update text
-                                                uploadedFile = try await self.client.updateMultipart(
-                                                    remoteId: intent.targetRemoteID,
-                                                    content: content,
-                                                    expectedSha256: sha256Hex
-                                                )
-                                            case .serverError(let code, _) where code == 400 || code == 409:
-                                                uploadedFile = try await self.client.updateMultipart(
-                                                    remoteId: intent.targetRemoteID,
-                                                    content: content,
-                                                    expectedSha256: sha256Hex
-                                                )
-                                            default:
-                                                throw error
-                                            }
-                                        }
-                                        committedItemID = intent.itemID
-                                    }
-                                    self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
-
-                                    // After the upload is successful, pass batchWrite(Group Commit,merge 256 item or 5ms Flush the disk) and write the baseline
-                                    try input.version.validate(at: fileURL)
-                                    let completedCreateIntent = createIntent
-                                    let expectedLocalGeneration = completedCreateIntent?.expectedLocalGeneration ?? existingTarget?.localGeneration ?? 1
-                                    try await self.store.batchWrite { conn in
-                                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
-                                        let itemStmt = try conn.cachedStatement("""
-                                        UPDATE items SET
-                                            remote_file_id = ?,
-                                            local_device = ?, local_inode = ?, local_mtime = ?,
-                                            local_size = ?, local_sha256 = ?,
-                                            base_sha256 = ?, base_size = ?,
-                                            remote_sha256 = ?, remote_size = ?, remote_status = 'present',
-                                            local_status = 'present', phase = 'committed', dirty_generation = 0,
-                                            updated_at = ?
-                                        WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                                            AND dirty_generation = ? AND is_tombstone = 0;
-                                        """)
-                                        itemStmt.bindText(uploadedFile.id, at: 1)
-                                        itemStmt.bindInt64(dev, at: 2)
-                                        itemStmt.bindInt64(ino, at: 3)
-                                        itemStmt.bindInt64(mtime, at: 4)
-                                        itemStmt.bindInt64(fileSize, at: 5)
-                                        itemStmt.bindText(sha256Hex, at: 6)
-                                        itemStmt.bindText(sha256Hex, at: 7)
-                                        itemStmt.bindInt64(fileSize, at: 8)
-                                        itemStmt.bindText(sha256Hex, at: 9)
-                                        itemStmt.bindInt64(fileSize, at: 10)
-                                        let ts = Date().timeIntervalSince1970
-                                        itemStmt.bindDouble(ts, at: 11)
-                                        itemStmt.bindInt64(committedItemID, at: 12)
-                                        itemStmt.bindInt64(expectedLocalGeneration, at: 13)
-                                        itemStmt.bindInt64(expectedRemoteGeneration, at: 14)
-                                        itemStmt.bindInt64(expectedDirtyGeneration, at: 15)
-                                        _ = try itemStmt.step()
-                                        itemStmt.reset()
-                                        guard conn.changes == 1 else { return }
-                                        receiptApplied.withLock { $0 = true }
-                                        if let createIntent = completedCreateIntent {
-                                            try DurableCreateIntentStore.completeOperation(
-                                                conn: conn,
-                                                operationID: createIntent.operationID,
-                                                now: ts
-                                            )
-                                        }
-                                    }
-                                } else {
-                                    // large files (> 8MB):Reuse existing remote_file_id with breakpoints, no blind replacement ID!
-                                    let remoteFileId: String
-                                    if let existingRemoteId = existingTarget?.remoteID {
-                                        remoteFileId = existingRemoteId
-                                    } else {
-                                        remoteFileId = try await self.idPool.nextId()
-                                    }
-                                    let isUpdate = existingTarget?.hasBaseline == true || (existingTarget?.phase == "committed" && existingTarget?.remoteStatus == "present")
-                                    if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteFileId) }
-
-                                    let currentItemId: Int64 = try await self.store.write { conn in
-                                        let itemStmt = try conn.cachedStatement("""
-                                        INSERT INTO items (
-                                            root_id, parent_id, name, entry_kind, remote_file_id,
-                                            local_device, local_inode, local_mtime, local_size, local_sha256,
-                                            local_generation, local_status, phase, dirty_generation,
-                                            created_at, updated_at
-                                        ) VALUES (
-                                            ?, ?, ?, 'file', ?,
-                                            ?, ?, ?, ?, ?,
-                                            1, 'present', 'inFlight', 1,
-                                            ?, ?
-                                        )
-                                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                        DO UPDATE SET
-                                            remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
-                                            local_device = excluded.local_device,
-                                            local_inode = excluded.local_inode,
-                                            local_mtime = excluded.local_mtime,
-                                            local_size = excluded.local_size,
-                                            local_sha256 = excluded.local_sha256,
-                                            phase = 'inFlight',
-                                            dirty_generation = MAX(items.dirty_generation, 1),
-                                            updated_at = excluded.updated_at;
-                                        """)
-                                        itemStmt.bindInt64(rootId, at: 1)
-                                        itemStmt.bindInt64(parentDirItemId, at: 2)
-                                        itemStmt.bindText(name, at: 3)
-                                        itemStmt.bindText(remoteFileId, at: 4)
-                                        itemStmt.bindInt64(dev, at: 5)
-                                        itemStmt.bindInt64(ino, at: 6)
-                                        itemStmt.bindInt64(mtime, at: 7)
-                                        itemStmt.bindInt64(fileSize, at: 8)
-                                        itemStmt.bindText(sha256Hex, at: 9)
-                                        let ts = Date().timeIntervalSince1970
-                                        itemStmt.bindDouble(ts, at: 10)
-                                        itemStmt.bindDouble(ts, at: 11)
-                                        _ = try itemStmt.step()
-                                        itemStmt.reset()
-
-                                        let qStmt = try conn.cachedStatement("""
-                                        SELECT item_id FROM items
-                                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                                        """)
-                                        qStmt.bindInt64(rootId, at: 1)
-                                        qStmt.bindInt64(parentDirItemId, at: 2)
-                                        qStmt.bindText(name, at: 3)
-                                        defer { qStmt.reset() }
-                                        if try qStmt.step(), let id = qStmt.columnInt64(at: 0) {
-                                            return id
-                                        }
-                                        return 0
-                                    }
-
-                                    // large files (> 8MB) Resumable 8MB Streaming block-based breakpoint resumption (each block is placed on the disk) offset)
-                                    _ = try await self.performResumableUpload(
-                                        rootId: rootId,
-                                        itemId: currentItemId,
-                                        fileURL: input.fileURL,
-                                        fileSize: fileSize,
-                                        expectedSha256: sha256Hex,
-                                        remoteId: remoteFileId,
-                                        parentId: remoteParentId,
-                                        name: name,
-                                        isUpdate: isUpdate
-                                    )
-
-                                    // Submit a common baseline B
-                                    try input.version.validate(at: fileURL)
-                                    let expectedLocalGeneration = existingTarget?.localGeneration ?? 1
-                                    try await self.store.batchWrite { conn in
-                                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
-                                        let updateStmt = try conn.cachedStatement("""
-                                        UPDATE items SET
-                                            base_sha256 = ?,
-                                            base_size = ?,
-                                            remote_sha256 = ?,
-                                            remote_size = ?,
-                                            remote_status = 'present',
-                                            phase = 'committed',
-                                            dirty_generation = 0,
-                                            updated_at = ?
-                                        WHERE root_id = ? AND remote_file_id = ? AND local_generation = ?
-                                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
-                                        """)
-                                        updateStmt.bindText(sha256Hex, at: 1)
-                                        updateStmt.bindInt64(fileSize, at: 2)
-                                        updateStmt.bindText(sha256Hex, at: 3)
-                                        updateStmt.bindInt64(fileSize, at: 4)
-                                        updateStmt.bindDouble(Date().timeIntervalSince1970, at: 5)
-                                        updateStmt.bindInt64(rootId, at: 6)
-                                        updateStmt.bindText(remoteFileId, at: 7)
-                                        updateStmt.bindInt64(expectedLocalGeneration, at: 8)
-                                        updateStmt.bindInt64(expectedRemoteGeneration, at: 9)
-                                        updateStmt.bindInt64(expectedDirtyGeneration, at: 10)
-                                        _ = try updateStmt.step()
-                                        updateStmt.reset()
-                                        if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
-                                    }
-                                }
-
-                                guard receiptApplied.withLock({ $0 }) else {
-                                    throw SyncEngineError.general("The upload receipt is stale; the newer generation remains pending: \(name)")
-                                }
-                                progress.recordSuccess(bytes: fileSize)
-                            } catch {
-                                if let createIntent {
-                                    await DurableCreateIntentStore.markUnknownOutcome(
-                                        store: self.store,
-                                        operationID: createIntent.operationID,
-                                        error: error
-                                    )
-                                }
-                                progress.recordFailure()
-                                if case DriveError.unsafeOverwrite = error {
-                                    let parentID = localDirMap.get(parentRel) ?? rootItemId
-                                    try? await self.store.batchWrite { conn in
-                                        let stmt = try conn.cachedStatement("""
-                                        UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
-                                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                                        """)
-                                        stmt.bindInt64(rootId, at: 1)
-                                        stmt.bindInt64(parentID, at: 2)
-                                        stmt.bindText(name, at: 3)
-                                        _ = try stmt.step()
-                                        stmt.reset()
-                                    }
-                                }
-                                self.logger.error("Failed to upload file [\(relPath)]: \(error)")
-                            }
-                        }
+                        Task { await uploadFile(fullPath: fullPath, relPath: relPath, parentRel: parentRel, name: name, fileSize: Int64(fileSize)) }
                     }
             }
         }
+        try await directoryScan(request, processBatch)
 
         // 5. Wait for all concurrent directory creation and uploads to complete
         await withTaskCancellationHandler {
@@ -775,5 +797,3 @@ extension SyncEngine {
     }
 
 }
-
-

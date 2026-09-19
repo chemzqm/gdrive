@@ -6,8 +6,8 @@ import Testing
 final class MockFailureSafetyURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let handler = Self.requestHandler else {
@@ -150,37 +150,37 @@ struct FailureStateSafetyTests {
             let path = url.path
 
             if path.contains("/files/\(rootRemoteId)") && request.httpMethod == "GET" {
-                let json = """
+                let json = Data("""
                 {"id": "\(rootRemoteId)", "name": "local_root", "mimeType": "application/vnd.google-apps.folder", "trashed": false}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes") {
-                let json = #"{"newStartPageToken": "token_2", "changes": []}"#.data(using: .utf8)!
+                let json = Data(#"{"newStartPageToken": "token_2", "changes": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = #"{"ids": ["mock_id_gen"]}"#.data(using: .utf8)!
+                let json = Data(#"{"ids": ["mock_id_gen"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(dirARemoteId)") {
                 if control.shouldFail {
                     // Inject 500 internal server error
-                    let errJson = #"{"error": {"code": 500, "message": "Simulated Drive failure"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 500, "message": "Simulated Drive failure"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
-                    let json = """
+                    let json = Data("""
                     {"id": "\(dirARemoteId)", "name": "dir_B", "mimeType": "application/vnd.google-apps.folder"}
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         // Established-baseline fixtures include their durable Changes boundary.
@@ -309,26 +309,26 @@ struct FailureStateSafetyTests {
         let uploads = RequestEventRecorder()
         let renames = RequestEventRecorder()
 
-        MockFailureSafetyURLProtocol.requestHandler = { request in
+        @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             let url = try #require(request.url)
             let path = url.path
 
             if path.contains("/files/\(rootRemoteId)") && request.httpMethod == "GET" {
-                let json = """
+                let json = Data("""
                 {"id": "\(rootRemoteId)", "name": "local_root", "mimeType": "application/vnd.google-apps.folder", "trashed": false}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes") {
-                let json = #"{"newStartPageToken": "token_2", "changes": []}"#.data(using: .utf8)!
+                let json = Data(#"{"newStartPageToken": "token_2", "changes": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = #"{"ids": ["mock_id_gen"]}"#.data(using: .utf8)!
+                let json = Data(#"{"ids": ["mock_id_gen"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(fileARemoteId)") {
@@ -347,25 +347,26 @@ struct FailureStateSafetyTests {
                     }
                     #expect(body == expectedContent)
                     uploads.recordFilePatch()
-                    let json = """
+                    let json = Data("""
                     {"id":"\(fileARemoteId)","name":"file_B.txt","mimeType":"text/plain","size":"12","sha256Checksum":"\(expectedSHA)"}
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
                 renames.recordFilePatch()
                 if control.shouldFail {
-                    let errJson = #"{"error": {"code": 400, "message": "Bad Request"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 400, "message": "Bad Request"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 400, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
-                    let json = """
+                    let json = Data("""
                     {"id": "\(fileARemoteId)", "name": "file_B.txt", "mimeType": "text/plain"}
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
+        MockFailureSafetyURLProtocol.requestHandler = handleRequest
 
         // Established-baseline fixtures include their durable Changes boundary.
         try await store.write { conn in
@@ -490,36 +491,36 @@ struct FailureStateSafetyTests {
             let path = url.path
 
             if path.contains("/files/\(rootRemoteId)") && request.httpMethod == "GET" {
-                let json = """
+                let json = Data("""
                 {"id": "\(rootRemoteId)", "name": "local_root", "mimeType": "application/vnd.google-apps.folder", "trashed": false}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes") {
-                let json = #"{"newStartPageToken": "token_2", "changes": []}"#.data(using: .utf8)!
+                let json = Data(#"{"newStartPageToken": "token_2", "changes": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = #"{"ids": ["mock_id_gen"]}"#.data(using: .utf8)!
+                let json = Data(#"{"ids": ["mock_id_gen"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(fileRemoteId)") {
                 if control.shouldFail {
-                    let errJson = #"{"error": {"code": 403, "message": "Cannot trash file"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 403, "message": "Cannot trash file"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
-                    let json = """
+                    let json = Data("""
                     {"id": "\(fileRemoteId)", "trashed": true}
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         // Established-baseline fixtures include their durable Changes boundary.
@@ -600,36 +601,36 @@ struct FailureStateSafetyTests {
             let path = url.path
 
             if path.contains("/files/\(rootRemoteId)") && request.httpMethod == "GET" {
-                let json = """
+                let json = Data("""
                 {"id": "\(rootRemoteId)", "name": "local_root", "mimeType": "application/vnd.google-apps.folder", "trashed": false}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes") {
-                let json = #"{"newStartPageToken": "token_2", "changes": []}"#.data(using: .utf8)!
+                let json = Data(#"{"newStartPageToken": "token_2", "changes": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = #"{"ids": ["valid_server_id_1"]}"#.data(using: .utf8)!
+                let json = Data(#"{"ids": ["valid_server_id_1"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "POST" && path.hasSuffix("/drive/v3/files") {
                 if control.shouldFail {
-                    let errJson = #"{"error": {"code": 500, "message": "Simulated Drive folder create error"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 500, "message": "Simulated Drive folder create error"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
-                    let json = """
+                    let json = Data("""
                     {"id": "valid_server_id_1", "name": "new_folder", "mimeType": "application/vnd.google-apps.folder"}
-                    """.data(using: .utf8)!
+                    """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         // Established-baseline fixtures include their durable Changes boundary.
@@ -723,25 +724,25 @@ struct FailureStateSafetyTests {
             let path = url.path
 
             if path.contains("/files/\(rootRemoteId)") && request.httpMethod == "GET" {
-                let json = """
+                let json = Data("""
                 {"id": "\(rootRemoteId)", "name": "local_root", "mimeType": "application/vnd.google-apps.folder", "trashed": false}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes/startPageToken") {
-                let json = #"{"startPageToken": "token_1"}"#.data(using: .utf8)!
+                let json = Data(#"{"startPageToken": "token_1"}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/changes") {
-                let json = #"{"newStartPageToken": "token_2", "changes": []}"#.data(using: .utf8)!
+                let json = Data(#"{"newStartPageToken": "token_2", "changes": []}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
                 if control.shouldFail {
-                    let errJson = #"{"error": {"code": 500, "message": "IDPool API failure"}}"#.data(using: .utf8)!
+                    let errJson = Data(#"{"error": {"code": 500, "message": "IDPool API failure"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
-                    let json = #"{"ids": ["valid_remote_id_42"]}"#.data(using: .utf8)!
+                    let json = Data(#"{"ids": ["valid_remote_id_42"]}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
@@ -751,13 +752,13 @@ struct FailureStateSafetyTests {
                     let requestedId = dict["id"] as? String {
                     tracker.add(requestedId)
                 }
-                let json = """
+                let json = Data("""
                 {"id": "valid_remote_id_42", "name": "sub_folder", "mimeType": "application/vnd.google-apps.folder"}
-                """.data(using: .utf8)!
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
-            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
+            return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
 
         // Established-baseline fixtures include their durable Changes boundary.

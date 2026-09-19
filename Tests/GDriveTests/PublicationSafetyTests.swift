@@ -6,8 +6,8 @@ import os
 private final class PublicationURLProtocol: URLProtocol, @unchecked Sendable {
     static let requests = OSAllocatedUnfairLock(initialState: 0)
     static let content = Data(repeating: 0x72, count: 65_544)
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests.withLock { $0 += 1 }
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
@@ -151,8 +151,7 @@ struct PublicationSafetyTests {
                 expectedDestination: expected, temporaryDirectory: staging,
                 beforePublish: { if cancel { throw CancellationError() } })
             Issue.record("Failed download unexpectedly published")
-        } catch is CancellationError { #expect(cancel) }
-        catch DriveError.checksumMismatch { #expect(!cancel) }
+        } catch is CancellationError { #expect(cancel) } catch DriveError.checksumMismatch { #expect(!cancel) }
         #expect(try Data(contentsOf: destination) == original)
         #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }

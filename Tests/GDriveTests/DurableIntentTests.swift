@@ -6,8 +6,8 @@ import Testing
 final class DurableIntentURLProtocol: URLProtocol, @unchecked Sendable {
     nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
-    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
         guard let handler = Self.requestHandler else {
@@ -167,7 +167,7 @@ struct DurableIntentTests {
         let client = DriveClient(auth: auth, session: URLSession(configuration: config))
         let idPool = IDPool(initialIds: ["small-file-id", "empty-dir-id"])
 
-        DurableIntentURLProtocol.requestHandler = { request in
+        @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             let url = try #require(request.url)
             let response: HTTPURLResponse
             let data: Data
@@ -250,6 +250,7 @@ struct DurableIntentTests {
             }
             return (response, data)
         }
+        DurableIntentURLProtocol.requestHandler = handleRequest
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: idPool)
         let stats: SyncStats

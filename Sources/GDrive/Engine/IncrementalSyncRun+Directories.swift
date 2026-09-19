@@ -72,6 +72,13 @@ extension IncrementalSyncRun {
     static func loadDirectoryContext(
         engine: SyncEngine, rootID: Int64, rootItemID: Int64, remoteRootID: String
     ) async throws -> DirectoryContext {
+        struct StoredDirectory: Sendable {
+            let id: Int64
+            let parentId: Int64
+            let name: String
+            let remoteId: String
+            let present: Bool
+        }
         let dirContext = DirectoryContext(rootItemId: rootItemID, remoteRootId: remoteRootID)
         try await engine.store.read { conn in
             let stmt = try conn.cachedStatement(
@@ -81,14 +88,11 @@ extension IncrementalSyncRun {
                 WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
                 """)
             stmt.bindInt64(rootID, at: 1)
-            var rawDirs:
-                [(id: Int64, parentId: Int64, name: String, remoteId: String, present: Bool)] =
-                    []
+            var rawDirs: [StoredDirectory] = []
             while try stmt.step() {
                 if let id = stmt.columnInt64(at: 0), let parentId = stmt.columnInt64(at: 1),
-                    let name = stmt.columnText(at: 2), let rId = stmt.columnText(at: 3)
-                {
-                    rawDirs.append((id, parentId, name, rId, stmt.columnText(at: 4) == "present"))
+                    let name = stmt.columnText(at: 2), let rId = stmt.columnText(at: 3) {
+                    rawDirs.append(StoredDirectory(id: id, parentId: parentId, name: name, remoteId: rId, present: stmt.columnText(at: 4) == "present"))
                 }
             }
             stmt.reset()
@@ -126,8 +130,7 @@ extension IncrementalSyncRun {
     func recoverPendingDirectories(_ dirItems: [DirtyRecord]) async throws {
         // Resumes the last creation of a directory that was persisted before the request but for which a completion receipt has not yet been submitted.
         // createDirectory Use the same pregenerated ID Retry; if the server succeeded last time,DriveClient will be in 409 Then verify the same object.
-        let pendingDirectoryCreates = dirItems.compactMap {
-            item -> (DirtyRecord, DurableCreateIntent)? in
+        let pendingDirectoryCreates = dirItems.compactMap { item -> (DirtyRecord, DurableCreateIntent)? in
             guard let intent = item.pendingCreate else { return nil }
             return (item, intent)
         }.sorted { lhs, rhs in
@@ -144,19 +147,19 @@ extension IncrementalSyncRun {
                     remoteId: intent.targetRemoteID
                 )
                 try await engine.store.batchWrite { conn in
-                    let ts = Date().timeIntervalSince1970
+                    let timestamp = Date().timeIntervalSince1970
                     let stmt = try conn.cachedStatement(
                         """
                         UPDATE items SET
                             remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
                         WHERE item_id = ?;
                         """)
-                    stmt.bindDouble(ts, at: 1)
+                    stmt.bindDouble(timestamp, at: 1)
                     stmt.bindInt64(intent.itemID, at: 2)
                     _ = try stmt.step()
                     stmt.reset()
                     try DurableCreateIntentStore.completeOperation(
-                        conn: conn, operationID: intent.operationID, now: ts)
+                        conn: conn, operationID: intent.operationID, now: timestamp)
                 }
             } catch {
                 await DurableCreateIntentStore.markUnknownOutcome(
@@ -172,52 +175,55 @@ extension IncrementalSyncRun {
 
     func reconcileDirectories(_ dirItems: [DirtyRecord]) async throws {
         // 1. For ordinary directories in a non-deleted state, submit and clear them directly. dirty_generation
-        if !dirItems.isEmpty {
-            try await engine.store.write { conn in
-                for item in dirItems {
-                    let isCandidate =
-                        (item.local?.status == .absent && item.remote?.status == .present)
-                        || (item.remote?.status == .trashed && item.local?.status == .present)
-                        || (item.local?.status == .absent && item.remote?.status == .trashed)
-                    if !isCandidate {
-                        if item.local?.status != .unknown && item.remote?.status != .unknown {
+        func commitSettledDirectories() async throws {
+            if !dirItems.isEmpty {
+                try await engine.store.write { conn in
+                    for item in dirItems {
+                        let isCandidate =
+                            (item.local?.status == .absent && item.remote?.status == .present)
+                            || (item.remote?.status == .trashed && item.local?.status == .present)
+                            || (item.local?.status == .absent && item.remote?.status == .trashed)
+                        if !isCandidate {
+                            if item.local?.status != .unknown && item.remote?.status != .unknown {
+                                do {
+                                    let stmt = try conn.cachedStatement(
+                                        """
+                                        UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                        """)
+                                    stmt.bindDouble(self.now, at: 1)
+                                    stmt.bindInt64(item.itemId, at: 2)
+                                    _ = try stmt.step()
+                                    stmt.reset()
+                                }
+                            }
+                        } else if item.local?.status == .absent && item.remote?.status == .trashed {
+                            // Both ends have been deleted
                             do {
                                 let stmt = try conn.cachedStatement(
                                     """
-                                    UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
                                     """)
                                 stmt.bindDouble(self.now, at: 1)
                                 stmt.bindInt64(item.itemId, at: 2)
                                 _ = try stmt.step()
                                 stmt.reset()
                             }
+                            self.actionTracker.counts.withLock { $0.deleted += 1 }
                         }
-                    } else if item.local?.status == .absent && item.remote?.status == .trashed {
-                        // Both ends have been deleted
-                        do {
-                            let stmt = try conn.cachedStatement(
-                                """
-                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                                """)
-                            stmt.bindDouble(self.now, at: 1)
-                            stmt.bindInt64(item.itemId, at: 2)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                        self.actionTracker.counts.withLock { $0.deleted += 1 }
                     }
-                }
 
+                }
             }
         }
+        try await commitSettledDirectories()
 
         // 2. For directories with unilateral deletion intentions, perform barrier verification in reverse order of tree depth (bottom-up, leaf directories first)
         let dirCandidates = dirItems.filter {
             ($0.local?.status == .absent && $0.remote?.status == .present)
                 || ($0.remote?.status == .trashed && $0.local?.status == .present)
-        }.sorted { a, b in
-            let pathA = directoryContext.getRelPath(for: a.itemId) ?? ""
-            let pathB = directoryContext.getRelPath(for: b.itemId) ?? ""
+        }.sorted { firstDirectory, secondDirectory in
+            let pathA = directoryContext.getRelPath(for: firstDirectory.itemId) ?? ""
+            let pathB = directoryContext.getRelPath(for: secondDirectory.itemId) ?? ""
             let depthA = pathA.isEmpty ? 0 : pathA.split(separator: "/").count
             let depthB = pathB.isEmpty ? 0 : pathB.split(separator: "/").count
             return depthA > depthB
@@ -266,7 +272,7 @@ extension IncrementalSyncRun {
                 return (total: 0, localPresent: 0, remotePresent: 0, pending: 0)
             }
 
-            if dirItem.local?.status == .absent && dirItem.remote?.status == .present {
+            func reconcileRemoteDeletion() async throws {
                 // The directory is deleted locally, but the remote directory is still there (original intention: trashRemote)
                 // Barrier check: if there are any remote files in the descendants that need to be preserved/Download files locally/conflict/Pending items, deletion of remote directories is absolutely prohibited
                 if barrier.remotePresent > 0 || barrier.localPresent > 0 || barrier.pending > 0 {
@@ -307,7 +313,9 @@ extension IncrementalSyncRun {
                             "Failed to delete remote directory [\(relPath)]: \(error)")
                     }
                 }
-            } else if dirItem.remote?.status == .trashed && dirItem.local?.status == .present {
+            }
+
+            func reconcileLocalDeletion() async throws {
                 // The remote end deleted the directory, but the local directory is still there (original intention: deleteLocal)
                 // Barrier check: If there are local new, modified or conflicting files in the descendants, deletion of the local directory is absolutely prohibited
                 if barrier.localPresent > 0 || barrier.remotePresent > 0 || barrier.pending > 0 {
@@ -384,6 +392,12 @@ extension IncrementalSyncRun {
                         }
                     }
                 }
+            }
+
+            if dirItem.local?.status == .absent && dirItem.remote?.status == .present {
+                try await reconcileRemoteDeletion()
+            } else if dirItem.remote?.status == .trashed && dirItem.local?.status == .present {
+                try await reconcileLocalDeletion()
             }
         }
     }

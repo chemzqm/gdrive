@@ -68,7 +68,14 @@ extension IncrementalSyncRun {
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: localPath, filters: scanFilters, options: scanOptions)
 
-        struct DiscoveredRecord {
+        struct ExistingLocalItem: Sendable {
+            let itemId: Int64
+            let parentId: Int64
+            let name: String
+            let remoteId: String?
+        }
+
+        struct DiscoveredRecord: Sendable {
             let type: EntryType
             let fullPath: String
             let dev: Int64
@@ -209,38 +216,301 @@ extension IncrementalSyncRun {
         let seenDirTracker = self.seenDirTracker
         let scanProgress = self.scanProgress
 
+        @Sendable func observeDirectory(_ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String) async throws {
+            let parentItemId =
+                directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
+            let dev = record.dev
+            let ino = record.ino
+
+            // Check whether the local directory has been renamed or moved (press dev + ino Find)
+            let existingDir:
+                ExistingLocalItem? =
+                    try await engine.store.read { conn in
+                        let stmt = try conn.cachedStatement(
+                            """
+                            SELECT item_id, parent_id, name, remote_file_id
+                            FROM items
+                            WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                            """)
+                        stmt.bindInt64(rootID, at: 1)
+                        stmt.bindInt64(dev, at: 2)
+                        stmt.bindInt64(ino, at: 3)
+                        defer { stmt.reset() }
+                        if try stmt.step(),
+                            let iId = stmt.columnInt64(at: 0),
+                            let pId = stmt.columnInt64(at: 1),
+                            let itemName = stmt.columnText(at: 2) {
+                            let rId = stmt.columnText(at: 3)
+                            return ExistingLocalItem(itemId: iId, parentId: pId, name: itemName, remoteId: rId)
+                        }
+                        return nil
+                    }
+
+            if let existing = existingDir,
+                remoteGate.blocks(
+                    directoryContext.getRelPath(for: existing.itemId) ?? "") {
+                remoteGate.addAlias(relPath)
+                return
+            }
+            if let existing = existingDir,
+                existing.name != name || existing.parentId != parentItemId {
+                // The local directory is renamed or moved
+                seenDirTracker.markSeen(
+                    parentId: existing.parentId, name: existing.name)
+                do {
+                    if let rId = existing.remoteId {
+                        let oldPRemote = directoryContext.getRemoteId(
+                            for: existing.parentId)
+                        let newPRemote = directoryContext.getRemoteId(for: parentItemId)
+                        let addP =
+                            (parentItemId != existing.parentId) ? newPRemote : nil
+                        let remP =
+                            (parentItemId != existing.parentId) ? oldPRemote : nil
+                        _ = try await engine.client.updateMetadata(
+                            remoteId: rId, newName: name, addParentId: addP,
+                            removeParentId: remP)
+                    }
+                    try await engine.store.write { conn in
+                        let stmt = try conn.cachedStatement(
+                            """
+                            UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
+                            """)
+                        stmt.bindText(name, at: 1)
+                        stmt.bindInt64(parentItemId, at: 2)
+                        stmt.bindDouble(now, at: 3)
+                        stmt.bindInt64(existing.itemId, at: 4)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+                    seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                    directoryContext.register(
+                        itemId: existing.itemId, parentItemId: parentItemId, name: name,
+                        remoteId: existing.remoteId ?? "")
+                } catch {
+                    engine.logger.error(
+                        "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)"
+                    )
+                }
+            } else if directoryContext.getItemId(byRelPath: relPath) == nil {
+                // Create a new local directory
+                let remoteParentId =
+                    directoryContext.getRemoteId(for: parentItemId) ?? remoteRootID
+                var intent: DurableCreateIntent?
+                do {
+                    let candidateRemoteID = try await engine.idPool.nextId()
+                    let prepared = try await DurableCreateIntentStore.prepareDirectory(
+                        store: engine.store,
+                        rootID: rootID,
+                        parentItemID: parentItemId,
+                        name: name,
+                        targetParentRemoteID: remoteParentId,
+                        candidateRemoteID: candidateRemoteID,
+                        device: dev,
+                        inode: ino
+                    )
+                    intent = prepared
+                    _ = try await engine.client.createDirectory(
+                        name: name,
+                        parentId: prepared.targetParentRemoteID,
+                        remoteId: prepared.targetRemoteID
+                    )
+                    try await engine.store.write { conn in
+                        let timestamp = Date().timeIntervalSince1970
+                        let stmt = try conn.cachedStatement(
+                            """
+                            UPDATE items SET
+                                remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                            WHERE item_id = ?;
+                            """)
+                        stmt.bindDouble(timestamp, at: 1)
+                        stmt.bindInt64(prepared.itemID, at: 2)
+                        _ = try stmt.step()
+                        stmt.reset()
+                        try DurableCreateIntentStore.completeOperation(
+                            conn: conn, operationID: prepared.operationID, now: timestamp)
+                    }
+                    directoryContext.register(
+                        itemId: prepared.itemID,
+                        parentItemId: parentItemId,
+                        name: name,
+                        remoteId: prepared.targetRemoteID
+                    )
+                    seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                    scanProgress.incDirs()
+                } catch {
+                    if let intent {
+                        await DurableCreateIntentStore.markUnknownOutcome(
+                            store: engine.store,
+                            operationID: intent.operationID,
+                            error: error
+                        )
+                    }
+                    engine.logger.error(
+                        "Failed to create remote directory [\(relPath)]: \(error)")
+                }
+            } else {
+                seenDirTracker.markSeen(parentId: parentItemId, name: name)
+            }
+        }
+
+        @Sendable func observeFile(_ record: DiscoveredRecord, fullPath: String, parentRelNormalized: String, name: String,
+                                   pendingObservations: inout [IncrementalLocalObservation], firstObservationSent: inout Bool) async throws {
+            scanProgress.incScanned()
+            let parentItemId =
+                directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
+            let dev = record.dev
+            let ino = record.ino
+            let mtime = record.mtime
+            let fileSize = record.fileSize
+
+            // The cache only contains committed, clean remote-present baselines.
+            // Matching the path as well as identity preserves the rename path below,
+            // while an ordinary unchanged file needs no per-item SQLite round trip.
+            if let cached = baselineCache.lookupUnchanged(
+                device: dev, inode: ino, mtime: mtime, size: fileSize),
+                cached.parentId == parentItemId, cached.name == name {
+                seenTracker.markSeen(parentId: parentItemId, name: name)
+                scanProgress.incSkipped()
+                return
+            }
+
+            // Check if local files have been renamed or moved (press dev + ino Find)
+            let existingFile:
+                ExistingLocalItem? =
+                    try await engine.store.read { conn in
+                        let stmt = try conn.cachedStatement(
+                            """
+                            SELECT item_id, parent_id, name, remote_file_id
+                            FROM items
+                            WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                            """)
+                        stmt.bindInt64(rootID, at: 1)
+                        stmt.bindInt64(dev, at: 2)
+                        stmt.bindInt64(ino, at: 3)
+                        defer { stmt.reset() }
+                        if try stmt.step(),
+                            let iId = stmt.columnInt64(at: 0),
+                            let pId = stmt.columnInt64(at: 1),
+                            let itemName = stmt.columnText(at: 2) {
+                            let rId = stmt.columnText(at: 3)
+                            return ExistingLocalItem(itemId: iId, parentId: pId, name: itemName, remoteId: rId)
+                        }
+                        return nil
+                    }
+
+            if let existing = existingFile {
+                let parentPath =
+                    directoryContext.getRelPath(for: existing.parentId) ?? ""
+                let oldPath =
+                    parentPath.isEmpty
+                    ? existing.name : "\(parentPath)/\(existing.name)"
+                if remoteGate.blocks(oldPath) { return }
+            }
+            if let existing = existingFile,
+                existing.name != name || existing.parentId != parentItemId {
+                // Local files are renamed or moved
+                seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
+                do {
+                    if let rId = existing.remoteId {
+                        let oldPRemote = directoryContext.getRemoteId(
+                            for: existing.parentId)
+                        let newPRemote = directoryContext.getRemoteId(for: parentItemId)
+                        let addP =
+                            (parentItemId != existing.parentId) ? newPRemote : nil
+                        let remP =
+                            (parentItemId != existing.parentId) ? oldPRemote : nil
+                        _ = try await engine.client.updateMetadata(
+                            remoteId: rId, newName: name, addParentId: addP,
+                            removeParentId: remP)
+                    }
+
+                    try await engine.store.write { conn in
+                        let stmt = try conn.cachedStatement(
+                            """
+                            UPDATE items SET
+                                name = ?,
+                                parent_id = ?,
+                                updated_at = ?
+                            WHERE item_id = ?;
+                            """)
+                        stmt.bindText(name, at: 1)
+                        stmt.bindInt64(parentItemId, at: 2)
+                        stmt.bindDouble(now, at: 3)
+                        stmt.bindInt64(existing.itemId, at: 4)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+                    seenTracker.markSeen(parentId: parentItemId, name: name)
+                } catch {
+                    engine.logger.error(
+                        "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)"
+                    )
+                    return
+                }
+                // Path updates do not mean that the text has been verified; retain the old metadata and continue content comparison.
+                // A pure name change will still hit the cache below, while a text change will reuse the existing summary and decision process.
+            }
+
+            seenTracker.markSeen(parentId: parentItemId, name: name)
+
+            // Quick change comparison (§6.2)
+            if baselineCache.lookupUnchanged(
+                device: dev, inode: ino, mtime: mtime, size: fileSize)
+                != nil {
+                scanProgress.incSkipped()
+                return
+            }
+
+            pendingObservations.append(
+                IncrementalLocalObservation(
+                    parentID: parentItemId, name: name,
+                    url: URL(fileURLWithPath: fullPath),
+                    device: dev, inode: ino, mtime: mtime, size: fileSize))
+            // First ready file goes immediately; subsequent work uses bounded natural chunks.
+            if !firstObservationSent || pendingObservations.count >= 64 {
+                try await commitObservations(pendingObservations)
+                pendingObservations.removeAll(keepingCapacity: true)
+                firstObservationSent = true
+            }
+        }
+
+        @Sendable func copyScanRecords(_ batch: ScanBatch) -> [DiscoveredRecord] {
+            var itemsInBatch: [DiscoveredRecord] = []
+            batch.withRawData { rawBuf in
+                guard let basePtr = rawBuf.baseAddress else { return }
+
+                for idx in 0..<batch.count {
+                    let record = batch.records[idx]
+                    let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
+                    let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
+                    let fullPath = String(cString: cPath)
+
+                    let dev = Int64(record.metadata?.identity.device ?? 1)
+                    let ino = Int64(record.metadata?.identity.inode ?? 0)
+                    let mtime =
+                        (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000
+                        + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
+                    let fileSize = record.metadata?.fileSize ?? 0
+
+                    itemsInBatch.append(
+                        DiscoveredRecord(
+                            type: record.type,
+                            fullPath: fullPath,
+                            dev: dev,
+                            ino: ino,
+                            mtime: mtime,
+                            fileSize: fileSize
+                        ))
+                }
+            }
+            return itemsInBatch
+        }
+
         do {
             try await engine.directoryScan(request) { batch in
                 var pendingObservations: [IncrementalLocalObservation] = []
                 var firstObservationSent = sentFirstObservation.withLock { $0 }
-                var itemsInBatch: [DiscoveredRecord] = []
-                batch.withRawData { rawBuf in
-                    guard let basePtr = rawBuf.baseAddress else { return }
-
-                    for idx in 0..<batch.count {
-                        let record = batch.records[idx]
-                        let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
-                        let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
-                        let fullPath = String(cString: cPath)
-
-                        let dev = Int64(record.metadata?.identity.device ?? 1)
-                        let ino = Int64(record.metadata?.identity.inode ?? 0)
-                        let mtime =
-                            (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000
-                            + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
-                        let fileSize = record.metadata?.fileSize ?? 0
-
-                        itemsInBatch.append(
-                            DiscoveredRecord(
-                                type: record.type,
-                                fullPath: fullPath,
-                                dev: dev,
-                                ino: ino,
-                                mtime: mtime,
-                                fileSize: fileSize
-                            ))
-                    }
-                }
+                let itemsInBatch = copyScanRecords(batch)
 
                 for record in itemsInBatch {
                     let fullPath = record.fullPath
@@ -265,8 +535,7 @@ extension IncrementalSyncRun {
                         directoryContext.getItemId(byRelPath: parentRelNormalized) == nil,
                         try remoteGate.blocksLocalAncestors(
                             URL(fileURLWithPath: fullPath).deletingLastPathComponent(),
-                            root: rootURL)
-                    {
+                            root: rootURL) {
                         continue
                     }
 
@@ -276,265 +545,10 @@ extension IncrementalSyncRun {
                         firstObservationSent = true
                     }
                     if record.type == .directory {
-                        let parentItemId =
-                            directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
-                        let dev = record.dev
-                        let ino = record.ino
-
-                        // Check whether the local directory has been renamed or moved (press dev + ino Find)
-                        let existingDir:
-                            (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? =
-                                try await engine.store.read { conn in
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        SELECT item_id, parent_id, name, remote_file_id
-                                        FROM items
-                                        WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
-                                        """)
-                                    stmt.bindInt64(rootID, at: 1)
-                                    stmt.bindInt64(dev, at: 2)
-                                    stmt.bindInt64(ino, at: 3)
-                                    defer { stmt.reset() }
-                                    if try stmt.step(),
-                                        let iId = stmt.columnInt64(at: 0),
-                                        let pId = stmt.columnInt64(at: 1),
-                                        let nm = stmt.columnText(at: 2)
-                                    {
-                                        let rId = stmt.columnText(at: 3)
-                                        return (iId, pId, nm, rId)
-                                    }
-                                    return nil
-                                }
-
-                        if let existing = existingDir,
-                            remoteGate.blocks(
-                                directoryContext.getRelPath(for: existing.itemId) ?? "")
-                        {
-                            remoteGate.addAlias(relPath)
-                            continue
-                        }
-                        if let existing = existingDir,
-                            existing.name != name || existing.parentId != parentItemId
-                        {
-                            // The local directory is renamed or moved
-                            seenDirTracker.markSeen(
-                                parentId: existing.parentId, name: existing.name)
-                            do {
-                                if let rId = existing.remoteId {
-                                    let oldPRemote = directoryContext.getRemoteId(
-                                        for: existing.parentId)
-                                    let newPRemote = directoryContext.getRemoteId(for: parentItemId)
-                                    let addP =
-                                        (parentItemId != existing.parentId) ? newPRemote : nil
-                                    let remP =
-                                        (parentItemId != existing.parentId) ? oldPRemote : nil
-                                    _ = try await engine.client.updateMetadata(
-                                        remoteId: rId, newName: name, addParentId: addP,
-                                        removeParentId: remP)
-                                }
-                                try await engine.store.write { conn in
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
-                                        """)
-                                    stmt.bindText(name, at: 1)
-                                    stmt.bindInt64(parentItemId, at: 2)
-                                    stmt.bindDouble(now, at: 3)
-                                    stmt.bindInt64(existing.itemId, at: 4)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                }
-                                seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                                directoryContext.register(
-                                    itemId: existing.itemId, parentItemId: parentItemId, name: name,
-                                    remoteId: existing.remoteId ?? "")
-                            } catch {
-                                engine.logger.error(
-                                    "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)"
-                                )
-                            }
-                        } else if directoryContext.getItemId(byRelPath: relPath) == nil {
-                            // Create a new local directory
-                            let remoteParentId =
-                                directoryContext.getRemoteId(for: parentItemId) ?? remoteRootID
-                            var intent: DurableCreateIntent?
-                            do {
-                                let candidateRemoteID = try await engine.idPool.nextId()
-                                let prepared = try await DurableCreateIntentStore.prepareDirectory(
-                                    store: engine.store,
-                                    rootID: rootID,
-                                    parentItemID: parentItemId,
-                                    name: name,
-                                    targetParentRemoteID: remoteParentId,
-                                    candidateRemoteID: candidateRemoteID,
-                                    device: dev,
-                                    inode: ino
-                                )
-                                intent = prepared
-                                _ = try await engine.client.createDirectory(
-                                    name: name,
-                                    parentId: prepared.targetParentRemoteID,
-                                    remoteId: prepared.targetRemoteID
-                                )
-                                try await engine.store.write { conn in
-                                    let ts = Date().timeIntervalSince1970
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        UPDATE items SET
-                                            remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
-                                        WHERE item_id = ?;
-                                        """)
-                                    stmt.bindDouble(ts, at: 1)
-                                    stmt.bindInt64(prepared.itemID, at: 2)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                    try DurableCreateIntentStore.completeOperation(
-                                        conn: conn, operationID: prepared.operationID, now: ts)
-                                }
-                                directoryContext.register(
-                                    itemId: prepared.itemID,
-                                    parentItemId: parentItemId,
-                                    name: name,
-                                    remoteId: prepared.targetRemoteID
-                                )
-                                seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                                scanProgress.incDirs()
-                            } catch {
-                                if let intent {
-                                    await DurableCreateIntentStore.markUnknownOutcome(
-                                        store: engine.store,
-                                        operationID: intent.operationID,
-                                        error: error
-                                    )
-                                }
-                                engine.logger.error(
-                                    "Failed to create remote directory [\(relPath)]: \(error)")
-                            }
-                        } else {
-                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                        }
+                        try await observeDirectory(record, relPath: relPath, parentRelNormalized: parentRelNormalized, name: name)
                     } else if record.type == .file {
-                        scanProgress.incScanned()
-                        let parentItemId =
-                            directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
-                        let dev = record.dev
-                        let ino = record.ino
-                        let mtime = record.mtime
-                        let fileSize = record.fileSize
-
-                        // The cache only contains committed, clean remote-present baselines.
-                        // Matching the path as well as identity preserves the rename path below,
-                        // while an ordinary unchanged file needs no per-item SQLite round trip.
-                        if let cached = baselineCache.lookupUnchanged(
-                            device: dev, inode: ino, mtime: mtime, size: fileSize),
-                            cached.parentId == parentItemId, cached.name == name
-                        {
-                            seenTracker.markSeen(parentId: parentItemId, name: name)
-                            scanProgress.incSkipped()
-                            continue
-                        }
-
-                        // Check if local files have been renamed or moved (press dev + ino Find)
-                        let existingFile:
-                            (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? =
-                                try await engine.store.read { conn in
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        SELECT item_id, parent_id, name, remote_file_id
-                                        FROM items
-                                        WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
-                                        """)
-                                    stmt.bindInt64(rootID, at: 1)
-                                    stmt.bindInt64(dev, at: 2)
-                                    stmt.bindInt64(ino, at: 3)
-                                    defer { stmt.reset() }
-                                    if try stmt.step(),
-                                        let iId = stmt.columnInt64(at: 0),
-                                        let pId = stmt.columnInt64(at: 1),
-                                        let nm = stmt.columnText(at: 2)
-                                    {
-                                        let rId = stmt.columnText(at: 3)
-                                        return (iId, pId, nm, rId)
-                                    }
-                                    return nil
-                                }
-
-                        if let existing = existingFile {
-                            let parentPath =
-                                directoryContext.getRelPath(for: existing.parentId) ?? ""
-                            let oldPath =
-                                parentPath.isEmpty
-                                ? existing.name : "\(parentPath)/\(existing.name)"
-                            if remoteGate.blocks(oldPath) { continue }
-                        }
-                        if let existing = existingFile,
-                            existing.name != name || existing.parentId != parentItemId
-                        {
-                            // Local files are renamed or moved
-                            seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
-                            do {
-                                if let rId = existing.remoteId {
-                                    let oldPRemote = directoryContext.getRemoteId(
-                                        for: existing.parentId)
-                                    let newPRemote = directoryContext.getRemoteId(for: parentItemId)
-                                    let addP =
-                                        (parentItemId != existing.parentId) ? newPRemote : nil
-                                    let remP =
-                                        (parentItemId != existing.parentId) ? oldPRemote : nil
-                                    _ = try await engine.client.updateMetadata(
-                                        remoteId: rId, newName: name, addParentId: addP,
-                                        removeParentId: remP)
-                                }
-
-                                try await engine.store.write { conn in
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        UPDATE items SET
-                                            name = ?,
-                                            parent_id = ?,
-                                            updated_at = ?
-                                        WHERE item_id = ?;
-                                        """)
-                                    stmt.bindText(name, at: 1)
-                                    stmt.bindInt64(parentItemId, at: 2)
-                                    stmt.bindDouble(now, at: 3)
-                                    stmt.bindInt64(existing.itemId, at: 4)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                }
-                                seenTracker.markSeen(parentId: parentItemId, name: name)
-                            } catch {
-                                engine.logger.error(
-                                    "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)"
-                                )
-                                continue
-                            }
-                            // Path updates do not mean that the text has been verified; retain the old metadata and continue content comparison.
-                            // A pure name change will still hit the cache below, while a text change will reuse the existing summary and decision process.
-                        }
-
-                        seenTracker.markSeen(parentId: parentItemId, name: name)
-
-                        // Quick change comparison (§6.2)
-                        if baselineCache.lookupUnchanged(
-                            device: dev, inode: ino, mtime: mtime, size: fileSize)
-                            != nil
-                        {
-                            scanProgress.incSkipped()
-                            continue
-                        }
-
-                        pendingObservations.append(
-                            IncrementalLocalObservation(
-                                parentID: parentItemId, name: name,
-                                url: URL(fileURLWithPath: fullPath),
-                                device: dev, inode: ino, mtime: mtime, size: fileSize))
-                        // First ready file goes immediately; subsequent work uses bounded natural chunks.
-                        if !firstObservationSent || pendingObservations.count >= 64 {
-                            try await commitObservations(pendingObservations)
-                            pendingObservations.removeAll(keepingCapacity: true)
-                            firstObservationSent = true
-                        }
+                        try await observeFile(record, fullPath: fullPath, parentRelNormalized: parentRelNormalized, name: name,
+                                              pendingObservations: &pendingObservations, firstObservationSent: &firstObservationSent)
                     }
                 }
                 try await commitObservations(pendingObservations)

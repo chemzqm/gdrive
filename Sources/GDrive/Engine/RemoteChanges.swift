@@ -12,26 +12,26 @@ struct RemoteChanges: Sendable {
 
     private enum Value { case text(String?), int(Int64?) }
     private static func statement(_ conn: SQLiteConnection, _ sql: String, _ values: [Value]) throws -> SQLiteStatement {
-        let q = try conn.cachedStatement(sql)
+        let queryStatement = try conn.cachedStatement(sql)
         for (index, value) in values.enumerated() {
             switch value {
-            case .text(let text): q.bindText(text, at: Int32(index + 1))
-            case .int(let int): q.bindInt64(int, at: Int32(index + 1))
+            case .text(let text): queryStatement.bindText(text, at: Int32(index + 1))
+            case .int(let int): queryStatement.bindInt64(int, at: Int32(index + 1))
             }
         }
-        return q
+        return queryStatement
     }
     private static func execute(_ conn: SQLiteConnection, _ sql: String, _ values: [Value]) throws {
-        let q = try statement(conn, sql, values)
-        defer { q.reset() }
-        _ = try q.step()
+        let queryStatement = try statement(conn, sql, values)
+        defer { queryStatement.reset() }
+        _ = try queryStatement.step()
     }
 
     static func saveInitialCursor(store: StateStore, client: DriveClient, rootID: Int64, requireExisting: Bool = false, initialToken: String? = nil) async throws {
         let exists = try await store.read { conn in
-            let q = try statement(conn, "SELECT 1 FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes';", [.int(rootID)])
-            defer { q.reset() }
-            return try q.step()
+            let queryStatement = try statement(conn, "SELECT 1 FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes';", [.int(rootID)])
+            defer { queryStatement.reset() }
+            return try queryStatement.step()
         }
         // A bootstrap retry must never replace an earlier recovery boundary.
         guard !exists else { return }
@@ -49,7 +49,7 @@ struct RemoteChanges: Sendable {
     }
 
     private func enqueue(_ conn: SQLiteConnection, change: DriveChange, scanID: String? = nil) throws {
-        let payload = String(decoding: try JSONEncoder().encode(change), as: UTF8.self)
+        let payload = (String(bytes: try JSONEncoder().encode(change), encoding: .utf8) ?? "Invalid UTF-8 data")
         try Self.execute(conn, """
             INSERT INTO remote_change_inbox(root_id, remote_id, payload, scan_id) VALUES (?, ?, ?, ?)
             ON CONFLICT(root_id, remote_id) DO UPDATE SET payload = excluded.payload,
@@ -97,21 +97,20 @@ struct RemoteChanges: Sendable {
 
     func consume() async throws {
         let saved: String? = try await store.read { conn in
-            let q = try Self.statement(conn, "SELECT token_value FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes' AND is_valid = 1;", [.int(rootID)])
-            defer { q.reset() }
-            return try q.step() ? q.columnText(at: 0) : nil
+            let queryStatement = try Self.statement(conn, "SELECT token_value FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes' AND is_valid = 1;", [.int(rootID)])
+            defer { queryStatement.reset() }
+            return try queryStatement.step() ? queryStatement.columnText(at: 0) : nil
         }
         var token: String
         if let saved { token = saved } else { token = try await startRebuild() }
         var rebuilt = saved == nil
         while true {
             let page: DriveChangesPage
-            do { page = try await client.listChanges(pageToken: token) }
-            catch let error as DriveError {
+            do { page = try await client.listChanges(pageToken: token) } catch let error as DriveError {
                 // Drive documents non-expiring tokens. Handle explicit token rejection,
                 // rather than treating permission/network errors as an expired cursor.
                 if case .serverError(let code, let message) = error,
-                   (code == 410 || (code == 400 && message.lowercased().contains("pagetoken"))), !rebuilt {
+                   code == 410 || (code == 400 && message.lowercased().contains("pagetoken")), !rebuilt {
                     token = try await startRebuild()
                     rebuilt = true
                     continue
@@ -156,7 +155,7 @@ struct RemoteChanges: Sendable {
         // After complete enumeration, only unobserved known IDs need metadata probes.
         // This avoids a files.get per item during a full index rebuild.
         let ids: [String] = try await store.read { conn in
-            let q = try Self.statement(conn, """
+            let queryStatement = try Self.statement(conn, """
                 WITH RECURSIVE excluded(item_id) AS (
                     SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                     UNION ALL SELECT i.item_id FROM items i JOIN excluded e ON i.parent_id = e.item_id
@@ -168,8 +167,8 @@ struct RemoteChanges: Sendable {
                     LIMIT 64;
                 """, Array(repeating: .int(rootID), count: 4))
             var ids: [String] = []
-            while try q.step() { if let id = q.columnText(at: 0) { ids.append(id) } }
-            q.reset()
+            while try queryStatement.step() { if let id = queryStatement.columnText(at: 0) { ids.append(id) } }
+            queryStatement.reset()
             return ids
         }
         guard !ids.isEmpty else { return }
@@ -195,28 +194,28 @@ struct RemoteChanges: Sendable {
         var unavailable: Set<String> = []
         while true {
             let entries: [Entry] = try await store.read { conn in
-                let q = try Self.statement(conn, """
+                let queryStatement = try Self.statement(conn, """
                     SELECT payload, scan_id FROM remote_change_inbox WHERE root_id = ? AND attempted_at < ?
                     ORDER BY attempted_at, remote_id LIMIT 1000;
                     """, [.int(rootID), .text(String(started))])
-                defer { q.reset() }
+                defer { queryStatement.reset() }
                 var rows: [Entry] = []
-                while try q.step() {
-                    guard let json = q.columnText(at: 0) else { continue }
-                    rows.append(Entry(change: try JSONDecoder().decode(DriveChange.self, from: Data(json.utf8)), scanID: q.columnText(at: 1)))
+                while try queryStatement.step() {
+                    guard let json = queryStatement.columnText(at: 0) else { continue }
+                    rows.append(Entry(change: try JSONDecoder().decode(DriveChange.self, from: Data(json.utf8)), scanID: queryStatement.columnText(at: 1)))
                 }
                 return rows
             }
             guard !entries.isEmpty else { break }
             let known: Set<String> = try await store.read { conn in
-                let q = try Self.statement(conn, """
+                let queryStatement = try Self.statement(conn, """
                     SELECT remote_file_id FROM items WHERE root_id = ? AND entry_kind = 'directory'
                         AND remote_status = 'present' AND is_tombstone = 0
                         AND remote_scope_excluded = 0;
                     """, [.int(rootID)])
-                defer { q.reset() }
+                defer { queryStatement.reset() }
                 var result: Set<String> = [remoteRootID]
-                while try q.step() { if let id = q.columnText(at: 0) { result.insert(id) } }
+                while try queryStatement.step() { if let id = queryStatement.columnText(at: 0) { result.insert(id) } }
                 return result
             }
             let byID = Dictionary(entries.map { ($0.change.fileId, $0) }, uniquingKeysWith: { _, latest in latest })
@@ -226,9 +225,13 @@ struct RemoteChanges: Sendable {
             func resolve(_ id: String) async throws -> Scope {
                 if id == remoteRootID { return .inside }
                 try Task.checkCancellation()
-                if let value = visited[id] { return value }
-                if unavailable.contains(id) { return .unknown }
-                guard !visiting.contains(id), visiting.count < 128 else { return .unknown }
+                func cachedScope() -> Scope? {
+                    if let value = visited[id] { return value }
+                    if unavailable.contains(id) { return .unknown }
+                    guard !visiting.contains(id), visiting.count < 128 else { return .unknown }
+                    return nil
+                }
+                if let scope = cachedScope() { return scope }
                 visiting.insert(id)
                 defer { visiting.remove(id) }
                 let queued = byID[id]
@@ -239,17 +242,20 @@ struct RemoteChanges: Sendable {
                     visited[id] = .outside
                     return .outside
                 }
-                if file == nil {
-                    guard budget > 0 else { return .unknown }
-                    budget -= 1
-                    do { file = try await client.getFile(remoteId: id) }
-                    catch {
-                        try Task.checkCancellation()
-                        unavailable.insert(id)
-                        return .unknown // retained inbox, never inferred absent
+                func fetchMissingFile() async throws -> Scope? {
+                    if file == nil {
+                        guard budget > 0 else { return .unknown }
+                        budget -= 1
+                        do { file = try await client.getFile(remoteId: id) } catch {
+                            try Task.checkCancellation()
+                            unavailable.insert(id)
+                            return .unknown // retained inbox, never inferred absent
+                        }
+                        fetched[id] = file
                     }
-                    fetched[id] = file
+                    return nil
                 }
+                if let scope = try await fetchMissingFile() { return scope }
                 guard let file else { return .unknown }
                 let scope: Scope
                 if let parent = file.parents?.first {
@@ -269,26 +275,30 @@ struct RemoteChanges: Sendable {
                 resolved.append(Resolved(entry: entry, scope: .unknown))
             }
             let batch = resolved
-            try await store.write { conn in
-                for result in batch {
-                    // The observation is retained even if a local rename or SQL constraint fails.
-                    try enqueue(conn, change: result.entry.change, scanID: result.entry.scanID)
-                    try Self.execute(conn, "UPDATE remote_change_inbox SET attempted_at = ? WHERE root_id = ? AND remote_id = ?;",
-                        [.text(String(started)), .int(rootID), .text(result.entry.change.fileId)])
-                    try conn.execute("SAVEPOINT remote_apply;")
-                    do {
-                        if try apply(conn, result) {
-                            try Self.execute(conn, "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;",
-                                [.int(rootID), .text(result.entry.change.fileId)])
-                        }
-                        try conn.execute("RELEASE remote_apply;")
-                    } catch {
-                        try conn.execute("ROLLBACK TO remote_apply;")
-                        try conn.execute("RELEASE remote_apply;")
+            try await applyResolvedBatch(batch, started: started)
+            if entries.count < 1000 { break }
+        }
+    }
+
+    private func applyResolvedBatch(_ batch: [Resolved], started: Double) async throws {
+        try await store.write { conn in
+            for result in batch {
+                // The observation is retained even if a local rename or SQL constraint fails.
+                try enqueue(conn, change: result.entry.change, scanID: result.entry.scanID)
+                try Self.execute(conn, "UPDATE remote_change_inbox SET attempted_at = ? WHERE root_id = ? AND remote_id = ?;",
+                    [.text(String(started)), .int(rootID), .text(result.entry.change.fileId)])
+                try conn.execute("SAVEPOINT remote_apply;")
+                do {
+                    if try apply(conn, result) {
+                        try Self.execute(conn, "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;",
+                            [.int(rootID), .text(result.entry.change.fileId)])
                     }
+                    try conn.execute("RELEASE remote_apply;")
+                } catch {
+                    try conn.execute("ROLLBACK TO remote_apply;")
+                    try conn.execute("RELEASE remote_apply;")
                 }
             }
-            if entries.count < 1000 { break }
         }
     }
 
@@ -302,17 +312,17 @@ struct RemoteChanges: Sendable {
         let version: Int64?
     }
     private func item(_ conn: SQLiteConnection, remoteID: String) throws -> Item? {
-        let q = try Self.statement(conn, """
+        let queryStatement = try Self.statement(conn, """
             SELECT item_id, parent_id, name, entry_kind, local_device, local_inode, remote_version
             FROM items WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
             """, [.int(rootID), .text(remoteID)])
-        defer { q.reset() }
-        guard try q.step(), let id = q.columnInt64(at: 0), let name = q.columnText(at: 2) else { return nil }
-        return Item(id: id, parentID: q.columnInt64(at: 1), name: name, isDirectory: q.columnText(at: 3) == "directory",
-                    device: q.columnInt64(at: 4), inode: q.columnInt64(at: 5), version: q.columnInt64(at: 6))
+        defer { queryStatement.reset() }
+        guard try queryStatement.step(), let id = queryStatement.columnInt64(at: 0), let name = queryStatement.columnText(at: 2) else { return nil }
+        return Item(id: id, parentID: queryStatement.columnInt64(at: 1), name: name, isDirectory: queryStatement.columnText(at: 3) == "directory",
+                    device: queryStatement.columnInt64(at: 4), inode: queryStatement.columnInt64(at: 5), version: queryStatement.columnInt64(at: 6))
     }
     private func path(_ conn: SQLiteConnection, itemID: Int64) throws -> String {
-        let q = try Self.statement(conn, """
+        let queryStatement = try Self.statement(conn, """
             WITH RECURSIVE ancestry(item_id, parent_id, path) AS (
                 SELECT item_id, parent_id, CASE WHEN parent_id IS NULL THEN '' ELSE name END FROM items WHERE item_id = ?
                 UNION ALL SELECT i.item_id, i.parent_id,
@@ -320,8 +330,8 @@ struct RemoteChanges: Sendable {
                 FROM items i JOIN ancestry a ON i.item_id = a.parent_id
             ) SELECT path FROM ancestry WHERE parent_id IS NULL;
             """, [.int(itemID)])
-        defer { q.reset() }
-        guard try q.step(), let path = q.columnText(at: 0) else { throw SyncEngineError.general("Unable to resolve local path for remote observation") }
+        defer { queryStatement.reset() }
+        guard try queryStatement.step(), let path = queryStatement.columnText(at: 0) else { throw SyncEngineError.general("Unable to resolve local path for remote observation") }
         return path
     }
     private func exclude(_ conn: SQLiteConnection, itemID: Int64) throws {
@@ -337,21 +347,25 @@ struct RemoteChanges: Sendable {
     private func apply(_ conn: SQLiteConnection, _ result: Resolved) throws -> Bool {
         let change = result.entry.change
         let existing = try item(conn, remoteID: change.fileId) // identity BEFORE parent classification
-        if change.removed == true {
-            if let existing { try exclude(conn, itemID: existing.id) }
-            return true
+        func applyRemovalOrExclusion() throws -> Bool? {
+            if change.removed == true {
+                if let existing { try exclude(conn, itemID: existing.id) }
+                return true
+            }
+            if change.file?.trashed == true {
+                try Self.execute(conn, """
+                    UPDATE items SET remote_status = 'trashed', phase = 'ready', dirty_generation = dirty_generation + 1
+                    WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
+                    """, [.int(rootID), .text(change.fileId)])
+                return true
+            }
+            guard result.scope == .inside else {
+                if let existing { try exclude(conn, itemID: existing.id) }
+                return result.scope == .outside
+            }
+            return nil
         }
-        if change.file?.trashed == true {
-            try Self.execute(conn, """
-                UPDATE items SET remote_status = 'trashed', phase = 'ready', dirty_generation = dirty_generation + 1
-                WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
-                """, [.int(rootID), .text(change.fileId)])
-            return true
-        }
-        guard result.scope == .inside else {
-            if let existing { try exclude(conn, itemID: existing.id) }
-            return result.scope == .outside
-        }
+        if let applied = try applyRemovalOrExclusion() { return applied }
         guard let file = change.file, let parentRemote = file.parents?.first,
               let parent = try item(conn, remoteID: parentRemote), parent.isDirectory,
               !file.name.isEmpty, file.name != ".", file.name != "..", !file.name.contains("/"), !file.name.contains("\0") else { return false }
@@ -359,37 +373,44 @@ struct RemoteChanges: Sendable {
         let parentPath = try path(conn, itemID: parent.id)
         let destination = rootURL.appendingPathComponent(parentPath).appendingPathComponent(file.name)
         try RemoteNameMapping.validateDestination(destination, root: rootURL)
-        let collision = try Self.statement(conn, """
-            SELECT item_id, remote_file_id, name FROM items INDEXED BY idx_items_local_name_key WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?) AND is_tombstone = 0;
-            """, [.int(rootID), .int(parent.id), .text(file.name)])
-        var localOnlyID: Int64?
-        while try collision.step() {
-            if collision.columnText(at: 1) == nil, collision.columnText(at: 2) != file.name { collision.reset(); return false }
-            if let remote = collision.columnText(at: 1), remote != file.id { collision.reset(); return false }
-            localOnlyID = collision.columnInt64(at: 0)
+        func findLocalCollision() throws -> (Bool, Int64?) {
+            let collision = try Self.statement(conn, """
+                SELECT item_id, remote_file_id, name FROM items INDEXED BY idx_items_local_name_key WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?) AND is_tombstone = 0;
+                """, [.int(rootID), .int(parent.id), .text(file.name)])
+            var localOnlyID: Int64?
+            while try collision.step() {
+                if collision.columnText(at: 1) == nil, collision.columnText(at: 2) != file.name { collision.reset(); return (false, nil) }
+                if let remote = collision.columnText(at: 1), remote != file.id { collision.reset(); return (false, nil) }
+                localOnlyID = collision.columnInt64(at: 0)
+            }
+            collision.reset()
+            return (true, localOnlyID)
         }
-        collision.reset()
+        let (collisionAccepted, localOnlyID) = try findLocalCollision()
+        guard collisionAccepted else { return false }
         if let existing, let version = existing.version, let incoming = file.versionNumber, incoming < version { return true }
         let moved = existing.map { $0.parentID != parent.id || $0.name != file.name } ?? false
-        if let existing, moved {
-            let source = rootURL.appendingPathComponent(try path(conn, itemID: existing.id))
-            if FileManager.default.fileExists(atPath: source.path) {
-                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try FileManager.default.moveItem(at: source, to: destination)
-            } else if FileManager.default.fileExists(atPath: destination.path) {
-                // A previous process may have moved it before its receipt committed.
-                let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
-                guard (attrs[.systemNumber] as? NSNumber)?.int64Value == existing.device,
-                      (attrs[.systemFileNumber] as? NSNumber)?.int64Value == existing.inode else { return false }
+        func moveExistingItem() throws -> Bool {
+            if let existing, moved {
+                let source = rootURL.appendingPathComponent(try path(conn, itemID: existing.id))
+                if FileManager.default.fileExists(atPath: source.path) {
+                    try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try FileManager.default.moveItem(at: source, to: destination)
+                } else if FileManager.default.fileExists(atPath: destination.path) {
+                    // A previous process may have moved it before its receipt committed.
+                    let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
+                    guard (attrs[.systemNumber] as? NSNumber)?.int64Value == existing.device,
+                          (attrs[.systemFileNumber] as? NSNumber)?.int64Value == existing.inode else { return false }
+                }
             }
+            return true
         }
+        guard try moveExistingItem() else { return false }
         if file.isDirectory, existing == nil {
             try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
         }
         let id: Int64
-        if let existing { id = existing.id }
-        else if let localOnlyID { id = localOnlyID }
-        else {
+        if let existing { id = existing.id } else if let localOnlyID { id = localOnlyID } else {
             try Self.execute(conn, """
                 INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id, local_status, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, strftime('%s','now'), strftime('%s','now'));
@@ -404,18 +425,22 @@ struct RemoteChanges: Sendable {
                 phase = 'ready', updated_at = strftime('%s','now') WHERE item_id = ?;
             """, [.int(parent.id), .text(file.name), .text(file.id), .text(file.name), .text(parentRemote),
                     .text(file.sha256Checksum), .int(file.sizeBytes), .int(file.versionNumber), .int(id)])
-        if file.isDirectory {
-            var isDirectory: ObjCBool = false
-            if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
-                guard isDirectory.boolValue else { return false }
-                let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
-                try Self.execute(conn, "UPDATE items SET local_device = ?, local_inode = ?, local_status = 'present' WHERE item_id = ?;",
-                    [.int((attrs[.systemNumber] as? NSNumber)?.int64Value),
-                     .int((attrs[.systemFileNumber] as? NSNumber)?.int64Value), .int(id)])
-            } else {
-                try Self.execute(conn, "UPDATE items SET local_status = 'absent' WHERE item_id = ?;", [.int(id)])
+        func recordLocalDirectory() throws -> Bool {
+            if file.isDirectory {
+                var isDirectory: ObjCBool = false
+                if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
+                    guard isDirectory.boolValue else { return false }
+                    let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
+                    try Self.execute(conn, "UPDATE items SET local_device = ?, local_inode = ?, local_status = 'present' WHERE item_id = ?;",
+                        [.int((attrs[.systemNumber] as? NSNumber)?.int64Value),
+                         .int((attrs[.systemFileNumber] as? NSNumber)?.int64Value), .int(id)])
+                } else {
+                    try Self.execute(conn, "UPDATE items SET local_status = 'absent' WHERE item_id = ?;", [.int(id)])
+                }
             }
+            return true
         }
+        guard try recordLocalDirectory() else { return false }
         let wasExcluded = try Self.statement(conn, "SELECT 1 FROM items WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 1;", [.int(rootID), .int(id)])
         let returning = try wasExcluded.step()
         wasExcluded.reset()
@@ -470,7 +495,7 @@ struct RemoteChanges: Sendable {
     /// Explicitly expose blocked name mappings without changing the durable inbox payload.
     func nameConflictCount() async throws -> Int {
         try await store.read { conn in
-            let q = try Self.statement(conn, """
+            let queryStatement = try Self.statement(conn, """
                 SELECT COUNT(DISTINCT c.remote_id) FROM remote_change_inbox c
                 CROSS JOIN items p ON p.root_id = c.root_id
                     AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]') AND p.is_tombstone = 0
@@ -479,15 +504,15 @@ struct RemoteChanges: Sendable {
                 WHERE c.root_id = ? AND (i.remote_file_id != c.remote_id
                     OR (i.remote_file_id IS NULL AND i.name != json_extract(c.payload, '$.file.name')));
                 """, [.int(rootID)])
-            defer { q.reset() }
-            _ = try q.step()
-            return Int(q.columnInt64(at: 0) ?? 0)
+            defer { queryStatement.reset() }
+            _ = try queryStatement.step()
+            return Int(queryStatement.columnInt64(at: 0) ?? 0)
         }
     }
 
     func gate() async throws -> Gate {
         try await store.read { conn in
-            let q = try Self.statement(conn, """
+            let queryStatement = try Self.statement(conn, """
                 SELECT item_id FROM items WHERE root_id = ? AND phase = 'waitingEvidence' AND remote_status = 'unknown' AND is_tombstone = 0
                 UNION SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                 UNION SELECT i.item_id FROM remote_change_inbox c JOIN items i
@@ -501,8 +526,8 @@ struct RemoteChanges: Sendable {
                     ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending';
                 """, Array(repeating: .int(rootID), count: 5))
             var ids: Set<Int64> = []
-            while try q.step() { if let id = q.columnInt64(at: 0) { ids.insert(id) } }
-            q.reset()
+            while try queryStatement.step() { if let id = queryStatement.columnInt64(at: 0) { ids.insert(id) } }
+            queryStatement.reset()
             var paths: Set<String> = []
             var identities: Set<LocalBaselineCache.Key> = []
             for id in ids {
@@ -522,14 +547,14 @@ struct RemoteChanges: Sendable {
     func enumeratePending(limit: Int) async throws -> Bool {
         struct Job: Sendable { let id: String; let scanID: String; let token: String? }
         let jobs: [Job] = try await store.read { conn in
-            let q = try Self.statement(conn, """
+            let queryStatement = try Self.statement(conn, """
                 SELECT remote_id, scan_id, page_token FROM remote_directory_scans
                 WHERE root_id = ? AND state = 'pending' LIMIT ?;
                 """, [.int(rootID), .int(Int64(max(1, min(64, limit))))])
-            defer { q.reset() }
+            defer { queryStatement.reset() }
             var rows: [Job] = []
-            while try q.step() {
-                if let id = q.columnText(at: 0), let scan = q.columnText(at: 1) { rows.append(Job(id: id, scanID: scan, token: q.columnText(at: 2))) }
+            while try queryStatement.step() {
+                if let id = queryStatement.columnText(at: 0), let scan = queryStatement.columnText(at: 1) { rows.append(Job(id: id, scanID: scan, token: queryStatement.columnText(at: 2))) }
             }
             return rows
         }
@@ -577,7 +602,7 @@ struct RemoteChanges: Sendable {
 
     func pendingCount() async throws -> Int {
         try await store.read { conn in
-            let q = try Self.statement(conn, """
+            let queryStatement = try Self.statement(conn, """
                 WITH RECURSIVE excluded(item_id) AS (
                     SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                     UNION ALL SELECT i.item_id FROM items i JOIN excluded e ON i.parent_id = e.item_id
@@ -586,9 +611,9 @@ struct RemoteChanges: Sendable {
                      + (SELECT count(*) FROM items WHERE root_id = ? AND remote_status = 'unknown' AND phase = 'waitingEvidence'
                           AND item_id NOT IN excluded);
                 """, Array(repeating: .int(rootID), count: 4))
-            defer { q.reset() }
-            _ = try q.step()
-            return Int(q.columnInt64(at: 0) ?? 0)
+            defer { queryStatement.reset() }
+            _ = try queryStatement.step()
+            return Int(queryStatement.columnInt64(at: 0) ?? 0)
         }
     }
 }

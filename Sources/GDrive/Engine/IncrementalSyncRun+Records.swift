@@ -80,8 +80,7 @@ extension IncrementalSyncRun {
                 let pendingCreate: DurableCreateIntent?
                 if let operationID = stmt.columnText(at: 13),
                     let targetRemoteID = stmt.columnText(at: 14),
-                    let targetParentRemoteID = stmt.columnText(at: 15)
-                {
+                    let targetParentRemoteID = stmt.columnText(at: 15) {
                     pendingCreate = DurableCreateIntent(
                         operationID: operationID,
                         itemID: iId,
@@ -141,12 +140,10 @@ extension IncrementalSyncRun {
             while try stmt.step() {
                 if let iId = stmt.columnInt64(at: 0),
                     let pId = stmt.columnInt64(at: 1),
-                    let name = stmt.columnText(at: 2)
-                {
+                    let name = stmt.columnText(at: 2) {
                     let parent = directoryContext.getRelPath(for: pId) ?? ""
                     let path = parent.isEmpty ? name : "\(parent)/\(name)"
-                    if !remoteGate.blocks(path) && !seenTracker.contains(parentId: pId, name: name)
-                    {
+                    if !remoteGate.blocks(path) && !seenTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }
                 }
@@ -164,13 +161,11 @@ extension IncrementalSyncRun {
             while try dirStmt.step() {
                 if let iId = dirStmt.columnInt64(at: 0),
                     let pId = dirStmt.columnInt64(at: 1),
-                    let name = dirStmt.columnText(at: 2)
-                {
+                    let name = dirStmt.columnText(at: 2) {
                     let parent = directoryContext.getRelPath(for: pId) ?? ""
                     let path = parent.isEmpty ? name : "\(parent)/\(name)"
                     if !remoteGate.blocks(path)
-                        && !seenDirTracker.contains(parentId: pId, name: name)
-                    {
+                        && !seenDirTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }
                 }
@@ -178,7 +173,7 @@ extension IncrementalSyncRun {
             dirStmt.reset()
 
             for dId in deletedIds {
-                let u = try conn.cachedStatement(
+                let update = try conn.cachedStatement(
                     """
                     UPDATE items SET
                         local_status = 'absent',
@@ -188,10 +183,10 @@ extension IncrementalSyncRun {
                         updated_at = ?
                     WHERE item_id = ?;
                     """)
-                u.bindDouble(now, at: 1)
-                u.bindInt64(dId, at: 2)
-                _ = try u.step()
-                u.reset()
+                update.bindDouble(now, at: 1)
+                update.bindInt64(dId, at: 2)
+                _ = try update.step()
+                update.reset()
             }
         }
 

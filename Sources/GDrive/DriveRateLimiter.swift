@@ -103,8 +103,8 @@ public actor DriveRateLimiter {
 
     /// Is currently in global cooldown
     public var isCoolingDown: Bool {
-        if let cd = cooldownUntil {
-            return cd > Date()
+        if let cooldown = cooldownUntil {
+            return cooldown > Date()
         }
         return false
     }

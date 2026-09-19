@@ -212,14 +212,26 @@ func buildDirectoryTopology(rootPath: String) -> [String] {
 
     // Arrange in ascending order by path slash level, ensuring that parent directories are always created before subdirectories.
     return dirs.sorted {
-        let c1 = $0.filter { $0 == "/" }.count
-        let c2 = $1.filter { $0 == "/" }.count
-        return c1 == c2 ? $0 < $1 : c1 < c2
+        let firstDepth = $0.filter { $0 == "/" }.count
+        let secondDepth = $1.filter { $0 == "/" }.count
+        return firstDepth == secondDepth ? $0 < $1 : firstDepth < secondDepth
     }
 }
 
 @main
 struct GDriveBenchMain {
+    private struct BenchmarkConfiguration {
+        let name: String
+        let capacity: Int
+        let timeoutMs: Int
+    }
+
+    private struct DirectoryTopology: Sendable {
+        let rootId: Int64
+        let rootItemId: Int64
+        let directoryIds: [String: Int64]
+    }
+
     static func main() async {
         signal(SIGPIPE, SIG_IGN)
 
@@ -261,14 +273,14 @@ struct GDriveBenchMain {
         setbuf(stdout, nil)
 
         // 3. Test configuration matrix
-        let configs: [(name: String, capacity: Int, timeoutMs: Int)] = [
-            ("Mode 1: 32 operations (5 ms timeout)", 32, 5),
-            ("Mode 2: 64 operations (5 ms timeout)", 64, 5),
-            ("Mode 3: 128 operations (5 ms timeout)", 128, 5),
-            ("Mode 4: 256 operations (5 ms timeout)", 256, 5),
-            ("Mode 5: 5 ms timeout only (capacity 10000)", 10000, 5),
-            ("Mode 6: 10 ms timeout only (capacity 10000)", 10000, 10),
-            ("Mode 7: 64 operations only (no practical timeout)", 64, 10000),
+        let configs: [BenchmarkConfiguration] = [
+            BenchmarkConfiguration(name: "Mode 1: 32 operations (5 ms timeout)", capacity: 32, timeoutMs: 5),
+            BenchmarkConfiguration(name: "Mode 2: 64 operations (5 ms timeout)", capacity: 64, timeoutMs: 5),
+            BenchmarkConfiguration(name: "Mode 3: 128 operations (5 ms timeout)", capacity: 128, timeoutMs: 5),
+            BenchmarkConfiguration(name: "Mode 4: 256 operations (5 ms timeout)", capacity: 256, timeoutMs: 5),
+            BenchmarkConfiguration(name: "Mode 5: 5 ms timeout only (capacity 10000)", capacity: 10000, timeoutMs: 5),
+            BenchmarkConfiguration(name: "Mode 6: 10 ms timeout only (capacity 10000)", capacity: 10000, timeoutMs: 10),
+            BenchmarkConfiguration(name: "Mode 7: 64 operations only (no practical timeout)", capacity: 64, timeoutMs: 10000)
         ]
 
         var results: [BenchResult] = []
@@ -320,18 +332,18 @@ struct GDriveBenchMain {
         print("==========================================================================================================")
         print("| Configuration plan | Total time spent (s) | Throughput (File/s) | Total number of transaction commits | Full batch trigger (times) | Timeout trigger (times) | Average number of items per batch | WAL size |")
         print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
-        for r in results {
+        for benchmarkResult in results {
             let numPart = String(
                 format: "%8.3f | %13.1f | %12d | %13d | %13d | %12.1f | %7lld KB |",
-                r.elapsedSeconds,
-                r.throughputFilesPerSec,
-                r.totalCommits,
-                r.capacityCommits,
-                r.timeoutCommits,
-                r.averageBatchSize,
-                r.walSizeBytes / 1024
+                benchmarkResult.elapsedSeconds,
+                benchmarkResult.throughputFilesPerSec,
+                benchmarkResult.totalCommits,
+                benchmarkResult.capacityCommits,
+                benchmarkResult.timeoutCommits,
+                benchmarkResult.averageBatchSize,
+                benchmarkResult.walSizeBytes / 1024
             )
-            print("| \(r.name) | \(numPart)")
+            print("| \(benchmarkResult.name) | \(numPart)")
         }
         print("==========================================================================================================")
     }
@@ -359,9 +371,9 @@ struct GDriveBenchMain {
         let now = Date().timeIntervalSince1970
 
         // 1. Create Root with underlying directory tree topology
-        let (staticRootId, staticRootItemId, staticDirIdMap): (Int64, Int64, [String: Int64])
+        let topology: DirectoryTopology
         do {
-            (staticRootId, staticRootItemId, staticDirIdMap) = try await store.write { conn in
+            topology = try await store.write { conn in
                 var localDirIdMap: [String: Int64] = [:]
                 let rootStmt = try conn.cachedStatement("""
                 INSERT INTO roots (
@@ -412,11 +424,15 @@ struct GDriveBenchMain {
                     dirInsertStmt.reset()
                 }
 
-                return (localRootId, localRootItemId, localDirIdMap)
+                return DirectoryTopology(rootId: localRootId, rootItemId: localRootItemId, directoryIds: localDirIdMap)
             }
         } catch {
             fatalError("Failed to initialize directory topology: \(error)")
         }
+
+        let staticRootId = topology.rootId
+        let staticRootItemId = topology.rootItemId
+        let staticDirIdMap = topology.directoryIds
 
         // 2. Preparing parallel hashing and writing pipelines
         let cpuCount = ProcessInfo.processInfo.activeProcessorCount
@@ -436,7 +452,7 @@ struct GDriveBenchMain {
         for idx in 0..<hashWorkers {
             let counter = counters[idx]
             computeGroup.enter()
-            let thread = Thread {
+            @Sendable func hashFiles() {
                 var readBuf = [UInt8](repeating: 0, count: 64 * 1024)
                 var ctx = CC_SHA256_CTX()
                 var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
@@ -444,23 +460,23 @@ struct GDriveBenchMain {
                 while let batch = computeQueue.pop() {
                     batch.withRawData { rawBuf in
                         guard let basePtr = rawBuf.baseAddress else { return }
-                        for i in 0..<batch.count {
-                            let record = batch.records[i]
+                        for fileIndex in 0..<batch.count {
+                            let record = batch.records[fileIndex]
                             let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
                             let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
 
-                            let fd = open(cPath, O_RDONLY)
-                            if fd < 0 { continue }
+                            let fileDescriptor = open(cPath, O_RDONLY)
+                            if fileDescriptor < 0 { continue }
 
                             CC_SHA256_Init(&ctx)
                             var fileSize: Int64 = 0
                             while true {
-                                let n = read(fd, &readBuf, readBuf.count)
-                                if n <= 0 { break }
-                                CC_SHA256_Update(&ctx, &readBuf, CC_LONG(n))
-                                fileSize += Int64(n)
+                                let bytesRead = read(fileDescriptor, &readBuf, readBuf.count)
+                                if bytesRead <= 0 { break }
+                                CC_SHA256_Update(&ctx, &readBuf, CC_LONG(bytesRead))
+                                fileSize += Int64(bytesRead)
                             }
-                            close(fd)
+                            close(fileDescriptor)
                             CC_SHA256_Final(&digest, &ctx)
 
                             let hexDigits = digest.map { String(format: "%02x", $0) }.joined()
@@ -504,6 +520,7 @@ struct GDriveBenchMain {
                 }
                 computeGroup.leave()
             }
+            let thread = Thread(block: hashFiles)
             thread.qualityOfService = .userInitiated
             thread.start()
         }
