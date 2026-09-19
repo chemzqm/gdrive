@@ -378,7 +378,8 @@ struct FailureStateSafetyTests {
         // 2. Allow update to succeed on retry
         control.shouldFail = false
         let stats = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
-        #expect(stats.filesUploaded == (contentChanged ? 1 : 0))
+        #expect(stats.filesUploaded == 0) // A11 blocks unconditioned remote overwrites.
+        #expect(stats.filesFailed == (contentChanged ? 1 : 0))
         #expect(stats.filesSkipped == (contentChanged ? 0 : 1))
 
         try await store.read { conn in
@@ -386,14 +387,15 @@ struct FailureStateSafetyTests {
             stmt.bindInt64(fileAItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnText(at: 0) == "file_B.txt", "File name in DB must be updated to file_B.txt after successful retry")
-            #expect(stmt.columnText(at: 1) == expectedSHA)
+            #expect(stmt.columnText(at: 1) == originalSHA)
             #expect(stmt.columnText(at: 2) == expectedSHA)
-            #expect(stmt.columnInt64(at: 3) == 0)
+            #expect((stmt.columnInt64(at: 3) ?? 0) == (contentChanged ? 1 : 0))
         }
         let second = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
         #expect(second.filesUploaded == 0)
-        #expect(second.filesSkipped == 1)
-        #expect(uploads.filePatchCount == (contentChanged ? 1 : 0))
+        #expect(second.filesSkipped == (contentChanged ? 0 : 1))
+        #expect(second.filesFailed == (contentChanged ? 1 : 0))
+        #expect(uploads.filePatchCount == 0)
         #expect(renames.filePatchCount == (failRename ? 2 : 1))
     }
 

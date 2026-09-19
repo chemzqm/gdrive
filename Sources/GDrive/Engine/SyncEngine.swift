@@ -3,6 +3,7 @@ import Foundation
 import CommonCrypto
 import Logging
 import DirectoryScanner
+import os
 
 /// 同步进度统计指标
 public struct SyncStats: Sendable {
@@ -596,38 +597,17 @@ public final class SyncEngine: Sendable {
 
                                 let fileURL = URL(fileURLWithPath: fullPath)
                                 let limit8MB: Int64 = 8 * 1024 * 1024
-                                let metaSize = Int64(record.metadata?.fileSize ?? 0)
 
-                                let sha256Hex: String
-                                let fileSize: Int64
-                                let smallContent: Data?
-
-                                if metaSize <= limit8MB {
-                                    // 小文件 (≤ 8MB)：单次磁盘读取装入内存，并在内存计算 SHA-256（彻底杜绝二次读盘）
-                                    let data = try Data(contentsOf: fileURL)
-                                    let actualSize = Int64(data.count)
-                                    if actualSize <= limit8MB {
-                                        fileSize = actualSize
-                                        sha256Hex = SyncEngine.computeSha256(of: data)
-                                        smallContent = data
-                                    } else {
-                                        let (s, sz) = try SyncEngine.computeFileSha256(at: fileURL)
-                                        sha256Hex = s
-                                        fileSize = sz
-                                        smallContent = nil
-                                    }
-                                } else {
-                                    let (s, sz) = try SyncEngine.computeFileSha256(at: fileURL)
-                                    sha256Hex = s
-                                    fileSize = sz
-                                    smallContent = nil
-                                }
+                                let input = try StableUploadInput.capture(at: fileURL)
+                                let sha256Hex = input.sha256
+                                let fileSize = input.size
+                                let smallContent = input.data
 
                                 self.monitor.startUpload(id: fullPath, name: name, totalBytes: fileSize)
 
-                                let dev = Int64(record.metadata?.identity.device ?? 1)
-                                let ino = Int64(record.metadata?.identity.inode ?? 0)
-                                let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
+                                let dev = input.version.device
+                                let ino = input.version.inode
+                                let mtime = input.version.mtime
 
                                 let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
 
@@ -637,11 +617,16 @@ public final class SyncEngine: Sendable {
                                     let remoteID: String?
                                     let phase: String
                                     let remoteStatus: String
+                                    let hasBaseline: Bool
+                                    let localGeneration: Int64
+                                    let remoteGeneration: Int64
+                                    let dirtyGeneration: Int64
                                 }
 
                                 let existingTarget: ExistingFileTarget? = try await self.store.read { conn in
                                     let stmt = try conn.cachedStatement("""
-                                    SELECT item_id, remote_file_id, phase, remote_status
+                                    SELECT item_id, remote_file_id, phase, remote_status, base_sha256,
+                                           local_generation, remote_generation, dirty_generation
                                     FROM items
                                     WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
                                     """)
@@ -654,13 +639,23 @@ public final class SyncEngine: Sendable {
                                             itemID: iId,
                                             remoteID: stmt.columnText(at: 1),
                                             phase: stmt.columnText(at: 2) ?? "discovered",
-                                            remoteStatus: stmt.columnText(at: 3) ?? "unknown"
+                                            remoteStatus: stmt.columnText(at: 3) ?? "unknown",
+                                            hasBaseline: stmt.columnText(at: 4) != nil,
+                                            localGeneration: stmt.columnInt64(at: 5) ?? 0,
+                                            remoteGeneration: stmt.columnInt64(at: 6) ?? 0,
+                                            dirtyGeneration: stmt.columnInt64(at: 7) ?? 0
                                         )
                                     }
                                     return nil
                                 }
 
                                 // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
+                                if let existingTarget, existingTarget.hasBaseline, let remoteID = existingTarget.remoteID {
+                                    throw DriveError.unsafeOverwrite(fileId: remoteID)
+                                }
+                                let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+                                let expectedRemoteGeneration = existingTarget?.remoteGeneration ?? 0
+                                let expectedDirtyGeneration = max(existingTarget?.dirtyGeneration ?? 0, 1)
                                 if fileSize <= limit8MB, let content = smallContent {
                                     let uploadedFile: DriveFile
                                     let committedItemID: Int64
@@ -729,8 +724,11 @@ public final class SyncEngine: Sendable {
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
 
                                     // 上传成功后，通过 batchWrite（Group Commit，合并 256 项或 5ms 刷盘）写入基线
+                                    try input.version.validate(at: fileURL)
                                     let completedCreateIntent = createIntent
+                                    let expectedLocalGeneration = completedCreateIntent?.expectedLocalGeneration ?? existingTarget?.localGeneration ?? 1
                                     try await self.store.batchWrite { conn in
+                                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
                                         let itemStmt = try conn.cachedStatement("""
                                         UPDATE items SET
                                             remote_file_id = ?,
@@ -740,7 +738,8 @@ public final class SyncEngine: Sendable {
                                             remote_sha256 = ?, remote_size = ?, remote_status = 'present',
                                             local_status = 'present', phase = 'committed', dirty_generation = 0,
                                             updated_at = ?
-                                        WHERE item_id = ?;
+                                        WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                                            AND dirty_generation = ? AND is_tombstone = 0;
                                         """)
                                         itemStmt.bindText(uploadedFile.id, at: 1)
                                         itemStmt.bindInt64(dev, at: 2)
@@ -755,8 +754,13 @@ public final class SyncEngine: Sendable {
                                         let ts = Date().timeIntervalSince1970
                                         itemStmt.bindDouble(ts, at: 11)
                                         itemStmt.bindInt64(committedItemID, at: 12)
+                                        itemStmt.bindInt64(expectedLocalGeneration, at: 13)
+                                        itemStmt.bindInt64(expectedRemoteGeneration, at: 14)
+                                        itemStmt.bindInt64(expectedDirtyGeneration, at: 15)
                                         _ = try itemStmt.step()
                                         itemStmt.reset()
+                                        guard conn.changes == 1 else { return }
+                                        receiptApplied.withLock { $0 = true }
                                         if let createIntent = completedCreateIntent {
                                             try DurableCreateIntentStore.completeOperation(
                                                 conn: conn,
@@ -773,7 +777,8 @@ public final class SyncEngine: Sendable {
                                     } else {
                                         remoteFileId = try await self.idPool.nextId()
                                     }
-                                    let isUpdate = (existingTarget?.phase == "committed" && existingTarget?.remoteStatus == "present")
+                                    let isUpdate = existingTarget?.hasBaseline == true || (existingTarget?.phase == "committed" && existingTarget?.remoteStatus == "present")
+                                    if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteFileId) }
 
                                     let currentItemId: Int64 = try await self.store.write { conn in
                                         let itemStmt = try conn.cachedStatement("""
@@ -833,7 +838,7 @@ public final class SyncEngine: Sendable {
                                     _ = try await self.performResumableUpload(
                                         rootId: rootId,
                                         itemId: currentItemId,
-                                        fileURL: fileURL,
+                                        fileURL: input.fileURL,
                                         fileSize: fileSize,
                                         expectedSha256: sha256Hex,
                                         remoteId: remoteFileId,
@@ -843,7 +848,10 @@ public final class SyncEngine: Sendable {
                                     )
 
                                     // 提交共同基线 B
+                                    try input.version.validate(at: fileURL)
+                                    let expectedLocalGeneration = existingTarget?.localGeneration ?? 1
                                     try await self.store.batchWrite { conn in
+                                        guard (try? LocalFileVersion.read(at: fileURL)) == input.version else { return }
                                         let updateStmt = try conn.cachedStatement("""
                                         UPDATE items SET
                                             base_sha256 = ?,
@@ -854,7 +862,8 @@ public final class SyncEngine: Sendable {
                                             phase = 'committed',
                                             dirty_generation = 0,
                                             updated_at = ?
-                                        WHERE root_id = ? AND remote_file_id = ?;
+                                        WHERE root_id = ? AND remote_file_id = ? AND local_generation = ?
+                                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
                                         """)
                                         updateStmt.bindText(sha256Hex, at: 1)
                                         updateStmt.bindInt64(fileSize, at: 2)
@@ -863,11 +872,18 @@ public final class SyncEngine: Sendable {
                                         updateStmt.bindDouble(Date().timeIntervalSince1970, at: 5)
                                         updateStmt.bindInt64(rootId, at: 6)
                                         updateStmt.bindText(remoteFileId, at: 7)
+                                        updateStmt.bindInt64(expectedLocalGeneration, at: 8)
+                                        updateStmt.bindInt64(expectedRemoteGeneration, at: 9)
+                                        updateStmt.bindInt64(expectedDirtyGeneration, at: 10)
                                         _ = try updateStmt.step()
                                         updateStmt.reset()
+                                        if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
                                     }
                                 }
 
+                                guard receiptApplied.withLock({ $0 }) else {
+                                    throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(name)")
+                                }
                                 progress.recordSuccess(bytes: fileSize)
                             } catch {
                                 if let createIntent {
@@ -878,6 +894,20 @@ public final class SyncEngine: Sendable {
                                     )
                                 }
                                 progress.recordFailure()
+                                if case DriveError.unsafeOverwrite = error {
+                                    let parentID = localDirMap.get(parentRel) ?? rootItemId
+                                    try? await self.store.batchWrite { conn in
+                                        let stmt = try conn.cachedStatement("""
+                                        UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
+                                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                                        """)
+                                        stmt.bindInt64(rootId, at: 1)
+                                        stmt.bindInt64(parentID, at: 2)
+                                        stmt.bindText(name, at: 3)
+                                        _ = try stmt.step()
+                                        stmt.reset()
+                                    }
+                                }
                                 self.logger.error("上传文件失败 [\(relPath)]: \(error)")
                             }
                         }
@@ -1106,22 +1136,26 @@ public final class SyncEngine: Sendable {
                         do {
                             self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
                             // 流式下载并核验 SHA-256
-                            try await self.client.downloadFile(
+                            let published = try await self.client.downloadFileSafely(
                                 remoteId: item.id,
                                 destinationURL: itemLocalURL,
                                 expectedSha256: item.sha256Checksum,
+                                expectedDestination: nil,
                                 onProgress: { delta in
                                     self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
                                 }
                             )
 
                             // 获取本地落盘后的元数据
-                            let attrs = try FileManager.default.attributesOfItem(atPath: itemLocalURL.path)
-                            let fileSize = (attrs[.size] as? Int64) ?? item.sizeBytes ?? 0
-                            let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? now) * 1_000_000_000
+                            let fileSize = published.size
+                            let mtime = published.mtime
 
                             // 写入 SQLite 基线 B
+                            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
                             try await self.store.batchWrite { conn in
+                                // A failed check leaves the file to the next scan; it
+                                // must not abort unrelated writes in the group commit.
+                                guard (try? LocalFileVersion.read(at: itemLocalURL)) == published else { return }
                                 let stmt = try conn.cachedStatement("""
                                 INSERT INTO items (
                                     root_id, parent_id, name, entry_kind, remote_file_id,
@@ -1129,6 +1163,7 @@ public final class SyncEngine: Sendable {
                                     base_sha256, base_size,
                                     remote_sha256, remote_size, remote_status,
                                     local_generation, local_status, phase,
+                                    local_device, local_inode,
                                     created_at, updated_at
                                 ) VALUES (
                                     ?, ?, ?, 'file', ?,
@@ -1136,23 +1171,11 @@ public final class SyncEngine: Sendable {
                                     ?, ?,
                                     ?, ?, 'present',
                                     1, 'present', 'committed',
+                                    ?, ?,
                                     ?, ?
                                 )
                                 ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                DO UPDATE SET
-                                    remote_file_id = excluded.remote_file_id,
-                                    local_mtime = excluded.local_mtime,
-                                    local_size = excluded.local_size,
-                                    local_sha256 = excluded.local_sha256,
-                                    base_sha256 = excluded.base_sha256,
-                                    base_size = excluded.base_size,
-                                    remote_sha256 = excluded.remote_sha256,
-                                    remote_size = excluded.remote_size,
-                                    remote_status = 'present',
-                                    local_generation = excluded.local_generation,
-                                    local_status = excluded.local_status,
-                                    phase = excluded.phase,
-                                    updated_at = excluded.updated_at;
+                                DO NOTHING;
                                 """)
                                 stmt.bindInt64(rootId, at: 1)
                                 stmt.bindInt64(parentItemId, at: 2)
@@ -1166,10 +1189,16 @@ public final class SyncEngine: Sendable {
                                 stmt.bindText(item.sha256Checksum, at: 10)
                                 stmt.bindInt64(fileSize, at: 11)
                                 let ts = Date().timeIntervalSince1970
-                                stmt.bindDouble(ts, at: 12)
-                                stmt.bindDouble(ts, at: 13)
+                                stmt.bindInt64(published.device, at: 12)
+                                stmt.bindInt64(published.inode, at: 13)
+                                stmt.bindDouble(ts, at: 14)
+                                stmt.bindDouble(ts, at: 15)
                                 _ = try stmt.step()
                                 stmt.reset()
+                                if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
+                            }
+                            guard receiptApplied.withLock({ $0 }) else {
+                                throw SyncEngineError.general("初始化下载回执已过期，保留现有状态: \(item.name)")
                             }
 
                             progress.filesDownloaded += 1
@@ -1262,6 +1291,7 @@ public final class SyncEngine: Sendable {
         isUpdate: Bool,
         chunkSize: Int64 = 8 * 1024 * 1024 // 8MB 分块，256KB 整数倍
     ) async throws -> DriveFile {
+        if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteId) }
         let opId = "resumable_\(remoteId)"
         var sessionURL: URL? = nil
         var currentOffset: Int64 = 0
@@ -2414,6 +2444,12 @@ public final class SyncEngine: Sendable {
             let local: LocalObservation?
             let remote: RemoteObservation?
             let pendingCreate: DurableCreateIntent?
+            let localGeneration: Int64
+            let remoteGeneration: Int64
+            let dirtyGeneration: Int64
+            let localDevice: Int64?
+            let localInode: Int64?
+            let localMtime: Int64?
         }
 
         let dirtyItems: [DirtyRecord] = try await store.read { conn in
@@ -2423,7 +2459,9 @@ public final class SyncEngine: Sendable {
                    items.local_sha256, items.local_size, items.local_status,
                    items.remote_sha256, items.remote_size, items.remote_status,
                    op.operation_id, op.target_remote_id, op.target_parent_remote_id,
-                   op.expected_local_generation, op.expected_sha256, op.total_bytes
+                   op.expected_local_generation, op.expected_sha256, op.total_bytes,
+                   items.local_generation, items.remote_generation, items.dirty_generation,
+                   items.local_device, items.local_inode, items.local_mtime
             FROM items
             LEFT JOIN operations op ON op.operation_id = (
                 SELECT candidate.operation_id
@@ -2481,7 +2519,13 @@ public final class SyncEngine: Sendable {
                 records.append(DirtyRecord(
                     itemId: iId, parentId: pId, name: name, remoteFileId: rFileId,
                     entryKind: kind, baseline: baseline, local: local, remote: remote,
-                    pendingCreate: pendingCreate
+                    pendingCreate: pendingCreate,
+                    localGeneration: stmt.columnInt64(at: 19) ?? 0,
+                    remoteGeneration: stmt.columnInt64(at: 20) ?? 0,
+                    dirtyGeneration: stmt.columnInt64(at: 21) ?? 0,
+                    localDevice: stmt.columnInt64(at: 22),
+                    localInode: stmt.columnInt64(at: 23),
+                    localMtime: stmt.columnInt64(at: 24)
                 ))
             }
             stmt.reset()
@@ -2499,6 +2543,7 @@ public final class SyncEngine: Sendable {
             var bytesDown: Int64 = 0
             var deleted = 0
             var conflicts = 0
+            let failures = OSAllocatedUnfairLock(initialState: 0)
         }
         let actionTracker = ActionTracker()
 
@@ -2580,6 +2625,10 @@ public final class SyncEngine: Sendable {
                         let localFileURL = rootURL.appendingPathComponent(relPath)
                         let remoteParentId = dirContext.getRemoteId(for: item.parentId) ?? remoteRootId
 
+                        if createIntent == nil, let remoteID = item.remoteFileId {
+                            throw DriveError.unsafeOverwrite(fileId: remoteID)
+                        }
+
                         // 若远端父目录此前被移入回收站，在上传子文件前自动恢复父目录
                         if let parentRId = dirContext.getRemoteId(for: item.parentId) {
                             let isParentTrashed: Bool = (try? await self.store.read { conn in
@@ -2619,11 +2668,14 @@ public final class SyncEngine: Sendable {
                         }
                         self.monitor.startUpload(id: item.name, name: item.name, totalBytes: fSize)
 
-                        let fileData = try Data(contentsOf: localFileURL)
-                        let attrs = try FileManager.default.attributesOfItem(atPath: localFileURL.path)
-                        let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? Date().timeIntervalSince1970) * 1_000_000_000
-                        let dev = (attrs[.systemNumber] as? NSNumber)?.int64Value ?? 0
-                        let ino = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
+                        let input = try StableUploadInput.capture(at: localFileURL)
+                        guard input.size == fSize, input.sha256 == sha256Hex else {
+                            throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                        }
+                        let fileData = try input.data ?? Data(contentsOf: input.fileURL)
+                        let mtime = input.version.mtime
+                        let dev = input.version.device
+                        let ino = input.version.inode
                         let uploadedFile: DriveFile
                         if let pending = createIntent {
                             guard let expectedSHA256 = pending.expectedSHA256,
@@ -2671,7 +2723,10 @@ public final class SyncEngine: Sendable {
                         }
 
                         let completedCreateIntent = createIntent
+                        try input.version.validate(at: localFileURL)
+                        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
                         try await self.store.batchWrite { conn in
+                            guard (try? LocalFileVersion.read(at: localFileURL)) == input.version else { return }
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET
                                 remote_file_id = ?,
@@ -2687,7 +2742,8 @@ public final class SyncEngine: Sendable {
                                 phase = 'committed',
                                 dirty_generation = 0,
                                 updated_at = ?
-                            WHERE item_id = ?;
+                            WHERE item_id = ? AND local_generation = ?
+                                AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
                             """)
                             stmt.bindText(uploadedFile.id, at: 1)
                             stmt.bindInt64(dev, at: 2)
@@ -2700,8 +2756,13 @@ public final class SyncEngine: Sendable {
                             stmt.bindInt64(fSize, at: 9)
                             stmt.bindDouble(now, at: 10)
                             stmt.bindInt64(item.itemId, at: 11)
+                            stmt.bindInt64(item.localGeneration, at: 12)
+                            stmt.bindInt64(item.remoteGeneration, at: 13)
+                            stmt.bindInt64(item.dirtyGeneration, at: 14)
                             _ = try stmt.step()
                             stmt.reset()
+                            guard conn.changes == 1 else { return }
+                            receiptApplied.withLock { $0 = true }
                             if let createIntent = completedCreateIntent {
                                 try DurableCreateIntentStore.completeOperation(
                                     conn: conn,
@@ -2711,15 +2772,34 @@ public final class SyncEngine: Sendable {
                             }
                         }
 
+                        guard receiptApplied.withLock({ $0 }) else {
+                            throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(item.name)")
+                        }
+
                         actionTracker.uploaded += 1
                         actionTracker.bytesUp += fSize
                     } catch {
+                        actionTracker.failures.withLock { $0 += 1 }
                         if let createIntent {
                             await DurableCreateIntentStore.markUnknownOutcome(
                                 store: self.store,
                                 operationID: createIntent.operationID,
                                 error: error
                             )
+                        }
+                        if case DriveError.unsafeOverwrite = error {
+                            try? await self.store.batchWrite { conn in
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET phase = 'blocked'
+                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                                """)
+                                stmt.bindInt64(item.itemId, at: 1)
+                                stmt.bindInt64(item.localGeneration, at: 2)
+                                stmt.bindInt64(item.remoteGeneration, at: 3)
+                                stmt.bindInt64(item.dirtyGeneration, at: 4)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
                         }
                         self.logger.error("增量上传失败 [\(item.name)]: \(error)")
                     }
@@ -2749,26 +2829,59 @@ public final class SyncEngine: Sendable {
                         // 确保本地目标父目录存在
                         try? FileManager.default.createDirectory(at: localFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
+                        let expectedDestination = try LocalFileVersion.read(at: localFileURL)
+                        if item.local?.status == .present {
+                            guard let expectedDestination,
+                                  expectedDestination.device == item.localDevice,
+                                  expectedDestination.inode == item.localInode,
+                                  expectedDestination.mtime == item.localMtime,
+                                  expectedDestination.size == item.local?.size else {
+                                throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                            }
+                        } else if expectedDestination != nil {
+                            throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                        }
                         self.monitor.startDownload(id: downId, name: item.name, totalBytes: downSize)
-                        try await self.client.downloadFile(
+                        let published = try await self.client.downloadFileSafely(
                             remoteId: remoteFileId,
                             destinationURL: localFileURL,
                             expectedSha256: item.remote?.sha256,
+                            expectedDestination: expectedDestination,
+                            beforePublish: {
+                                let current = try await self.store.read { conn in
+                                    let stmt = try conn.cachedStatement("""
+                                    SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
+                                        AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                                    """)
+                                    defer { stmt.reset() }
+                                    stmt.bindInt64(item.itemId, at: 1)
+                                    stmt.bindInt64(item.localGeneration, at: 2)
+                                    stmt.bindInt64(item.remoteGeneration, at: 3)
+                                    stmt.bindInt64(item.dirtyGeneration, at: 4)
+                                    return try stmt.step()
+                                }
+                                guard current else {
+                                    throw SyncEngineError.general("下载计划已过期，保留本地文件: \(item.name)")
+                                }
+                            },
                             onProgress: { delta in
                                 self.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
                             }
                         )
 
-                        let attrs = try FileManager.default.attributesOfItem(atPath: localFileURL.path)
-                        let fSize = (attrs[.size] as? Int64) ?? item.remote?.size ?? 0
-                        let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? Date().timeIntervalSince1970) * 1_000_000_000
+                        let fSize = published.size
+                        let mtime = published.mtime
 
+                        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
                         try await self.store.batchWrite { conn in
+                            guard (try? LocalFileVersion.read(at: localFileURL)) == published else { return }
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET
                                 local_sha256 = remote_sha256,
                                 local_size = remote_size,
                                 local_mtime = ?,
+                                local_device = ?,
+                                local_inode = ?,
                                 local_status = 'present',
                                 remote_status = 'present',
                                 base_sha256 = remote_sha256,
@@ -2776,18 +2889,30 @@ public final class SyncEngine: Sendable {
                                 phase = 'committed',
                                 dirty_generation = 0,
                                 updated_at = ?
-                            WHERE item_id = ?;
+                            WHERE item_id = ? AND local_generation = ?
+                                AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
                             """)
                             stmt.bindInt64(Int64(mtime), at: 1)
-                            stmt.bindDouble(Date().timeIntervalSince1970, at: 2)
-                            stmt.bindInt64(item.itemId, at: 3)
+                            stmt.bindInt64(published.device, at: 2)
+                            stmt.bindInt64(published.inode, at: 3)
+                            stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
+                            stmt.bindInt64(item.itemId, at: 5)
+                            stmt.bindInt64(item.localGeneration, at: 6)
+                            stmt.bindInt64(item.remoteGeneration, at: 7)
+                            stmt.bindInt64(item.dirtyGeneration, at: 8)
                             _ = try stmt.step()
                             stmt.reset()
+                            guard conn.changes == 1 else { return }
+                            receiptApplied.withLock { $0 = true }
+                        }
+                        guard receiptApplied.withLock({ $0 }) else {
+                            throw SyncEngineError.general("下载回执已过期，保留新一代待同步状态: \(item.name)")
                         }
 
                         actionTracker.downloaded += 1
                         actionTracker.bytesDown += fSize
                     } catch {
+                        actionTracker.failures.withLock { $0 += 1 }
                         self.logger.error("增量下载失败 [\(item.name)]: \(error)")
                     }
                 }
@@ -2803,12 +2928,15 @@ public final class SyncEngine: Sendable {
                         phase = 'committed',
                         dirty_generation = 0,
                         updated_at = ?
-                    WHERE item_id = ?;
+                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
                     """)
                     stmt.bindText(sha, at: 1)
                     stmt.bindInt64(size, at: 2)
                     stmt.bindDouble(now, at: 3)
                     stmt.bindInt64(item.itemId, at: 4)
+                    stmt.bindInt64(item.localGeneration, at: 5)
+                    stmt.bindInt64(item.remoteGeneration, at: 6)
+                    stmt.bindInt64(item.dirtyGeneration, at: 7)
                     _ = try stmt.step()
                     stmt.reset()
                 }
@@ -2906,12 +3034,16 @@ public final class SyncEngine: Sendable {
 
                         try await self.store.write { conn in
                             let stmt = try conn.cachedStatement("""
-                            UPDATE items SET conflict_id = ?, conflict_winner = ?, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            UPDATE items SET conflict_id = ?, conflict_winner = ?, phase = 'committed', dirty_generation = 0, updated_at = ?
+                            WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
                             """)
                             stmt.bindText(conflictId, at: 1)
                             stmt.bindText(winner.rawValue, at: 2)
                             stmt.bindDouble(now, at: 3)
                             stmt.bindInt64(item.itemId, at: 4)
+                            stmt.bindInt64(item.localGeneration, at: 5)
+                            stmt.bindInt64(item.remoteGeneration, at: 6)
+                            stmt.bindInt64(item.dirtyGeneration, at: 7)
                             _ = try stmt.step()
                             stmt.reset()
                         }
@@ -2924,8 +3056,11 @@ public final class SyncEngine: Sendable {
 
             case .unchanged:
                 try await store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement("UPDATE items SET dirty_generation = 0 WHERE item_id = ?;")
+                    let stmt = try conn.cachedStatement("UPDATE items SET dirty_generation = 0 WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;")
                     stmt.bindInt64(item.itemId, at: 1)
+                    stmt.bindInt64(item.localGeneration, at: 2)
+                    stmt.bindInt64(item.remoteGeneration, at: 3)
+                    stmt.bindInt64(item.dirtyGeneration, at: 4)
                     _ = try stmt.step()
                     stmt.reset()
                 }
@@ -3151,6 +3286,7 @@ public final class SyncEngine: Sendable {
         stats.bytesDownloaded = actionTracker.bytesDown
         stats.filesDeleted = actionTracker.deleted
         stats.conflictsResolved = actionTracker.conflicts
+        stats.filesFailed = actionTracker.failures.withLock { $0 }
         stats.elapsedSeconds = elapsed
         notifier.finish()
 

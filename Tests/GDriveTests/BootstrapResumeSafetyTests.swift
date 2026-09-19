@@ -412,7 +412,7 @@ struct BootstrapResumeSafetyTests {
 
     // MARK: - Test 3: Changed File Updates In-Place via updateMultipart Without Creating Duplicate Object
 
-    @Test("Changed file updates in-place without creating duplicate remote object")
+    @Test("Changed existing file remains pending without an unsafe remote overwrite (A11)")
     func testChangedFileUpdatesInPlace() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_change_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -498,12 +498,13 @@ struct BootstrapResumeSafetyTests {
 
         // Round 2: 变更后重跑同步
         let round2 = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
-        #expect(round2.filesUploaded == 1)
+        #expect(round2.filesUploaded == 0)
+        #expect(round2.filesFailed == 1)
         #expect(round2.filesSkipped == 0)
 
-        // 断言：服务端仅发生 1 次 POST 创建，以及 1 次 PATCH 原地更新；绝无第 2 次 POST 创建新文件！
+        // A11: only the original POST is allowed; no overwrite or duplicate creation.
         #expect(recorder.fileCreateCount == 1)
-        #expect(recorder.filePatchCount == 1)
+        #expect(recorder.filePatchCount == 0)
 
         // 断言 SQLite 中 items 表仅有 1 个文件项，且其 remote_file_id 保持为 fixedFileId
         let (itemCount, currentRemoteId, currentBaseSha): (Int, String?, String?) = try await store.read { conn in
@@ -516,8 +517,14 @@ struct BootstrapResumeSafetyTests {
         }
         #expect(itemCount == 1)
         #expect(currentRemoteId == fixedFileId)
-        let expectedV2Sha = SyncEngine.computeSha256(of: v2Content.data(using: .utf8)!)
-        #expect(currentBaseSha == expectedV2Sha)
+        let expectedV1Sha = SyncEngine.computeSha256(of: v1Content.data(using: .utf8)!)
+        #expect(currentBaseSha == expectedV1Sha)
+        try await store.read { conn in
+            let stmt = try conn.prepare("SELECT phase, dirty_generation FROM items WHERE entry_kind = 'file';")
+            #expect(try stmt.step())
+            #expect(stmt.columnText(at: 0) == "blocked")
+            #expect((stmt.columnInt64(at: 1) ?? 0) > 0)
+        }
     }
 
     // MARK: - Test 4: Interrupted Resumable Upload Resumes Session and Reuses Remote ID

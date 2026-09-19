@@ -119,6 +119,11 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 ### 2.4 同步引擎与调度层 (`Sources/GDrive/Engine/`)
 
 * **`SyncEngine.swift`**：
+  * **覆盖发布保护（A11）**：当前 Drive 正文条件写未通过实网契约验证，已有远端正文覆盖
+    被阻断并保留 dirty/旧基线；新建上传继续运行。小文件使用不可变内存输入，大文件
+    使用 clonefile 快照（不支持时明确失败，不回退到全量复制）。下载发布前校验
+    identity/generation，使用排他 rename 或原子交换；完成回执按预期 generation 条件提交。
+    具体限制与性能证据见 [A11 验收记录](a11-validation.md)。
   * **模式 1：`syncLocalToRemoteEmpty`**：
     * 调用纯 Swift `DirectoryScanner`，在 POSIX 系统调用底层遍历阶段即直接剪枝跳
       过 `.git` 目录。

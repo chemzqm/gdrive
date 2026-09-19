@@ -140,8 +140,8 @@ struct DurableIntentTests {
         #expect(recoveredDirectory.targetRemoteID == "directory-id-original")
     }
 
-    @Test("Directory and small-file requests observe committed intents before HTTP, then complete atomically")
-    func requestsStartAfterIntentCommit() async throws {
+    @Test("Durable requests commit only their own generation (A05/A11)", arguments: ["none", "local_generation", "remote_generation", "dirty_generation", "source"], [false, true])
+    func requestsStartAfterIntentCommit(invalidation: String, incremental: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-order-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer {
@@ -173,6 +173,10 @@ struct DurableIntentTests {
                 response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
                 data = Data(#"{"startPageToken":"start-token"}"#.utf8)
                 return (response, data)
+            }
+            if url.path.hasSuffix("/changes") {
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                        Data(#"{"changes":[],"newStartPageToken":"next"}"#.utf8))
             }
             if url.path.hasSuffix("/files/generateIds") {
                 response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -216,6 +220,13 @@ struct DurableIntentTests {
 
             response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
             if operationType == "uploadMultipart" {
+                if invalidation == "source" {
+                    try Data("newer local contents".utf8).write(to: localRoot.appendingPathComponent("small.txt"))
+                } else if invalidation != "none" {
+                    let writer = try SQLiteConnection(path: databasePath)
+                    // invalidation is a closed list of column names from the test arguments.
+                    try writer.execute("UPDATE items SET \(invalidation) = \(invalidation) + 1 WHERE entry_kind = 'file';")
+                }
                 data = try JSONSerialization.data(withJSONObject: [
                     "id": targetID,
                     "name": "small.txt",
@@ -238,12 +249,15 @@ struct DurableIntentTests {
         }
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: idPool)
-        let stats = try await engine.syncLocalToRemoteEmpty(
-            localPath: localRoot.path,
-            remoteRootId: "remote-root",
-            maxUploadConcurrency: 8
-        )
-        #expect(stats.filesUploaded == 1)
+        let stats: SyncStats
+        if incremental {
+            _ = try await seedRoot(store: store, localPath: localRoot.path, remoteID: "remote-root")
+            stats = try await engine.syncIncremental(localPath: localRoot.path, remoteRootId: "remote-root", maxConcurrency: 8)
+        } else {
+            stats = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "remote-root", maxUploadConcurrency: 8)
+        }
+        #expect(stats.filesUploaded == (invalidation == "none" ? 1 : 0))
+        #expect(stats.filesFailed == (invalidation == "none" ? 0 : 1))
         #expect(stats.directoriesCreated == 1)
 
         let states: [(String, String)] = try await store.read { conn in
@@ -257,7 +271,19 @@ struct DurableIntentTests {
             return result
         }
         #expect(states.count == 2)
-        #expect(states.allSatisfy { $0.1 == "completed" })
+        #expect(states.first { $0.0 == "createDirectory" }?.1 == "completed")
+        #expect(states.first { $0.0 == "uploadMultipart" }?.1 == (invalidation == "none" ? "completed" : "unknownOutcome"))
+        try await store.read { conn in
+            let query = try conn.prepare("SELECT dirty_generation, base_sha256 FROM items WHERE entry_kind = 'file';")
+            #expect(try query.step())
+            if invalidation == "none" {
+                #expect(query.columnInt64(at: 0) == 0)
+                #expect(query.columnText(at: 1) == sha)
+            } else {
+                #expect((query.columnInt64(at: 0) ?? 0) > 0)
+                #expect(query.columnText(at: 1) == nil)
+            }
+        }
     }
 
     @Test("A fresh engine retries an unknown multipart result with the persisted Drive ID and accepts 409 verification")

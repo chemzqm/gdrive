@@ -536,8 +536,8 @@ struct DirectoryBarrierTests {
         }
     }
 
-    @Test("Scenario 4: Local directory deleted but remote added new child file via Changes -> child downloaded, parent directory recreated, remote parent NOT trashed")
-    func testLocalDirDeletedRemoteChildNewlyAdded() async throws {
+    @Test("Scenario 4: remote child download honors generation and directory barrier (A04/A11)", arguments: ["none", "local_generation", "remote_generation", "dirty_generation"])
+    func testLocalDirDeletedRemoteChildNewlyAdded(invalidation: String) async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test4_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -644,6 +644,10 @@ struct DirectoryBarrierTests {
             }
 
             if url.contains("/drive/v3/files/\(newChildRemoteId)") && url.contains("alt=media") {
+                if invalidation != "none" {
+                    let writer = try SQLiteConnection(path: dbPath)
+                    try writer.execute("UPDATE items SET \(invalidation) = \(invalidation) + 1 WHERE entry_kind = 'file';")
+                }
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
                 return (response, newFileData)
             }
@@ -669,10 +673,22 @@ struct DirectoryBarrierTests {
         let subDirURL = localRootDir.appendingPathComponent("sub")
         let downloadedFile = subDirURL.appendingPathComponent("remote_added.txt")
         #expect(FileManager.default.fileExists(atPath: subDirURL.path), "Local sub directory must be recreated")
-        #expect(FileManager.default.fileExists(atPath: downloadedFile.path), "Newly added remote file must be downloaded to disk")
+        #expect(FileManager.default.fileExists(atPath: downloadedFile.path) == (invalidation == "none"))
 
         let fileContentOnDisk = try? String(contentsOf: downloadedFile, encoding: .utf8)
-        #expect(fileContentOnDisk == newRemoteContent)
+        #expect(fileContentOnDisk == (invalidation == "none" ? newRemoteContent : nil))
+        try await store.read { conn in
+            let stmt = try conn.prepare("SELECT dirty_generation, base_sha256 FROM items WHERE remote_file_id = ?;")
+            stmt.bindText(newChildRemoteId, at: 1)
+            #expect(try stmt.step())
+            if invalidation == "none" {
+                #expect(stmt.columnInt64(at: 0) == 0)
+                #expect(stmt.columnText(at: 1) == newFileSha256)
+            } else {
+                #expect((stmt.columnInt64(at: 0) ?? 0) > 0)
+                #expect(stmt.columnText(at: 1) == nil)
+            }
+        }
 
         // 3. 数据库中 sub 目录恢复为 present / committed
         try await store.read { conn in

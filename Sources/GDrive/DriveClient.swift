@@ -2,6 +2,7 @@ import Foundation
 import CommonCrypto
 import Logging
 import os
+import Darwin
 
 /// Google Drive 文件及目录元数据资源模型
 public struct DriveFile: Codable, Sendable {
@@ -68,6 +69,8 @@ public enum DriveError: Error, Sendable, CustomStringConvertible {
     case serverError(statusCode: Int, message: String)
     case invalidResponse(message: String)
     case fileModifiedDuringUpload(path: String)
+    case unsafeOverwrite(fileId: String)
+    case stableInputUnavailable(path: String)
 
     public var description: String {
         switch self {
@@ -86,7 +89,11 @@ public enum DriveError: Error, Sendable, CustomStringConvertible {
         case .invalidResponse(let msg):
             return "无效的 API 响应: \(msg)"
         case .fileModifiedDuringUpload(let path):
-            return "本地文件在上传中途被修改: \(path)"
+            return "本地文件在传输或发布期间发生变化: \(path)"
+        case .unsafeOverwrite(let id):
+            return "已阻断远端正文覆盖，Drive 条件写尚未验证，保留待同步状态: \(id)"
+        case .stableInputUnavailable(let path):
+            return "文件系统不支持写时复制快照，无法安全且高效地捕获大文件上传输入: \(path)"
         }
     }
 }
@@ -427,67 +434,28 @@ public final class DriveClient: Sendable {
 
     // MARK: - 文件内容更新 (Update)
 
-    /// 更新已存在文件的正文内容（≤ 8MB）
+    /// 已有文件正文覆盖目前被安全阻断：抛出 unsafeOverwrite，不发出 HTTP 请求。
+    /// 仅在真实服务端原子条件写契约验证通过后才能重新启用。
     public func updateMultipart(
         remoteId: String,
         mimeType: String = "application/octet-stream",
         content: Data,
         expectedSha256: String
     ) async throws -> DriveFile {
-        let token = try await getValidToken()
-        var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files/\(remoteId)")!
-        components.queryItems = [
-            URLQueryItem(name: "uploadType", value: "media"),
-            URLQueryItem(name: "fields", value: Self.fields)
-        ]
-
-        var req = URLRequest(url: components.url!)
-        req.httpMethod = "PATCH"
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue(mimeType, forHTTPHeaderField: "Content-Type")
-        req.httpBody = content
-
-        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
-        let driveFile = try JSONDecoder().decode(DriveFile.self, from: data)
-
-        // 校验响应中的大小与 SHA-256
-        if let actualSize = driveFile.sizeBytes, actualSize != Int64(content.count) {
-            throw DriveError.sizeMismatch(expected: Int64(content.count), actual: actualSize)
-        }
-        if let actualChecksum = driveFile.sha256Checksum,
-           actualChecksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
-            throw DriveError.checksumMismatch(expected: expectedSha256, actual: actualChecksum)
-        }
-
-        return driveFile
+        // Real Drive contract probe: uploadType=media accepts an invalid
+        // If-Match and overwrites the object. A preceding GET cannot close that race.
+        throw DriveError.unsafeOverwrite(fileId: remoteId)
     }
 
-    /// 发起大文件已存在文件的 Resumable 内容更新会话 (> 8MB)
+    /// 已有文件 Resumable 覆盖目前被安全阻断，不创建上传会话。
     public func initiateResumableUpdate(
         remoteId: String,
         totalBytes: Int64,
         mimeType: String = "application/octet-stream"
     ) async throws -> URL {
-        let token = try await getValidToken()
-        var components = URLComponents(string: "https://www.googleapis.com/upload/drive/v3/files/\(remoteId)")!
-        components.queryItems = [
-            URLQueryItem(name: "uploadType", value: "resumable"),
-            URLQueryItem(name: "fields", value: Self.fields)
-        ]
-
-        var req = URLRequest(url: components.url!)
-        req.httpMethod = "PATCH"
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        req.setValue(mimeType, forHTTPHeaderField: "X-Upload-Content-Type")
-        req.setValue(String(totalBytes), forHTTPHeaderField: "X-Upload-Content-Length")
-
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
-        guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
-            let detail = String(decoding: data, as: UTF8.self)
-            throw DriveError.serverError(statusCode: http.statusCode, message: "创建 Resumable 更新会话失败: \(detail)")
-        }
-
-        return sessionURL
+        // Session initiation alone would not prove an atomic condition on the
+        // final chunk. Keep updates blocked until that separate contract is proven.
+        throw DriveError.unsafeOverwrite(fileId: remoteId)
     }
 
     // MARK: - 大文件 Resumable Upload (> 8MB)
@@ -669,6 +637,24 @@ public final class DriveClient: Sendable {
         expectedSha256: String? = nil,
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws {
+        _ = try await downloadFileSafely(
+            remoteId: remoteId, destinationURL: destinationURL, expectedSha256: expectedSha256,
+            expectedDestination: LocalFileVersion.read(at: destinationURL), onProgress: onProgress
+        )
+    }
+
+    @discardableResult
+    func downloadFileSafely(
+        remoteId: String,
+        destinationURL: URL,
+        expectedSha256: String?,
+        expectedDestination: LocalFileVersion?,
+        beforePublish: (@Sendable () async throws -> Void)? = nil,
+        onProgress: (@Sendable (Int64) -> Void)? = nil
+    ) async throws -> LocalFileVersion {
+        guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
+            throw DriveError.fileModifiedDuringUpload(path: destinationURL.path)
+        }
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         components.queryItems = [
@@ -682,6 +668,12 @@ public final class DriveClient: Sendable {
         await rateLimiter.acquire()
         let tempURL = destinationURL.deletingLastPathComponent()
             .appendingPathComponent(".tmp_\(UUID().uuidString)")
+        var publishedSuccessfully = false
+        defer {
+            if !publishedSuccessfully {
+                try? FileManager.default.removeItem(at: tempURL)
+            }
+        }
 
         let (asyncBytes, response) = try await session.bytes(for: req)
         guard let http = response as? HTTPURLResponse else {
@@ -696,6 +688,7 @@ public final class DriveClient: Sendable {
 
         FileManager.default.createFile(atPath: tempURL.path, contents: nil)
         let fileHandle = try FileHandle(forWritingTo: tempURL)
+        defer { try? fileHandle.close() }
 
         var ctx = CC_SHA256_CTX()
         CC_SHA256_Init(&ctx)
@@ -728,17 +721,10 @@ public final class DriveClient: Sendable {
             throw DriveError.checksumMismatch(expected: expected, actual: actualSha256)
         }
 
-        // 原子替换目标路径（优先移动旧文件至废纸篓）
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            var trashURL: NSURL?
-            if (try? FileManager.default.trashItem(at: destinationURL, resultingItemURL: &trashURL)) != nil {
-                try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-            } else {
-                _ = try FileManager.default.replaceItemAt(destinationURL, withItemAt: tempURL)
-            }
-        } else {
-            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
-        }
+        try await beforePublish?()
+        let published = try LocalFilePublication.publish(tempURL, to: destinationURL, expected: expectedDestination)
+        publishedSuccessfully = true
+        return published
     }
 
     // MARK: - Changes 增量变更

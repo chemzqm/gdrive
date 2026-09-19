@@ -1,0 +1,130 @@
+import Foundation
+import Testing
+import os
+@testable import GDrive
+
+private final class PublicationURLProtocol: URLProtocol, @unchecked Sendable {
+    static let requests = OSAllocatedUnfairLock(initialState: 0)
+    static let content = Data(repeating: 0x72, count: 65_544)
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        Self.requests.withLock { $0 += 1 }
+        client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.content)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+@Suite("Stable transfer inputs and local publication (A11)", .serialized)
+struct PublicationSafetyTests {
+    private func client(in directory: URL) throws -> DriveClient {
+        let credentials = directory.appendingPathComponent("auth.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(AuthData(clientId: "test", accessToken: "test", expiresAt: Date().addingTimeInterval(3600))).write(to: credentials)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PublicationURLProtocol.self]
+        return DriveClient(auth: try Auth(path: credentials.path), session: URLSession(configuration: configuration))
+    }
+
+    @Test("Unsupported remote overwrites fail before any request")
+    func blocksOverwrite() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-block-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = try client(in: directory)
+        PublicationURLProtocol.requests.withLock { $0 = 0 }
+        do {
+            _ = try await client.updateMultipart(remoteId: "existing", content: Data(), expectedSha256: "unused")
+            Issue.record("Unconditional overwrite was allowed")
+        } catch DriveError.unsafeOverwrite { }
+        do {
+            _ = try await client.initiateResumableUpdate(remoteId: "existing", totalBytes: 9 * 1024 * 1024)
+            Issue.record("Unconditional resumable update was allowed")
+        } catch DriveError.unsafeOverwrite { }
+        #expect(PublicationURLProtocol.requests.withLock { $0 } == 0)
+    }
+
+    @Test("A modification during streaming download survives publication and temporary cleanup")
+    func downloadRace() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-download-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        try Data("original".utf8).write(to: destination)
+        let newer = Data("concurrent local edit".utf8)
+        let client = try client(in: directory)
+        let changed = OSAllocatedUnfairLock(initialState: false)
+        do {
+            try await client.downloadFile(remoteId: "remote", destinationURL: destination,
+                expectedSha256: SyncEngine.computeSha256(of: PublicationURLProtocol.content), onProgress: { _ in
+                    changed.withLock { done in
+                        if !done {
+                            do { try newer.write(to: destination) } catch { Issue.record(error) }
+                            done = true
+                        }
+                    }
+                })
+            Issue.record("Changed destination was replaced")
+        } catch DriveError.fileModifiedDuringUpload { }
+        #expect(try Data(contentsOf: destination) == newer)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).allSatisfy { !$0.hasPrefix(".tmp_") })
+    }
+
+    @Test("Captured small and large inputs do not follow later source writes", arguments: [12, 9 * 1024 * 1024])
+    func stableInput(size: Int) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-input-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let source = directory.appendingPathComponent("source")
+        let original = Data(repeating: 0x41, count: size)
+        try original.write(to: source)
+        let input = try StableUploadInput.capture(at: source)
+        let handle = try FileHandle(forWritingTo: source)
+        try handle.write(contentsOf: Data(repeating: 0x42, count: size))
+        try handle.close()
+        #expect(input.sha256 == SyncEngine.computeSha256(of: original))
+        #expect(try (input.data ?? Data(contentsOf: input.fileURL)) == original)
+        #expect(throws: (any Error).self) { try input.version.validate(at: source) }
+    }
+
+    @Test("Download publication rejects changed, replaced and newly created destinations", arguments: ["changed", "replaced", "created"])
+    func rejectsStaleDestination(kind: String) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-publish-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        let download = directory.appendingPathComponent("download")
+        if kind != "created" { try Data("original".utf8).write(to: destination) }
+        let expected = try LocalFileVersion.read(at: destination)
+        if kind == "replaced" { try FileManager.default.removeItem(at: destination) }
+        let newer = Data("new local version".utf8)
+        try newer.write(to: destination)
+        try Data("remote version".utf8).write(to: download)
+        #expect(throws: (any Error).self) {
+            try LocalFilePublication.publish(download, to: destination, expected: expected)
+        }
+        #expect(try Data(contentsOf: destination) == newer)
+        #expect(FileManager.default.fileExists(atPath: download.path))
+    }
+
+    @Test("Unchanged destination publishes the downloaded inode", arguments: [false, true])
+    func publishesAtomically(existing: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-publish-ok-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        let download = directory.appendingPathComponent("download")
+        if existing { try Data("original".utf8).write(to: destination) }
+        let expected = try LocalFileVersion.read(at: destination)
+        let content = Data("remote version".utf8)
+        try content.write(to: download)
+        let inode = try #require(try LocalFileVersion.read(at: download)).inode
+        let published = try LocalFilePublication.publish(download, to: destination, expected: expected)
+        #expect(published.inode == inode)
+        #expect(try Data(contentsOf: destination) == content)
+        #expect(!FileManager.default.fileExists(atPath: download.path))
+    }
+}
