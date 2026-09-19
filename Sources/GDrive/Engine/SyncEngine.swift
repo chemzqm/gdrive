@@ -16,6 +16,8 @@ public struct SyncStats: Sendable {
     public var bytesDownloaded: Int64 = 0
     public var filesDeleted: Int = 0
     public var conflictsResolved: Int = 0
+    /// Durable remote observations/pages still awaiting a later reconcile round.
+    public var remoteWorkPending: Int = 0
     public var filesFailed: Int = 0
     public var elapsedSeconds: Double = 0
 }
@@ -296,22 +298,7 @@ public final class SyncEngine: Sendable {
             return (rId, rItemId)
         }
 
-        // 获取并持久化远端 Changes 起始 token C0 (§3.3)
-        if let startPageToken = try? await client.getStartPageToken() {
-            try? await store.write { conn in
-                let cursorStmt = try conn.cachedStatement("""
-                INSERT INTO cursors (
-                    root_id, account_id, cursor_kind, token_value, updated_at
-                ) VALUES (?, 'default', 'drive_changes', ?, ?)
-                ON CONFLICT (root_id, cursor_kind) DO UPDATE SET token_value = excluded.token_value, updated_at = excluded.updated_at;
-                """)
-                cursorStmt.bindInt64(rootId, at: 1)
-                cursorStmt.bindText(startPageToken, at: 2)
-                cursorStmt.bindDouble(now, at: 3)
-                _ = try cursorStmt.step()
-                cursorStmt.reset()
-            }
-        }
+        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
 
         // 2. 初始化目录异步唤醒调度器（根目录预设为已就绪）
         let directoryTracker = DirectoryTracker(remoteRootId: remoteRootId)
@@ -994,6 +981,13 @@ public final class SyncEngine: Sendable {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
         }
 
+        let rootExists = try await store.read { conn in
+            let q = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
+            defer { q.reset() }
+            q.bindText(remoteRootId, at: 1)
+            return try q.step()
+        }
+
         let now = Date().timeIntervalSince1970
 
         // 1. 注册或获取 Root 记录与根目录项
@@ -1043,22 +1037,7 @@ public final class SyncEngine: Sendable {
             return (rId, rItemId)
         }
 
-        // 获取并持久化远端 Changes 起始 token C0 (§3.3)
-        if let startPageToken = try? await client.getStartPageToken() {
-            try? await store.write { conn in
-                let cursorStmt = try conn.cachedStatement("""
-                INSERT INTO cursors (
-                    root_id, account_id, cursor_kind, token_value, updated_at
-                ) VALUES (?, 'default', 'drive_changes', ?, ?)
-                ON CONFLICT (root_id, cursor_kind) DO UPDATE SET token_value = excluded.token_value, updated_at = excluded.updated_at;
-                """)
-                cursorStmt.bindInt64(rootId, at: 1)
-                cursorStmt.bindText(startPageToken, at: 2)
-                cursorStmt.bindDouble(now, at: 3)
-                _ = try cursorStmt.step()
-                cursorStmt.reset()
-            }
-        }
+        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
 
         let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
         let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)
@@ -1667,6 +1646,11 @@ public final class SyncEngine: Sendable {
             }
         }
 
+        let remoteChanges = RemoteChanges(store: store, client: client, rootID: rootId,
+            remoteRootID: remoteRootId, rootURL: rootURL)
+        try await remoteChanges.consume()
+        let remoteGate = try await remoteChanges.gate()
+
         // -------------------------------------------------------------
         // 1. 构建目录拓扑映射 (在内存中快速维护，O(1) 路径与父项解析)
         // -------------------------------------------------------------
@@ -1760,268 +1744,6 @@ public final class SyncEngine: Sendable {
                         dirContext.register(itemId: dir.id, parentItemId: rootItemId, name: dir.name, remoteId: dir.remoteId)
                     }
                     break
-                }
-            }
-        }
-
-        // -------------------------------------------------------------
-        // 2. 消费 Google Drive Changes 增量变更 feed (§9.4)
-        // -------------------------------------------------------------
-        var changeToken: String? = try await store.read { conn in
-            let stmt = try conn.cachedStatement("""
-            SELECT token_value FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes' AND is_valid = 1;
-            """)
-            stmt.bindInt64(rootId, at: 1)
-            defer { stmt.reset() }
-            if try stmt.step(), let token = stmt.columnText(at: 0) {
-                return token
-            }
-            return nil
-        }
-
-        if changeToken == nil {
-            changeToken = try? await client.getStartPageToken()
-        }
-
-        if let currentToken = changeToken {
-            var activeToken = currentToken
-            var hasMorePages = true
-            var latestNewStartToken: String? = nil
-
-            while hasMorePages {
-                do {
-                    let page = try await client.listChanges(pageToken: activeToken)
-                    for change in page.changes {
-                        let fileId = change.fileId
-                        if fileId == remoteRootId {
-                            if change.file?.trashed == true || change.removed == true {
-                                let reason = change.removed == true ? "removed" : "trashed"
-                                self.logger.error("增量变更检测到远端同步根目录被移除或移入回收站 (\(reason)): \(fileId)，终止同步以保护本地文件")
-                                throw SyncEngineError.remoteRootLost(remoteId: fileId, reason: reason)
-                            }
-                            // 远端根目录自身的普通元数据更新无需作为子项处理
-                            continue
-                        }
-                        if change.file?.trashed == true {
-                            // 远端明确移入回收站
-                            try await store.batchWrite { conn in
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET
-                                    remote_status = 'trashed',
-                                    remote_generation = remote_generation + 1,
-                                    dirty_generation = dirty_generation + 1,
-                                    phase = 'ready',
-                                    updated_at = ?
-                                WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
-                                """)
-                                stmt.bindDouble(now, at: 1)
-                                stmt.bindInt64(rootId, at: 2)
-                                stmt.bindText(fileId, at: 3)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                        } else if change.removed == true {
-                            // 远端项失去访问权限或已被移除 (removed != trashed)
-                            // 遵循官方契约：removed 包括失去访问权限，绝不能单凭此字段判定文件已被用户删除而触发本地误删
-                            // 标记为 remote_status = 'unknown', phase = 'blocked'，绝不触发本地删除
-                            self.logger.info("远端项访问权限失效或被移除 (removed=true) [\(fileId)]，保护本地文件副本不予删除")
-                            try await store.batchWrite { conn in
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET
-                                    remote_status = 'unknown',
-                                    phase = 'blocked',
-                                    dirty_generation = 0,
-                                    updated_at = ?
-                                WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
-                                """)
-                                stmt.bindDouble(now, at: 1)
-                                stmt.bindInt64(rootId, at: 2)
-                                stmt.bindText(fileId, at: 3)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                        } else if let file = change.file {
-                            // 检查该远端项的父目录是否属于本同步树
-                            let parentRemoteId = file.parents?.first ?? ""
-                            guard let parentItemId = dirContext.getItemId(byRemote: parentRemoteId) else {
-                                continue
-                            }
-
-                            // 检查该 remote_file_id 是否已在本地数据库中存在
-                            let existingItem: (itemId: Int64, parentId: Int64, name: String, isDir: Bool)? = try await store.read { conn in
-                                let stmt = try conn.cachedStatement("""
-                                SELECT item_id, parent_id, name, entry_kind
-                                FROM items
-                                WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
-                                """)
-                                stmt.bindInt64(rootId, at: 1)
-                                stmt.bindText(file.id, at: 2)
-                                defer { stmt.reset() }
-                                if try stmt.step(),
-                                   let iId = stmt.columnInt64(at: 0),
-                                   let pId = stmt.columnInt64(at: 1),
-                                   let nm = stmt.columnText(at: 2),
-                                   let kind = stmt.columnText(at: 3) {
-                                    return (iId, pId, nm, kind == "directory")
-                                }
-                                return nil
-                            }
-
-                            if let existing = existingItem {
-                                // 远端已存在对象：检查是否发生重命名或移动
-                                let isRenamedOrMoved = (existing.name != file.name || existing.parentId != parentItemId)
-                                if isRenamedOrMoved {
-                                    let oldParentRel = dirContext.getRelPath(for: existing.parentId) ?? ""
-                                    let oldRel = oldParentRel.isEmpty ? existing.name : "\(oldParentRel)/\(existing.name)"
-                                    let oldURL = rootURL.appendingPathComponent(oldRel)
-
-                                    let newParentRel = dirContext.getRelPath(for: parentItemId) ?? ""
-                                    let newRel = newParentRel.isEmpty ? file.name : "\(newParentRel)/\(file.name)"
-                                    let newURL = rootURL.appendingPathComponent(newRel)
-
-                                    if FileManager.default.fileExists(atPath: oldURL.path) {
-                                        try? FileManager.default.createDirectory(at: newURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                                        try? FileManager.default.moveItem(at: oldURL, to: newURL)
-                                    }
-
-                                    if existing.isDir {
-                                        dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: file.name, remoteId: file.id)
-                                    }
-                                }
-
-                                try await store.batchWrite { conn in
-                                    let stmt = try conn.cachedStatement("""
-                                    UPDATE items SET
-                                        parent_id = ?,
-                                        name = ?,
-                                        remote_name = ?,
-                                        remote_sha256 = ?,
-                                        remote_size = ?,
-                                        remote_status = 'present',
-                                        remote_generation = remote_generation + 1,
-                                        dirty_generation = dirty_generation + 1,
-                                        phase = 'ready',
-                                        updated_at = ?
-                                    WHERE item_id = ?;
-                                    """)
-                                    stmt.bindInt64(parentItemId, at: 1)
-                                    stmt.bindText(file.name, at: 2)
-                                    stmt.bindText(file.name, at: 3)
-                                    stmt.bindText(file.sha256Checksum, at: 4)
-                                    stmt.bindInt64(file.sizeBytes, at: 5)
-                                    stmt.bindDouble(now, at: 6)
-                                    stmt.bindInt64(existing.itemId, at: 7)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                }
-                            } else if file.isDirectory {
-                                // 远端全新目录
-                                let parentRelPath = dirContext.getRelPath(for: parentItemId) ?? ""
-                                let relPath = parentRelPath.isEmpty ? file.name : "\(parentRelPath)/\(file.name)"
-                                let localDirURL = rootURL.appendingPathComponent(relPath)
-                                try FileManager.default.createDirectory(at: localDirURL, withIntermediateDirectories: true)
-
-                                let dItemId: Int64 = try await store.write { conn in
-                                    let stmt = try conn.cachedStatement("""
-                                    INSERT INTO items (
-                                        root_id, parent_id, name, entry_kind, remote_file_id,
-                                        phase, created_at, updated_at
-                                    ) VALUES (?, ?, ?, 'directory', ?, 'committed', ?, ?)
-                                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                    DO UPDATE SET remote_file_id = excluded.remote_file_id, updated_at = excluded.updated_at;
-                                    """)
-                                    stmt.bindInt64(rootId, at: 1)
-                                    stmt.bindInt64(parentItemId, at: 2)
-                                    stmt.bindText(file.name, at: 3)
-                                    stmt.bindText(file.id, at: 4)
-                                    stmt.bindDouble(now, at: 5)
-                                    stmt.bindDouble(now, at: 6)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-
-                                    let q = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;")
-                                    q.bindInt64(rootId, at: 1)
-                                    q.bindInt64(parentItemId, at: 2)
-                                    q.bindText(file.name, at: 3)
-                                    guard try q.step(), let id = q.columnInt64(at: 0) else {
-                                        throw NSError(domain: "SyncEngine", code: 21, userInfo: nil)
-                                    }
-                                    q.reset()
-                                    return id
-                                }
-                                dirContext.register(itemId: dItemId, parentItemId: parentItemId, name: file.name, remoteId: file.id)
-                            } else {
-                                // 远端全新文件
-                                try await store.batchWrite { conn in
-                                    let stmt = try conn.cachedStatement("""
-                                    INSERT INTO items (
-                                        root_id, parent_id, name, entry_kind, remote_file_id,
-                                        remote_name, remote_sha256, remote_size, remote_status,
-                                        local_status,
-                                        remote_generation, phase, dirty_generation,
-                                        created_at, updated_at
-                                    ) VALUES (
-                                        ?, ?, ?, 'file', ?,
-                                        ?, ?, ?, 'present',
-                                        'absent',
-                                        1, 'ready', 1,
-                                        ?, ?
-                                    )
-                                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                    DO UPDATE SET
-                                        remote_file_id = excluded.remote_file_id,
-                                        remote_name = excluded.remote_name,
-                                        remote_sha256 = excluded.remote_sha256,
-                                        remote_size = excluded.remote_size,
-                                        remote_status = 'present',
-                                        remote_generation = items.remote_generation + 1,
-                                        dirty_generation = items.dirty_generation + 1,
-                                        phase = 'ready',
-                                        updated_at = excluded.updated_at;
-                                    """)
-                                    stmt.bindInt64(rootId, at: 1)
-                                    stmt.bindInt64(parentItemId, at: 2)
-                                    stmt.bindText(file.name, at: 3)
-                                    stmt.bindText(file.id, at: 4)
-                                    stmt.bindText(file.name, at: 5)
-                                    stmt.bindText(file.sha256Checksum, at: 6)
-                                    stmt.bindInt64(file.sizeBytes, at: 7)
-                                    stmt.bindDouble(now, at: 8)
-                                    stmt.bindDouble(now, at: 9)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                }
-                            }
-                        }
-                    }
-
-                    if let next = page.nextPageToken {
-                        activeToken = next
-                    } else {
-                        hasMorePages = false
-                        latestNewStartToken = page.newStartPageToken
-                    }
-                } catch let error as SyncEngineError {
-                    throw error
-                } catch {
-                    self.logger.warning("获取 Changes 失败: \(error)")
-                    hasMorePages = false
-                }
-            }
-
-            // 更新 Changes 游标
-            if let finalToken = latestNewStartToken {
-                try await store.write { conn in
-                    let stmt = try conn.cachedStatement("""
-                    INSERT INTO cursors (root_id, account_id, cursor_kind, token_value, updated_at)
-                    VALUES (?, 'default', 'drive_changes', ?, ?)
-                    ON CONFLICT (root_id, cursor_kind) DO UPDATE SET token_value = excluded.token_value, updated_at = excluded.updated_at;
-                    """)
-                    stmt.bindInt64(rootId, at: 1)
-                    stmt.bindText(finalToken, at: 2)
-                    stmt.bindDouble(now, at: 3)
-                    _ = try stmt.step()
-                    stmt.reset()
                 }
             }
         }
@@ -2138,9 +1860,16 @@ public final class SyncEngine: Sendable {
 
                 if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") { continue }
 
+                if remoteGate.blocks(relPath) { continue }
                 let name = (relPath as NSString).lastPathComponent
                 let parentRel = (relPath as NSString).deletingLastPathComponent
                 let parentRelNormalized = (parentRel == "." || parentRel.isEmpty) ? "" : parentRel
+
+                if !remoteGate.paths.isEmpty,
+                   dirContext.getItemId(byRelPath: parentRelNormalized) == nil,
+                   try remoteGate.blocksLocalAncestors(URL(fileURLWithPath: fullPath).deletingLastPathComponent(), root: rootURL) {
+                    continue
+                }
 
                 if record.type == .directory {
                     let parentItemId = dirContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemId
@@ -2168,6 +1897,11 @@ public final class SyncEngine: Sendable {
                         return nil
                     }
 
+                    if let existing = existingDir,
+                       remoteGate.blocks(dirContext.getRelPath(for: existing.itemId) ?? "") {
+                        remoteGate.addAlias(relPath)
+                        continue
+                    }
                     if let existing = existingDir, (existing.name != name || existing.parentId != parentItemId) {
                         // 本地目录发生重命名或移动
                         seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
@@ -2280,6 +2014,11 @@ public final class SyncEngine: Sendable {
                         return nil
                     }
 
+                    if let existing = existingFile {
+                        let parentPath = dirContext.getRelPath(for: existing.parentId) ?? ""
+                        let oldPath = parentPath.isEmpty ? existing.name : "\(parentPath)/\(existing.name)"
+                        if remoteGate.blocks(oldPath) { continue }
+                    }
                     if let existing = existingFile, (existing.name != name || existing.parentId != parentItemId) {
                         // 本地文件发生重命名或移动
                         seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
@@ -2400,7 +2139,9 @@ public final class SyncEngine: Sendable {
                 if let iId = stmt.columnInt64(at: 0),
                    let pId = stmt.columnInt64(at: 1),
                    let name = stmt.columnText(at: 2) {
-                    if !seenTracker.contains(parentId: pId, name: name) {
+                    let parent = dirContext.getRelPath(for: pId) ?? ""
+                    let path = parent.isEmpty ? name : "\(parent)/\(name)"
+                    if !remoteGate.blocks(path) && !seenTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }
                 }
@@ -2418,7 +2159,9 @@ public final class SyncEngine: Sendable {
                 if let iId = dirStmt.columnInt64(at: 0),
                    let pId = dirStmt.columnInt64(at: 1),
                    let name = dirStmt.columnText(at: 2) {
-                    if !seenDirTracker.contains(parentId: pId, name: name) {
+                    let parent = dirContext.getRelPath(for: pId) ?? ""
+                    let path = parent.isEmpty ? name : "\(parent)/\(name)"
+                    if !remoteGate.blocks(path) && !seenDirTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }
                 }
@@ -2565,8 +2308,13 @@ public final class SyncEngine: Sendable {
         // 5A. 阶段一：先对所有文件项执行 Reconciler 裁决与调度执行 (§9.1, A04)
         // 确保所有文件级上传、下载、修改保留与删除动作彻底完成，作为目录删除的屏障
         // -------------------------------------------------------------
-        let fileItems = dirtyItems.filter { $0.entryKind == "file" }
-        let dirItems = dirtyItems.filter { $0.entryKind == "directory" }
+        let eligibleItems = dirtyItems.filter { item in
+            let parent = dirContext.getRelPath(for: item.parentId) ?? ""
+            let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
+            return !remoteGate.blocks(path)
+        }
+        let fileItems = eligibleItems.filter { $0.entryKind == "file" }
+        let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
 
         // 恢复上次在请求前已持久化、但尚未提交完成回执的目录创建。
         // createDirectory 使用相同预生成 ID 重试；若服务端上次已成功，DriveClient 会在 409 后核验同一对象。
@@ -3268,6 +3016,12 @@ public final class SyncEngine: Sendable {
                 cont.resume()
             }
         }
+
+        // Local ready work finishes before any subtree enumeration request is issued.
+        let enumerated = try await remoteChanges.enumeratePending(limit: maxConcurrency)
+        // Even an empty completed listing releases local paths which were gated earlier
+        // in this round. Schedule one follow-up discovery instead of claiming convergence.
+        stats.remoteWorkPending = max(try await remoteChanges.pendingCount(), enumerated ? 1 : 0)
 
         try await store.flush()
         try await store.checkpoint()

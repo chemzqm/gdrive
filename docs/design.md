@@ -119,6 +119,11 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 ### 2.4 同步引擎与调度层 (`Sources/GDrive/Engine/`)
 
 * **`SyncEngine.swift`**：
+  * **Changes 持久化（A13）**：每页观察、dirty 和游标原子落库，未知归属事件保留在
+    `remote_change_inbox`；移出范围的对象保留本地内容并阻止反向写回。新/移入目录
+    通过持久化分页任务补列，安排在已就绪传输之后。缺失游标先捕获 C0，再重建观察。
+    `SyncStats.remoteWorkPending` 非零时由后续同步轮次继续处理，不能视为全部收敛。
+    验证与调用约定见 [A13 验收记录](a13-validation.md)。
   * **冲突恢复（A12）**：文件变动前以 `conflict_operations` 持久化双方摘要、发布路径、
     副本 item/远端 ID 和观察代次。先保留并上传本地副本，再安全发布远端原文件，最后
     原子提交两个共同基线与完成回执。pending 在下轮扫描前恢复，失败不计已解决。

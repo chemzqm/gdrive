@@ -567,6 +567,9 @@ struct BootstrapResumeSafetyTests {
                 1, 'default', '\(localRootDir.path)', 1, 1,
                 'mock_remote_root', 'localToRemoteEmpty', 'freshCreated', 1, 1
             );
+            -- A resumable/bootstrap intent starts after its durable Changes boundary.
+            INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
+            VALUES (1, 'default', 'drive_changes', 'token_1', 1);
             INSERT INTO items (
                 item_id, root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
             ) VALUES (
@@ -780,6 +783,9 @@ struct BootstrapResumeSafetyTests {
                 1, 'default', '\(localRootDir.path)', 1, 1,
                 'mock_remote_root', 'localToRemoteEmpty', 'freshCreated', 1, 1
             );
+            -- A resumable/bootstrap intent starts after its durable Changes boundary.
+            INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
+            VALUES (1, 'default', 'drive_changes', 'token_1', 1);
             INSERT INTO items (
                 item_id, root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
             ) VALUES (

@@ -188,6 +188,11 @@ struct DirectoryBarrierTests {
             return (response, "{}".data(using: .utf8)!)
         }
 
+        // These cases exercise an established baseline; a missing cursor now correctly
+        // requests index reconstruction, covered separately by ChangesRecoveryTests.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
@@ -332,6 +337,11 @@ struct DirectoryBarrierTests {
             return (response, "{}".data(using: .utf8)!)
         }
 
+        // These cases exercise an established baseline; a missing cursor now correctly
+        // requests index reconstruction, covered separately by ChangesRecoveryTests.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
@@ -501,6 +511,11 @@ struct DirectoryBarrierTests {
             return (response, "{}".data(using: .utf8)!)
         }
 
+        // These cases exercise an established baseline; a missing cursor now correctly
+        // requests index reconstruction, covered separately by ChangesRecoveryTests.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
@@ -662,6 +677,11 @@ struct DirectoryBarrierTests {
             return (response, "{}".data(using: .utf8)!)
         }
 
+        // These cases exercise an established baseline; a missing cursor now correctly
+        // requests index reconstruction, covered separately by ChangesRecoveryTests.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
@@ -817,6 +837,11 @@ struct DirectoryBarrierTests {
             return (response, "{}".data(using: .utf8)!)
         }
 
+        // These cases exercise an established baseline; a missing cursor now correctly
+        // requests index reconstruction, covered separately by ChangesRecoveryTests.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 

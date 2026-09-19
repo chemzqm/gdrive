@@ -259,3 +259,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_pending_item
     ON conflict_operations(item_id) WHERE state = 'pending';
 CREATE INDEX IF NOT EXISTS idx_conflict_pending_root
     ON conflict_operations(root_id) WHERE state = 'pending';
+
+-- A13: a cursor acknowledges durable observations, never discarded events.
+CREATE TABLE IF NOT EXISTS remote_change_inbox (
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    remote_id TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    scan_id TEXT,
+    attempted_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(root_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_inbox_retry ON remote_change_inbox(root_id, attempted_at);
+CREATE TABLE IF NOT EXISTS remote_directory_scans (
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    remote_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL,
+    page_token TEXT,
+    state TEXT NOT NULL CHECK(state IN ('pending', 'complete')),
+    PRIMARY KEY(root_id, remote_id)
+);
+CREATE INDEX IF NOT EXISTS idx_remote_scans_pending ON remote_directory_scans(root_id) WHERE state = 'pending';
+CREATE TABLE IF NOT EXISTS remote_scope_exclusions (
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
+    PRIMARY KEY(root_id, item_id)
+);

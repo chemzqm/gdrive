@@ -588,44 +588,42 @@ public final class DriveClient: Sendable {
     /// 列举指定父目录下的直接子项（自动处理分页）
     public func listChildren(parentId: String) async throws -> [DriveFile] {
         var items: [DriveFile] = []
-        var pageToken: String?
-
-        while true {
-            let token = try await getValidToken()
-            var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
-            var queryItems = [
-                URLQueryItem(name: "q", value: "'\(parentId)' in parents and trashed = false"),
-                URLQueryItem(name: "fields", value: "nextPageToken,files(\(Self.fields))"),
-                URLQueryItem(name: "pageSize", value: "1000"),
-                URLQueryItem(name: "supportsAllDrives", value: "true"),
-                URLQueryItem(name: "includeItemsFromAllDrives", value: "true")
-            ]
-            if let pageToken {
-                queryItems.append(URLQueryItem(name: "pageToken", value: pageToken))
-            }
-            components.queryItems = queryItems
-
-            var req = URLRequest(url: components.url!)
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-
-            let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
-
-            struct ListFilesResponse: Decodable {
-                let nextPageToken: String?
-                let files: [DriveFile]
-            }
-
-            let decoded = try JSONDecoder().decode(ListFilesResponse.self, from: data)
-            items.append(contentsOf: decoded.files)
-
-            if let next = decoded.nextPageToken, !next.isEmpty {
-                pageToken = next
-            } else {
-                break
-            }
-        }
-
+        var token: String?
+        repeat {
+            let page = try await listChildrenPage(parentId: parentId, pageToken: token)
+            items.append(contentsOf: page.files)
+            token = page.nextPageToken
+        } while token != nil
         return items
+    }
+
+    struct ChildrenPage: Decodable, Sendable {
+        let nextPageToken: String?
+        let files: [DriveFile]
+        let incompleteSearch: Bool?
+    }
+
+    /// One durable enumeration unit. Partial search results are never evidence of absence.
+    func listChildrenPage(parentId: String, pageToken: String? = nil) async throws -> ChildrenPage {
+        let token = try await getValidToken()
+        var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files")!
+        var query = [
+            URLQueryItem(name: "q", value: "'\(parentId)' in parents and trashed = false"),
+            URLQueryItem(name: "fields", value: "nextPageToken,incompleteSearch,files(\(Self.fields))"),
+            URLQueryItem(name: "pageSize", value: "1000"),
+            URLQueryItem(name: "supportsAllDrives", value: "true"),
+            URLQueryItem(name: "includeItemsFromAllDrives", value: "true")
+        ]
+        if let pageToken { query.append(URLQueryItem(name: "pageToken", value: pageToken)) }
+        components.queryItems = query
+        var req = URLRequest(url: components.url!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
+        let page = try JSONDecoder().decode(ChildrenPage.self, from: data)
+        guard page.incompleteSearch != true, page.nextPageToken != "" else {
+            throw DriveError.invalidResponse(message: "远端目录列举不完整: \(parentId)")
+        }
+        return page
     }
 
     // MARK: - 文件下载 (Download)

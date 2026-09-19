@@ -55,6 +55,9 @@ struct DurableIntentTests {
             root.bindText(remoteID, at: 2)
             _ = try root.step()
             let rootID = conn.lastInsertRowId
+            // A persisted baseline includes its Changes cursor; missing-cursor recovery
+            // has a separate reconstruction contract and dedicated coverage.
+            try conn.execute("INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) VALUES (\(rootID), 'default', 'drive_changes', 'start', 1);")
 
             let item = try conn.prepare("""
             INSERT INTO items (

@@ -178,6 +178,10 @@ struct FailureStateSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
         }
 
+        // Established-baseline fixtures include their durable Changes boundary.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_1', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while updateMetadata fails
@@ -358,6 +362,10 @@ struct FailureStateSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
         }
 
+        // Established-baseline fixtures include their durable Changes boundary.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_1', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // A failed rename must preserve both the mapping and verified content metadata.
@@ -509,6 +517,10 @@ struct FailureStateSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
         }
 
+        // Established-baseline fixtures include their durable Changes boundary.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_1', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. First sync with trash failing
@@ -615,6 +627,10 @@ struct FailureStateSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
         }
 
+        // Established-baseline fixtures include their durable Changes boundary.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_1', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while createDirectory fails
@@ -739,6 +755,10 @@ struct FailureStateSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, "{}".data(using: .utf8)!)
         }
 
+        // Established-baseline fixtures include their durable Changes boundary.
+        try await store.write { conn in
+            try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_1', 100 FROM roots;")
+        }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync when ID generation fails
