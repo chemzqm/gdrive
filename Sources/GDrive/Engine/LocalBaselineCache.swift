@@ -57,7 +57,15 @@ public final class LocalBaselineCache: @unchecked Sendable {
             let stmt = try conn.cachedStatement("""
             SELECT item_id, parent_id, name, remote_file_id, local_device, local_inode, local_mtime, local_size, base_sha256
             FROM items
-            WHERE root_id = ? AND entry_kind = 'file' AND is_tombstone = 0 AND local_inode IS NOT NULL;
+            WHERE root_id = ?
+              AND entry_kind = 'file'
+              AND is_tombstone = 0
+              AND local_inode IS NOT NULL
+              AND phase = 'committed'
+              AND base_sha256 IS NOT NULL
+              AND dirty_generation = 0
+              AND remote_status = 'present'
+              AND remote_file_id IS NOT NULL;
             """)
             stmt.bindInt64(rootId, at: 1)
 

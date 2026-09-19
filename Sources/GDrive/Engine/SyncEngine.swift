@@ -111,23 +111,36 @@ public final class SyncEngine: Sendable {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
         // 1. 检查 SQLite 是否已存在处于激活状态的同步根
-        let existingRootId: Int64? = try await store.read { conn in
+        let existingRoot: (rootId: Int64, bootstrapState: String, initialDir: String)? = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
-            SELECT root_id FROM roots
+            SELECT root_id, bootstrap_state, initial_sync_direction FROM roots
             WHERE local_root_path = ? AND remote_root_id = ? AND is_active = 1;
             """)
             stmt.bindText(resolvedLocalPath, at: 1)
             stmt.bindText(remoteFolderId, at: 2)
             defer { stmt.reset() }
             if try stmt.step() {
-                return stmt.columnInt64(at: 0)
+                return (
+                    stmt.columnInt64(at: 0) ?? 0,
+                    stmt.columnText(at: 1) ?? "freshCreated",
+                    stmt.columnText(at: 2) ?? "localToRemoteEmpty"
+                )
             }
             return nil
         }
 
-        if existingRootId != nil {
-            logger.info("[Sync] 已有共同同步基线，自动执行增量双向同步: \(resolvedLocalPath) <-> \(remoteFolderId)")
-            return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
+        if let existing = existingRoot {
+            if existing.bootstrapState == "existingKnown" {
+                logger.info("[Sync] 已有共同同步基线，自动执行增量双向同步: \(resolvedLocalPath) <-> \(remoteFolderId)")
+                return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
+            } else {
+                logger.info("[Sync] 存在未完成的初始化基线 (bootstrapState: \(existing.bootstrapState))，恢复初始化流程...")
+                if existing.initialDir == "remoteToLocalEmpty" {
+                    return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress)
+                } else {
+                    return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
+                }
+            }
         }
 
         // 2. 首次同步：自动探测本地与远端目录真实状态
@@ -325,6 +338,52 @@ public final class SyncEngine: Sendable {
         }
         let localDirMap = LocalDirMap(rootItemId: rootItemId)
 
+        // 预先从 SQLite 加载已知的所有子目录映射，恢复 bootstrap 或重跑时坚决复用，避免盲目重复创建
+        let existingDirs: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = try await store.read { conn in
+            let stmt = try conn.cachedStatement("""
+            SELECT item_id, parent_id, name, remote_file_id
+            FROM items
+            WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
+            """)
+            stmt.bindInt64(rootId, at: 1)
+            defer { stmt.reset() }
+            var list: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = []
+            while try stmt.step() {
+                if let id = stmt.columnInt64(at: 0),
+                   let pId = stmt.columnInt64(at: 1),
+                   let name = stmt.columnText(at: 2),
+                   let rId = stmt.columnText(at: 3) {
+                    list.append((id, pId, name, rId))
+                }
+            }
+            return list
+        }
+
+        var dirPathsById: [Int64: String] = [rootItemId: ""]
+        var registered = Set<Int64>([rootItemId])
+        var remainingDirs = existingDirs
+        var topoProgress = true
+        while !remainingDirs.isEmpty && topoProgress {
+            topoProgress = false
+            remainingDirs.removeAll { dir in
+                if registered.contains(dir.parentId), let parentPath = dirPathsById[dir.parentId] {
+                    let relPath = parentPath.isEmpty ? dir.name : "\(parentPath)/\(dir.name)"
+                    dirPathsById[dir.id] = relPath
+                    localDirMap.set(relPath, id: dir.id)
+                    registered.insert(dir.id)
+                    topoProgress = true
+                    return true
+                }
+                return false
+            }
+        }
+
+        for (id, relPath) in dirPathsById where id != rootItemId {
+            if let dir = existingDirs.first(where: { $0.id == id }) {
+                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: dir.remoteId)
+            }
+        }
+
         // 3. 设置有界并发上传流水线（严格上限 64 并发）
         let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
         let uploadSemaphore = AsyncSemaphore(count: effectiveConcurrency)
@@ -438,7 +497,10 @@ public final class SyncEngine: Sendable {
                     let name = (relPath as NSString).lastPathComponent
 
                     if record.type == .directory {
-                        // 目录处理：排队等待其父目录就绪后立即在远端创建
+                        // 目录处理：若目录已存在且已登记远端 ID，直接跳过远端创建，严防重复创建
+                        if localDirMap.get(relPath) != nil {
+                            continue
+                        }
                         uploadGroup.enter()
                         Task {
                             defer { uploadGroup.leave() }
@@ -569,45 +631,64 @@ public final class SyncEngine: Sendable {
 
                                 let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
 
+                                // 查询该文件是否已在 SQLite 中记录（无论是已 committed 还是未完成的 inFlight）
+                                struct ExistingFileTarget {
+                                    let itemID: Int64
+                                    let remoteID: String?
+                                    let phase: String
+                                    let remoteStatus: String
+                                }
+
+                                let existingTarget: ExistingFileTarget? = try await self.store.read { conn in
+                                    let stmt = try conn.cachedStatement("""
+                                    SELECT item_id, remote_file_id, phase, remote_status
+                                    FROM items
+                                    WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                                    """)
+                                    stmt.bindInt64(rootId, at: 1)
+                                    stmt.bindInt64(parentDirItemId, at: 2)
+                                    stmt.bindText(name, at: 3)
+                                    defer { stmt.reset() }
+                                    if try stmt.step(), let iId = stmt.columnInt64(at: 0) {
+                                        return ExistingFileTarget(
+                                            itemID: iId,
+                                            remoteID: stmt.columnText(at: 1),
+                                            phase: stmt.columnText(at: 2) ?? "discovered",
+                                            remoteStatus: stmt.columnText(at: 3) ?? "unknown"
+                                        )
+                                    }
+                                    return nil
+                                }
+
                                 // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
                                 if fileSize <= limit8MB, let content = smallContent {
-                                    let committedTarget: (itemID: Int64, remoteID: String)? = try await self.store.read { conn in
-                                        let stmt = try conn.cachedStatement("""
-                                        SELECT item_id, remote_file_id
-                                        FROM items
-                                        WHERE root_id = ? AND parent_id = ? AND name = ?
-                                          AND is_tombstone = 0 AND phase = 'committed'
-                                          AND remote_status = 'present' AND remote_file_id IS NOT NULL;
-                                        """)
-                                        stmt.bindInt64(rootId, at: 1)
-                                        stmt.bindInt64(parentDirItemId, at: 2)
-                                        stmt.bindText(name, at: 3)
-                                        defer { stmt.reset() }
-                                        guard try stmt.step(),
-                                              let itemID = stmt.columnInt64(at: 0),
-                                              let remoteID = stmt.columnText(at: 1) else { return nil }
-                                        return (itemID, remoteID)
-                                    }
-
                                     let uploadedFile: DriveFile
                                     let committedItemID: Int64
-                                    if let committedTarget {
-                                        // 已提交对象是内容更新，不创建新的 Drive 对象或 create intent。
+                                    if let existing = existingTarget, let existingRemoteId = existing.remoteID,
+                                       existing.phase == "committed" && existing.remoteStatus == "present" {
+                                        // 已在云端提交的文件发生内容变更：直接调用 updateMultipart 更新远端现有对象，绝对不新建 Drive 对象！
                                         uploadedFile = try await self.client.updateMultipart(
-                                            remoteId: committedTarget.remoteID,
+                                            remoteId: existingRemoteId,
                                             content: content,
                                             expectedSha256: sha256Hex
                                         )
-                                        committedItemID = committedTarget.itemID
+                                        committedItemID = existing.itemID
                                     } else {
-                                        let candidateRemoteID = try await self.idPool.nextId()
+                                        // 新建文件或重跑未竟文件：优先复用既有 remote_file_id，避免重新生成
+                                        let targetRemoteId: String
+                                        if let existingRemoteId = existingTarget?.remoteID {
+                                            targetRemoteId = existingRemoteId
+                                        } else {
+                                            targetRemoteId = try await self.idPool.nextId()
+                                        }
                                         let intent = try await DurableCreateIntentStore.prepareMultipartUpload(
                                             store: self.store,
                                             rootID: rootId,
+                                            itemID: existingTarget?.itemID,
                                             parentItemID: parentDirItemId,
                                             name: name,
                                             targetParentRemoteID: remoteParentId,
-                                            candidateRemoteID: candidateRemoteID,
+                                            candidateRemoteID: targetRemoteId,
                                             device: dev,
                                             inode: ino,
                                             mtime: mtime,
@@ -615,13 +696,34 @@ public final class SyncEngine: Sendable {
                                             sha256: sha256Hex
                                         )
                                         createIntent = intent
-                                        uploadedFile = try await self.client.uploadMultipart(
-                                            name: name,
-                                            parentId: intent.targetParentRemoteID,
-                                            remoteId: intent.targetRemoteID,
-                                            content: content,
-                                            expectedSha256: sha256Hex
-                                        )
+
+                                        do {
+                                            uploadedFile = try await self.client.uploadMultipart(
+                                                name: name,
+                                                parentId: intent.targetParentRemoteID,
+                                                remoteId: intent.targetRemoteID,
+                                                content: content,
+                                                expectedSha256: sha256Hex
+                                            )
+                                        } catch let error as DriveError {
+                                            switch error {
+                                            case .conflict:
+                                                // 远端可能在上次上传尝试中已成功写入该 ID 的元数据，转为更新正文
+                                                uploadedFile = try await self.client.updateMultipart(
+                                                    remoteId: intent.targetRemoteID,
+                                                    content: content,
+                                                    expectedSha256: sha256Hex
+                                                )
+                                            case .serverError(let code, _) where code == 400 || code == 409:
+                                                uploadedFile = try await self.client.updateMultipart(
+                                                    remoteId: intent.targetRemoteID,
+                                                    content: content,
+                                                    expectedSha256: sha256Hex
+                                                )
+                                            default:
+                                                throw error
+                                            }
+                                        }
                                         committedItemID = intent.itemID
                                     }
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
@@ -664,8 +766,15 @@ public final class SyncEngine: Sendable {
                                         }
                                     }
                                 } else {
-                                    // 大文件 (> 8MB)：上传前单次写入 inFlight 状态，获取 itemId 以支持断点分块续传
-                                    let remoteFileId = try await self.idPool.nextId()
+                                    // 大文件 (> 8MB)：复用既有 remote_file_id 与断点，不盲目更换 ID！
+                                    let remoteFileId: String
+                                    if let existingRemoteId = existingTarget?.remoteID {
+                                        remoteFileId = existingRemoteId
+                                    } else {
+                                        remoteFileId = try await self.idPool.nextId()
+                                    }
+                                    let isUpdate = (existingTarget?.phase == "committed" && existingTarget?.remoteStatus == "present")
+
                                     let currentItemId: Int64 = try await self.store.write { conn in
                                         let itemStmt = try conn.cachedStatement("""
                                         INSERT INTO items (
@@ -681,14 +790,14 @@ public final class SyncEngine: Sendable {
                                         )
                                         ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
                                         DO UPDATE SET
-                                            remote_file_id = excluded.remote_file_id,
+                                            remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
                                             local_device = excluded.local_device,
                                             local_inode = excluded.local_inode,
                                             local_mtime = excluded.local_mtime,
                                             local_size = excluded.local_size,
                                             local_sha256 = excluded.local_sha256,
-                                            phase = excluded.phase,
-                                            dirty_generation = excluded.dirty_generation,
+                                            phase = 'inFlight',
+                                            dirty_generation = MAX(items.dirty_generation, 1),
                                             updated_at = excluded.updated_at;
                                         """)
                                         itemStmt.bindInt64(rootId, at: 1)
@@ -730,7 +839,7 @@ public final class SyncEngine: Sendable {
                                         remoteId: remoteFileId,
                                         parentId: remoteParentId,
                                         name: name,
-                                        isUpdate: false
+                                        isUpdate: isUpdate
                                     )
 
                                     // 提交共同基线 B
@@ -793,6 +902,18 @@ public final class SyncEngine: Sendable {
         // 6. 强制将缓冲区写入磁盘并执行 WAL checkpoint
         try await store.flush()
         try await store.checkpoint()
+
+        if progress.filesFailed == 0 {
+            try await store.write { conn in
+                let stmt = try conn.cachedStatement("""
+                UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
+                """)
+                stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                stmt.bindInt64(rootId, at: 2)
+                _ = try stmt.step()
+                stmt.reset()
+            }
+        }
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
         stats.directoriesCreated = progress.dirsCreated
@@ -1073,6 +1194,16 @@ public final class SyncEngine: Sendable {
 
         try await store.flush()
         try await store.checkpoint()
+
+        try await store.write { conn in
+            let stmt = try conn.cachedStatement("""
+            UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
+            """)
+            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+            stmt.bindInt64(rootId, at: 2)
+            _ = try stmt.step()
+            stmt.reset()
+        }
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
         stats.directoriesCreated = progress.dirsCreated
