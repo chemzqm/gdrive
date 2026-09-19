@@ -27,7 +27,7 @@ struct RemoteChanges: Sendable {
         _ = try q.step()
     }
 
-    static func saveInitialCursor(store: StateStore, client: DriveClient, rootID: Int64, requireExisting: Bool = false) async throws {
+    static func saveInitialCursor(store: StateStore, client: DriveClient, rootID: Int64, requireExisting: Bool = false, initialToken: String? = nil) async throws {
         let exists = try await store.read { conn in
             let q = try statement(conn, "SELECT 1 FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes';", [.int(rootID)])
             defer { q.reset() }
@@ -38,7 +38,8 @@ struct RemoteChanges: Sendable {
         guard !requireExisting else {
             throw SyncEngineError.general("已有同步根缺少 Changes 游标，请通过 syncIncremental 重建远端观察")
         }
-        let token = try await client.getStartPageToken()
+        let token: String
+        if let initialToken { token = initialToken } else { token = try await client.getStartPageToken() }
         try await store.write { conn in
             try execute(conn, """
                 INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)

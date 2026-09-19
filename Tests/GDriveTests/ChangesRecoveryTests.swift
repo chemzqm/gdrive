@@ -592,4 +592,123 @@ struct ChangesRecoveryTests {
             #expect(q.columnInt64(at: 0) == 2)
         }
     }
+    @Test("A15 empty binding is complete and accepts additions on either side", arguments: [false, true])
+    func emptyBinding(remoteAddition: Bool) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { try $0.execute("DELETE FROM roots;") }
+        let before = await f.store.getWriterStats()
+        _ = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        let after = await f.store.getWriterStats()
+        #expect(after.totalCommits - before.totalCommits == 1)
+        try await f.store.read { conn in
+            let q = try conn.prepare("SELECT r.bootstrap_state, i.phase, c.token_value FROM roots r JOIN items i USING(root_id) JOIN cursors c USING(root_id) WHERE i.parent_id IS NULL;")
+            #expect(try q.step())
+            #expect(q.columnText(at: 0) == "existingKnown")
+            #expect(q.columnText(at: 1) == "committed")
+            #expect(q.columnText(at: 2) == "fresh")
+        }
+        let requests = ChangesProtocol.state.withLock { $0.requests }
+        #expect(requests.count == 3)
+        #expect(requests[1].contains("startPageToken"))
+        #expect(requests[2].contains("/files?"))
+        if remoteAddition {
+            let file = remoteFile("new", parent: "root", content: "new content", name: ".env")
+            ChangesProtocol.state.withLock {
+                $0.pages["fresh"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)])
+            }
+        } else {
+            try Data("new content".utf8).write(to: f.local.appendingPathComponent(".env"))
+        }
+        let result = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        #expect(result.filesFailed == 0)
+        #expect(remoteAddition ? result.filesDownloaded == 1 : result.filesUploaded == 1)
+        #expect(try String(contentsOf: f.local.appendingPathComponent(".env"), encoding: .utf8) == "new content")
+    }
+
+    @Test("A15 hidden file initializes upload")
+    func hiddenInitialUpload() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { try $0.execute("DELETE FROM roots;") }
+        try Data("secret".utf8).write(to: f.local.appendingPathComponent(".env"))
+        let result = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        #expect(result.filesUploaded == 1)
+        #expect(result.filesFailed == 0)
+    }
+
+    @Test("A15 probe includes hidden entries and excludes only git directories")
+    func emptyProbeFiltering() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        #expect(try SyncEngine.isLocalRootEmpty(root.path))
+        let git = root.appendingPathComponent(".git")
+        try FileManager.default.createDirectory(at: git, withIntermediateDirectories: true)
+        try Data("ignored".utf8).write(to: git.appendingPathComponent("config"))
+        #expect(try SyncEngine.isLocalRootEmpty(root.path))
+        try FileManager.default.removeItem(at: git)
+        try Data("gitdir: elsewhere".utf8).write(to: git)
+        #expect(try !SyncEngine.isLocalRootEmpty(root.path))
+        #expect(throws: POSIXError.self) { try SyncEngine.isLocalRootEmpty(git.path) }
+    }
+
+    @Test("A15 unreadable local root never commits an empty baseline")
+    func unreadableInitialRoot() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { try $0.execute("DELETE FROM roots;") }
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: f.local.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: f.local.path) }
+        await #expect(throws: POSIXError.self) {
+            try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        }
+        try await f.store.read { conn in
+            let q = try conn.prepare("SELECT COUNT(*) FROM roots;")
+            #expect(try q.step())
+            #expect(q.columnInt64(at: 0) == 0)
+        }
+    }
+
+    @Test("A15 cursor insert failure rolls back root and item")
+    func emptyBindingRollback() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write {
+            try $0.execute("DELETE FROM roots;")
+            try $0.execute("CREATE TRIGGER reject_cursor BEFORE INSERT ON cursors BEGIN SELECT RAISE(ABORT, 'injected'); END;")
+        }
+        await #expect(throws: (any Error).self) {
+            try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        }
+        try await f.store.read { conn in
+            let q = try conn.prepare("SELECT (SELECT COUNT(*) FROM roots) + (SELECT COUNT(*) FROM items) + (SELECT COUNT(*) FROM cursors);")
+            #expect(try q.step())
+            #expect(q.columnInt64(at: 0) == 0)
+        }
+    }
+
+    @Test("A15 absent local directory is created for an empty binding")
+    func absentLocalEmptyBinding() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { try $0.execute("DELETE FROM roots;") }
+        try FileManager.default.removeItem(at: f.local)
+        _ = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        _ = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        #expect(FileManager.default.fileExists(atPath: f.local.path))
+    }
+
+    @Test("A15 download bootstrap reuses the routing cursor")
+    func downloadReusesCursor() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { try $0.execute("DELETE FROM roots;") }
+        remoteFile("new", parent: "root")
+        let result = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
+        #expect(result.filesDownloaded == 1)
+        #expect(result.filesFailed == 0)
+        #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("startPageToken") }.count } == 1)
+    }
+
 }

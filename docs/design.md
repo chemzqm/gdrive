@@ -149,6 +149,9 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
     * 双向增量同步：本地快速变更扫描 + Google Drive `Changes API` 增量变更拉取，
       由 Reconciler 驱动 3-way 差异决策。
   * **统一入口 `sync`**：
+    * 空↔空首次绑定在一次事务内保存根身份、committed root item、existingKnown 状态及
+      列举前捕获的 Changes 游标；本地顶层探测包含隐藏条目，仅排除 `.git` 目录，
+      找到首个有效条目即返回，枚举错误直接传播。见 [A15 验收记录](a15-validation.md)。
     * 自动探测本地与远端目录是否包含文件，智能路由至初始化全量同步或已有基线增量
       同步。
 * **`DirectoryTracker.swift`**：

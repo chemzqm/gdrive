@@ -159,20 +159,12 @@ public final class SyncEngine: Sendable {
         guard remoteFile.isDirectory else {
             throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteFolderId)"])
         }
+        // Probe only the top level; hidden entries are included, only .git directories are pruned.
+        let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
+        // Capture before listing so a concurrent remote creation cannot fall before the cursor.
+        let emptyRootCursor = isLocalEmpty ? try await client.getStartPageToken() : nil
         let remoteChildren = try await client.listChildren(parentId: remoteFolderId)
         let isRemoteEmpty = remoteChildren.isEmpty
-
-        // 探测本地目录：是否包含非隐藏文件
-        var isDir: ObjCBool = false
-        let localExists = FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir)
-        var isLocalEmpty = true
-        if localExists && isDir.boolValue {
-            let localContents = (try? FileManager.default.contentsOfDirectory(atPath: resolvedLocalPath)) ?? []
-            let realFiles = localContents.filter { !$0.hasPrefix(".") }
-            isLocalEmpty = realFiles.isEmpty
-        } else if localExists && !isDir.boolValue {
-            throw NSError(domain: "SyncEngine", code: 102, userInfo: [NSLocalizedDescriptionKey: "本地路径已存在但不是目录: \(resolvedLocalPath)"])
-        }
 
         // 3. 根据探测结果安全分流
         if !isLocalEmpty && isRemoteEmpty {
@@ -180,24 +172,55 @@ public final class SyncEngine: Sendable {
             return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
         } else if isLocalEmpty && !isRemoteEmpty {
             logger.info("[Sync] 检测到【云端包含文件，本地为空目录】，自动启动 remoteToLocalEmpty 初始化下载")
-            return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress)
+            return try await initializeRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress, initialCursor: emptyRootCursor)
         } else if isLocalEmpty && isRemoteEmpty {
             logger.info("[Sync] 检测到【本地与云端均为空目录】，建立初始空基线")
+            try FileManager.default.createDirectory(atPath: resolvedLocalPath, withIntermediateDirectories: true)
+            var metadata = stat()
+            guard stat(resolvedLocalPath, &metadata) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+            let device = Int64(metadata.st_dev)
+            let inode = Int64(metadata.st_ino)
+            let rootName = URL(fileURLWithPath: resolvedLocalPath).lastPathComponent
             let now = Date().timeIntervalSince1970
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 INSERT INTO roots (
                     account_id, local_root_path, local_root_device, local_root_inode,
                     remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at
-                ) VALUES ('default', ?, 1, 1, ?, 'localToRemoteEmpty', 'freshCreated', ?, ?)
-                ON CONFLICT (account_id, remote_root_id) DO UPDATE SET updated_at = excluded.updated_at;
+                ) VALUES ('default', ?, ?, ?, ?, 'localToRemoteEmpty', 'existingKnown', ?, ?);
                 """)
                 stmt.bindText(resolvedLocalPath, at: 1)
-                stmt.bindText(remoteFolderId, at: 2)
-                stmt.bindDouble(now, at: 3)
-                stmt.bindDouble(now, at: 4)
+                stmt.bindInt64(device, at: 2)
+                stmt.bindInt64(inode, at: 3)
+                stmt.bindText(remoteFolderId, at: 4)
+                stmt.bindDouble(now, at: 5)
+                stmt.bindDouble(now, at: 6)
                 _ = try stmt.step()
                 stmt.reset()
+                let rootID = conn.lastInsertRowId
+                let item = try conn.cachedStatement("""
+                INSERT INTO items(root_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status, phase, created_at, updated_at)
+                VALUES (?, ?, 'directory', ?, ?, ?, 'present', 'present', 'committed', ?, ?);
+                """)
+                item.bindInt64(rootID, at: 1)
+                item.bindText(rootName, at: 2)
+                item.bindText(remoteFolderId, at: 3)
+                item.bindInt64(device, at: 4)
+                item.bindInt64(inode, at: 5)
+                item.bindDouble(now, at: 6)
+                item.bindDouble(now, at: 7)
+                _ = try item.step()
+                item.reset()
+                let cursor = try conn.cachedStatement("""
+                INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
+                VALUES (?, 'default', 'drive_changes', ?, ?);
+                """)
+                cursor.bindInt64(rootID, at: 1)
+                cursor.bindText(emptyRootCursor!, at: 2)
+                cursor.bindDouble(now, at: 3)
+                _ = try cursor.step()
+                cursor.reset()
             }
             return SyncStats()
         } else {
@@ -205,6 +228,38 @@ public final class SyncEngine: Sendable {
             throw NSError(domain: "SyncEngine", code: 103, userInfo: [
                 NSLocalizedDescriptionKey: "双向同步初始基线要求其中一端必须为空目录。当前检测到本地路径(\(resolvedLocalPath))与远端文件夹(\(remoteFolderId))均包含已有文件。为避免盲合并导致数据覆盖或大规模冲突，请指定空目录进行首次初始化。"
             ])
+        }
+    }
+
+    /// O(1) memory, no recursion or content reads; matches includeHidden + excludeDirectory(".git").
+    static func isLocalRootEmpty(_ path: String) throws -> Bool {
+        guard let directory = opendir(path) else {
+            if errno == ENOENT { return true }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { closedir(directory) }
+        while true {
+            errno = 0
+            guard let entry = readdir(directory) else {
+                if errno != 0 { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
+                return true
+            }
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+            if name == ".git" {
+                var type = entry.pointee.d_type
+                if type == UInt8(DT_UNKNOWN) {
+                    var metadata = stat()
+                    guard fstatat(dirfd(directory), name, &metadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                    if metadata.st_mode & S_IFMT == S_IFDIR { type = UInt8(DT_DIR) }
+                }
+                if type == UInt8(DT_DIR) { continue }
+            }
+            return false
         }
     }
 
@@ -956,6 +1011,17 @@ public final class SyncEngine: Sendable {
         maxDownloadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
+        try await initializeRemoteToLocalEmpty(localPath: localPath, remoteRootId: remoteRootId,
+            maxDownloadConcurrency: maxDownloadConcurrency, onProgress: onProgress, initialCursor: nil)
+    }
+
+    private func initializeRemoteToLocalEmpty(
+        localPath: String,
+        remoteRootId: String,
+        maxDownloadConcurrency: Int,
+        onProgress: (@Sendable (SyncProgress) -> Void)?,
+        initialCursor: String?
+    ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
         let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
@@ -1039,7 +1105,7 @@ public final class SyncEngine: Sendable {
             return (rId, rItemId)
         }
 
-        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
+        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists, initialToken: initialCursor)
 
         let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
         let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)
