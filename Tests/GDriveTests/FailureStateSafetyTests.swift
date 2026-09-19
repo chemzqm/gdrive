@@ -204,8 +204,8 @@ struct FailureStateSafetyTests {
         }
     }
 
-    @Test("File rename failure does not commit new name to SQLite; retrying succeeds")
-    func testFileRenameFailurePreservesBaselineAndRetries() async throws {
+    @Test("File rename preserves content detection and retries safely (A10)", arguments: [false, true], [false, true])
+    func testFileRenameFailurePreservesBaselineAndRetries(contentChanged: Bool, failRename: Bool) async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_file_rename_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -214,6 +214,10 @@ struct FailureStateSafetyTests {
         try FileManager.default.createDirectory(at: localRootDir, withIntermediateDirectories: true)
         let fileA = localRootDir.appendingPathComponent("file_A.txt")
         try "file content".write(to: fileA, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_000)], ofItemAtPath: fileA.path)
+        let originalSHA = SyncEngine.computeSha256(of: Data("file content".utf8))
+        let expectedContent = Data((contentChanged ? "new contents" : "file content").utf8)
+        let expectedSHA = SyncEngine.computeSha256(of: expectedContent)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -268,11 +272,33 @@ struct FailureStateSafetyTests {
             return conn.lastInsertRowId
         }
 
+        try await store.write { conn in
+            let stmt = try conn.prepare("""
+                UPDATE items SET local_mtime = 1700000000000000000, local_size = 12,
+                    base_size = 12, remote_size = 12,
+                    local_sha256 = ?, base_sha256 = ?, remote_sha256 = ? WHERE item_id = ?;
+                """)
+            for index in 1...3 { stmt.bindText(originalSHA, at: Int32(index)) }
+            stmt.bindInt64(fileAItemId, at: 4)
+            _ = try stmt.step()
+        }
+
         // Rename file_A.txt -> file_B.txt on disk
         let fileB = localRootDir.appendingPathComponent("file_B.txt")
         try FileManager.default.moveItem(at: fileA, to: fileB)
+        if contentChanged {
+            let handle = try FileHandle(forWritingTo: fileB)
+            try handle.write(contentsOf: expectedContent)
+            try handle.close()
+            try FileManager.default.setAttributes([.modificationDate: Date(timeIntervalSince1970: 1_700_000_010)], ofItemAtPath: fileB.path)
+        }
+        let renamedAttrs = try FileManager.default.attributesOfItem(atPath: fileB.path)
+        #expect((renamedAttrs[.systemFileNumber] as? NSNumber)?.int64Value == fileAIno)
 
         let control = FailureControlState()
+        control.shouldFail = failRename
+        let uploads = RequestEventRecorder()
+        let renames = RequestEventRecorder()
 
         MockFailureSafetyURLProtocol.requestHandler = { request in
             let url = try #require(request.url)
@@ -297,6 +323,27 @@ struct FailureStateSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(fileARemoteId)") {
+                if path.contains("/upload/") {
+                    #expect(!control.shouldFail)
+                    var body = request.httpBody ?? Data()
+                    if let stream = request.httpBodyStream {
+                        stream.open()
+                        defer { stream.close() }
+                        var buffer = [UInt8](repeating: 0, count: 1024)
+                        while true {
+                            let count = stream.read(&buffer, maxLength: buffer.count)
+                            guard count > 0 else { break }
+                            body.append(contentsOf: buffer.prefix(count))
+                        }
+                    }
+                    #expect(body == expectedContent)
+                    uploads.recordFilePatch()
+                    let json = """
+                    {"id":"\(fileARemoteId)","name":"file_B.txt","mimeType":"text/plain","size":"12","sha256Checksum":"\(expectedSHA)"}
+                    """.data(using: .utf8)!
+                    return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
+                }
+                renames.recordFilePatch()
                 if control.shouldFail {
                     let errJson = #"{"error": {"code": 400, "message": "Bad Request"}}"#.data(using: .utf8)!
                     return (HTTPURLResponse(url: url, statusCode: 400, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
@@ -313,27 +360,41 @@ struct FailureStateSafetyTests {
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
-        // 1. Run sync while file rename fails
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        // A failed rename must preserve both the mapping and verified content metadata.
+        if failRename {
+            try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // SQLite should NOT be updated to 'file_B.txt'
-        try await store.read { conn in
-            let stmt = try conn.prepare("SELECT name FROM items WHERE item_id = ?;")
-            stmt.bindInt64(fileAItemId, at: 1)
-            #expect(try stmt.step())
-            #expect(stmt.columnText(at: 0) == "file_A.txt", "File name in DB must remain file_A.txt after failed rename")
+            try await store.read { conn in
+                let stmt = try conn.prepare("SELECT name, local_mtime, local_sha256 FROM items WHERE item_id = ?;")
+                stmt.bindInt64(fileAItemId, at: 1)
+                #expect(try stmt.step())
+                #expect(stmt.columnText(at: 0) == "file_A.txt", "File name in DB must remain file_A.txt after failed rename")
+                #expect(stmt.columnInt64(at: 1) == 1_700_000_000_000_000_000)
+                #expect(stmt.columnText(at: 2) == originalSHA)
+            }
+            #expect(uploads.filePatchCount == 0)
         }
 
         // 2. Allow update to succeed on retry
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        let stats = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        #expect(stats.filesUploaded == (contentChanged ? 1 : 0))
+        #expect(stats.filesSkipped == (contentChanged ? 0 : 1))
 
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT name FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT name, base_sha256, local_sha256, dirty_generation FROM items WHERE item_id = ?;")
             stmt.bindInt64(fileAItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnText(at: 0) == "file_B.txt", "File name in DB must be updated to file_B.txt after successful retry")
+            #expect(stmt.columnText(at: 1) == expectedSHA)
+            #expect(stmt.columnText(at: 2) == expectedSHA)
+            #expect(stmt.columnInt64(at: 3) == 0)
         }
+        let second = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        #expect(second.filesUploaded == 0)
+        #expect(second.filesSkipped == 1)
+        #expect(uploads.filePatchCount == (contentChanged ? 1 : 0))
+        #expect(renames.filePatchCount == (failRename ? 2 : 1))
     }
 
     @Test("Remote trash failure does not mark item as tombstone in SQLite; retry succeeds")

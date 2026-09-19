@@ -1265,6 +1265,7 @@ public final class SyncEngine: Sendable {
         let opId = "resumable_\(remoteId)"
         var sessionURL: URL? = nil
         var currentOffset: Int64 = 0
+        var completedFile: DriveFile? = nil
 
         struct ExistingResumableOp {
             let sessionURL: URL
@@ -1299,28 +1300,24 @@ public final class SyncEngine: Sendable {
             if isSameFile {
                 // 向云端探测服务端实际已接收的有效 offset
                 do {
-                    let serverOffset = try await client.queryResumableOffset(sessionURL: existing.sessionURL, totalBytes: fileSize)
-                    if serverOffset >= fileSize {
-                        // 云端已全部接收完毕
-                        let now = Date().timeIntervalSince1970
-                        try await store.write { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE operations SET state = 'completed', confirmed_offset = ?, updated_at = ? WHERE operation_id = ?;
-                            """)
-                            stmt.bindInt64(fileSize, at: 1)
-                            stmt.bindDouble(now, at: 2)
-                            stmt.bindText(opId, at: 3)
-                            _ = try stmt.step()
-                            stmt.reset()
+                    switch try await client.queryResumableOffset(sessionURL: existing.sessionURL, totalBytes: fileSize) {
+                    case .complete(let file):
+                        completedFile = file
+                        sessionURL = existing.sessionURL
+                        currentOffset = fileSize
+                    case .incomplete(let serverOffset):
+                        guard serverOffset >= 0, serverOffset < fileSize else {
+                            throw DriveError.invalidResponse(message: "Resumable 探测偏移越界: \(serverOffset)/\(fileSize)")
                         }
-                        return try await client.getFile(remoteId: remoteId)
+                        sessionURL = existing.sessionURL
+                        currentOffset = serverOffset
+                    case .expired:
+                        sessionURL = nil
+                        currentOffset = 0
                     }
-                    sessionURL = existing.sessionURL
-                    currentOffset = serverOffset
                 } catch {
-                    // 会话已过期或失效，重新发起新会话
-                    sessionURL = nil
-                    currentOffset = 0
+                    // 临时网络/服务端故障不得废弃仍可能有效的会话。
+                    throw error
                 }
             } else {
                 // 文件内容或大小已发生变化，断点作废，重新发起全新上传
@@ -1330,7 +1327,7 @@ public final class SyncEngine: Sendable {
         }
 
         // 2. 若无有效会话，发起新 Resumable 上传会话并持久化操作意图
-        let activeSessionURL: URL
+        var activeSessionURL: URL
         if let sURL = sessionURL {
             activeSessionURL = sURL
         } else {
@@ -1342,6 +1339,7 @@ public final class SyncEngine: Sendable {
             currentOffset = 0
 
             let now = Date().timeIntervalSince1970
+            let activeSessionURI = activeSessionURL.absoluteString
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 INSERT INTO operations (
@@ -1367,7 +1365,7 @@ public final class SyncEngine: Sendable {
                 stmt.bindText(expectedSha256, at: 4)
                 stmt.bindText(remoteId, at: 5)
                 stmt.bindText(parentId, at: 6)
-                stmt.bindText(activeSessionURL.absoluteString, at: 7)
+                stmt.bindText(activeSessionURI, at: 7)
                 stmt.bindInt64(fileSize, at: 8)
                 stmt.bindDouble(now, at: 9)
                 stmt.bindDouble(now, at: 10)
@@ -1384,7 +1382,8 @@ public final class SyncEngine: Sendable {
         let initialAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         let initialMtime = initialAttrs?[.modificationDate] as? Date
 
-        var finalDriveFile: DriveFile? = nil
+        var finalDriveFile: DriveFile? = completedFile
+        var repeatedNoProgress = false
 
         while currentOffset < fileSize {
             // 检测文件是否在上传分块中途被并发修改
@@ -1420,37 +1419,78 @@ public final class SyncEngine: Sendable {
                 totalBytes: fileSize
             )
 
-            currentOffset += Int64(chunkData.count)
-            self.monitor.reportUploadProgress(id: fileURL.path, additionalBytes: Int64(chunkData.count))
+            let previousOffset = currentOffset
+            switch result {
+            case .incomplete(let confirmedOffset):
+                guard confirmedOffset >= previousOffset,
+                      confirmedOffset <= previousOffset + Int64(chunkData.count),
+                      confirmedOffset < fileSize else {
+                    throw DriveError.invalidResponse(message: "Resumable 确认偏移非法: \(confirmedOffset)，发送区间 \(previousOffset)-\(previousOffset + Int64(chunkData.count) - 1)")
+                }
+                if confirmedOffset == previousOffset {
+                    guard !repeatedNoProgress else {
+                        throw DriveError.invalidResponse(message: "Resumable 会话连续未确认任何新字节")
+                    }
+                    repeatedNoProgress = true
+                } else {
+                    repeatedNoProgress = false
+                }
+                currentOffset = confirmedOffset
+            case .complete(let file):
+                currentOffset = fileSize
+                finalDriveFile = file
+            case .expired:
+                activeSessionURL = isUpdate
+                    ? try await client.initiateResumableUpdate(remoteId: remoteId, totalBytes: fileSize)
+                    : try await client.initiateResumableUpload(name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
+                currentOffset = 0
+                repeatedNoProgress = false
+            }
+            let confirmedBytes = max(0, currentOffset - previousOffset)
+            if confirmedBytes > 0 {
+                self.monitor.reportUploadProgress(id: fileURL.path, additionalBytes: confirmedBytes)
+            }
 
             // 每完成一个块，立即在数据库记录已确认 offset 与状态
-            let isComplete = (currentOffset >= fileSize)
             let recordedOffset = currentOffset
             let now = Date().timeIntervalSince1970
+            let activeSessionURI = activeSessionURL.absoluteString
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 UPDATE operations SET
+                    session_uri = ?,
                     confirmed_offset = ?,
-                    state = ?,
+                    state = 'inFlight',
                     updated_at = ?
                 WHERE operation_id = ?;
                 """)
-                stmt.bindInt64(recordedOffset, at: 1)
-                stmt.bindText(isComplete ? "completed" : "inFlight", at: 2)
+                stmt.bindText(activeSessionURI, at: 1)
+                stmt.bindInt64(recordedOffset, at: 2)
                 stmt.bindDouble(now, at: 3)
                 stmt.bindText(opId, at: 4)
                 _ = try stmt.step()
                 stmt.reset()
             }
 
-            if let res = result {
-                finalDriveFile = res
+            if finalDriveFile != nil {
                 break
             }
         }
 
         let file = try await (finalDriveFile != nil ? finalDriveFile! : client.getFile(remoteId: remoteId))
-        if let checksum = file.sha256Checksum, checksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
+        guard file.sizeBytes == fileSize else {
+            let now = Date().timeIntervalSince1970
+            try? await store.write { conn in
+                let stmt = try conn.cachedStatement("UPDATE operations SET state = 'failed', updated_at = ? WHERE operation_id = ?;")
+                stmt.bindDouble(now, at: 1)
+                stmt.bindText(opId, at: 2)
+                _ = try stmt.step()
+                stmt.reset()
+            }
+            throw DriveError.sizeMismatch(expected: fileSize, actual: file.sizeBytes)
+        }
+        guard let checksum = file.sha256Checksum,
+              checksum.caseInsensitiveCompare(expectedSha256) == .orderedSame else {
             // 云端最终拼接计算的哈希与预期不匹配（说明在传输过程中发生篡改或数据损坏）
             let now = Date().timeIntervalSince1970
             try? await store.write { conn in
@@ -1462,7 +1502,18 @@ public final class SyncEngine: Sendable {
                 _ = try stmt.step()
                 stmt.reset()
             }
-            throw DriveError.checksumMismatch(expected: expectedSha256, actual: checksum)
+            throw DriveError.checksumMismatch(expected: expectedSha256, actual: file.sha256Checksum)
+        }
+        let now = Date().timeIntervalSince1970
+        try await store.write { conn in
+            let stmt = try conn.cachedStatement("""
+            UPDATE operations SET state = 'completed', confirmed_offset = ?, updated_at = ? WHERE operation_id = ?;
+            """)
+            stmt.bindInt64(fileSize, at: 1)
+            stmt.bindDouble(now, at: 2)
+            stmt.bindText(opId, at: 3)
+            _ = try stmt.step()
+            stmt.reset()
         }
         return file
     }
@@ -2202,25 +2253,23 @@ public final class SyncEngine: Sendable {
                                 UPDATE items SET
                                     name = ?,
                                     parent_id = ?,
-                                    local_mtime = ?,
-                                    local_size = ?,
                                     updated_at = ?
                                 WHERE item_id = ?;
                                 """)
                                 stmt.bindText(name, at: 1)
                                 stmt.bindInt64(parentItemId, at: 2)
-                                stmt.bindInt64(mtime, at: 3)
-                                stmt.bindInt64(fileSize, at: 4)
-                                stmt.bindDouble(now, at: 5)
-                                stmt.bindInt64(existing.itemId, at: 6)
+                                stmt.bindDouble(now, at: 3)
+                                stmt.bindInt64(existing.itemId, at: 4)
                                 _ = try stmt.step()
                                 stmt.reset()
                             }
                             seenTracker.markSeen(parentId: parentItemId, name: name)
                         } catch {
                             self.logger.error("重命名/移动远端文件失败 [\(existing.name) -> \(name)]: \(error)")
+                            continue
                         }
-                        continue
+                        // 路径更新不代表正文已验证；保留旧元数据并继续内容比对。
+                        // 纯改名仍命中下方缓存，正文变化则复用既有摘要与裁决流程。
                     }
 
                     seenTracker.markSeen(parentId: parentItemId, name: name)

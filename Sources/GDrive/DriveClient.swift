@@ -47,6 +47,17 @@ public struct DriveFile: Codable, Sendable {
     }
 }
 
+/// Resumable upload session state reported by Google Drive.
+public enum ResumableUploadResult: Sendable {
+    /// The session is active. The associated value is the first byte not yet
+    /// confirmed by the server.
+    case incomplete(confirmedOffset: Int64)
+    /// The upload has completed and Drive returned the resulting file.
+    case complete(DriveFile)
+    /// The session no longer exists and must be recreated.
+    case expired
+}
+
 /// Google Drive API 错误类型
 public enum DriveError: Error, Sendable, CustomStringConvertible {
     case rateLimited(retryAfter: TimeInterval?)
@@ -520,13 +531,13 @@ public final class DriveClient: Sendable {
     }
 
     /// 向已有的 Resumable 会话发送分块数据
-    /// - Returns: 若上传完成则返回 DriveFile，若尚有剩余未完成分块则返回 nil
+    /// - Returns: 服务端确认的会话状态。调用方必须按 confirmedOffset 推进，不能按发送长度推断。
     public func uploadResumableChunk(
         sessionURL: URL,
         chunkData: Data,
         offset: Int64,
         totalBytes: Int64
-    ) async throws -> DriveFile? {
+    ) async throws -> ResumableUploadResult {
         let chunkEnd = offset + Int64(chunkData.count) - 1
         var req = URLRequest(url: sessionURL)
         req.httpMethod = "PUT"
@@ -534,14 +545,14 @@ public final class DriveClient: Sendable {
         req.setValue(String(chunkData.count), forHTTPHeaderField: "Content-Length")
         req.httpBody = chunkData
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308])
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308, 404])
 
         if http.statusCode == 308 {
-            // 分块已成功接收，后续仍需继续上传
-            return nil
+            return .incomplete(confirmedOffset: try parseResumableConfirmedOffset(http, totalBytes: totalBytes))
         } else if http.statusCode == 200 || http.statusCode == 201 {
-            // 全部分块完成，返回最终对象
-            return try JSONDecoder().decode(DriveFile.self, from: data)
+            return .complete(try JSONDecoder().decode(DriveFile.self, from: data))
+        } else if http.statusCode == 404 {
+            return .expired
         } else {
             let detail = String(decoding: data, as: UTF8.self)
             throw DriveError.serverError(statusCode: http.statusCode, message: "分块上传失败: \(detail)")
@@ -549,22 +560,38 @@ public final class DriveClient: Sendable {
     }
 
     /// 查询 Resumable 会话的已确认断点偏移量
-    public func queryResumableOffset(sessionURL: URL, totalBytes: Int64) async throws -> Int64 {
+    public func queryResumableOffset(sessionURL: URL, totalBytes: Int64) async throws -> ResumableUploadResult {
         var req = URLRequest(url: sessionURL)
         req.httpMethod = "PUT"
         req.setValue("bytes */\(totalBytes)", forHTTPHeaderField: "Content-Range")
         req.setValue("0", forHTTPHeaderField: "Content-Length")
 
-        let (_, http) = try await executeRequest(req, acceptableStatusCodes: [308])
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308, 404])
 
-        guard let range = http.value(forHTTPHeaderField: "Range") else {
-            return 0
+        switch http.statusCode {
+        case 200, 201:
+            return .complete(try JSONDecoder().decode(DriveFile.self, from: data))
+        case 308:
+            return .incomplete(confirmedOffset: try parseResumableConfirmedOffset(http, totalBytes: totalBytes))
+        case 404:
+            return .expired
+        default:
+            let detail = String(decoding: data, as: UTF8.self)
+            throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
-        // 格式: bytes=0-4194303
-        if let lastStr = range.split(separator: "-").last, let last = Int64(lastStr) {
-            return last + 1
+    }
+
+    private func parseResumableConfirmedOffset(_ response: HTTPURLResponse, totalBytes: Int64) throws -> Int64 {
+        // Google omits Range when it has not persisted any bytes yet.
+        guard let range = response.value(forHTTPHeaderField: "Range") else { return 0 }
+        let prefix = "bytes=0-"
+        guard range.hasPrefix(prefix),
+              let last = Int64(range.dropFirst(prefix.count)),
+              last >= 0,
+              last < totalBytes else {
+            throw DriveError.invalidResponse(message: "无效的 Resumable Range: \(range)")
         }
-        return 0
+        return last + 1
     }
 
     // MARK: - 元数据获取与核验

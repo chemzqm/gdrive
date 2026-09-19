@@ -589,6 +589,7 @@ struct BootstrapResumeSafetyTests {
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
         let recorder = RequestEventRecorder()
+        let resumedChunkAttempt = SafeCounter(0)
 
         MockBootstrapSafetyURLProtocol.setHandler { request in
             guard let url = request.url else {
@@ -618,9 +619,12 @@ struct BootstrapResumeSafetyTests {
                         // 探测请求，服务端确认已收到 0-4194303 (4MB)
                         let headers = ["Range": "bytes=0-4194303"]
                         return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: headers)!, Data())
-                    } else if contentRange.starts(with: "bytes 4194304-") {
-                        // 续传分块请求！记录收到的起始 offset
+                    } else if contentRange.starts(with: "bytes 4194304-") && resumedChunkAttempt.next() == 0 {
+                        // 服务端只确认到 6MB；引擎必须按 Range 而非发送长度推进。
                         recorder.recordResumedRange(start: 4194304)
+                        return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-6291455"])!, Data())
+                    } else if contentRange.starts(with: "bytes 6291456-") {
+                        recorder.recordResumedRange(start: 6291456)
                         let json = """
                         {"id": "\(persistentRemoteId)", "name": "large_9mb.bin", "size": "\(totalSize)", "sha256Checksum": "\(expectedSha256)"}
                         """.data(using: .utf8)!
@@ -649,6 +653,7 @@ struct BootstrapResumeSafetyTests {
 
         // 断言：确实复用了既有 session，从 4194304 (4MB) 处续传！
         #expect(recorder.resumedRangeStarts.contains(4194304))
+        #expect(recorder.resumedRangeStarts.contains(6291456))
 
         // 断言：SQLite 中的文件已转为 committed 且 remote_file_id 严格保持为 persistentRemoteId
         let (phase, dirtyGen, baseSha, finalRemoteId): (String?, Int64?, String?, String?) = try await store.read { conn in
@@ -663,6 +668,77 @@ struct BootstrapResumeSafetyTests {
         #expect(dirtyGen == 0)
         #expect(baseSha == expectedSha256)
         #expect(finalRemoteId == persistentRemoteId)
+
+        let operation: (Int64, String)? = try await store.read { conn in
+            let s = try conn.cachedStatement("SELECT confirmed_offset, state FROM operations WHERE operation_id = ?;")
+            s.bindText("resumable_\(persistentRemoteId)", at: 1)
+            defer { s.reset() }
+            guard try s.step() else { return nil }
+            return (s.columnInt64(at: 0) ?? -1, s.columnText(at: 1) ?? "")
+        }
+        #expect(operation?.0 == totalSize)
+        #expect(operation?.1 == "completed")
+    }
+
+    @Test("Resumable client exposes server-confirmed offsets and terminal session states")
+    func testResumableServerStates() async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a09_client_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let auth = try createMockAuth(tempDir: tempDir)
+        let client = createMockClient(auth: auth)
+        let total: Int64 = 1024
+        let finalJSON = #"{"id":"file","name":"file.bin","size":"1024","sha256Checksum":"abc"}"#.data(using: .utf8)!
+        let transientAttempts = SafeCounter(0)
+
+        MockBootstrapSafetyURLProtocol.setHandler { request in
+            let url = request.url!
+            switch url.lastPathComponent {
+            case "no-range":
+                return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: nil)!, Data())
+            case "partial":
+                return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-511"])!, Data())
+            case "complete-200":
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, finalJSON)
+            case "complete-201":
+                return (HTTPURLResponse(url: url, statusCode: 201, httpVersion: nil, headerFields: nil)!, finalJSON)
+            case "expired":
+                return (HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+            case "transient":
+                if transientAttempts.next() == 0 {
+                    return (HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: ["Retry-After": "0"])!, Data())
+                }
+                return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-255"])!, Data())
+            default:
+                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data())
+            }
+        }
+
+        if case .incomplete(let offset) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/no-range")!, totalBytes: total) {
+            #expect(offset == 0)
+        } else { Issue.record("308 without Range must report offset zero") }
+
+        if case .incomplete(let offset) = try await client.uploadResumableChunk(sessionURL: URL(string: "https://upload.invalid/partial")!, chunkData: Data(repeating: 1, count: 1024), offset: 0, totalBytes: total) {
+            #expect(offset == 512)
+        } else { Issue.record("308 must expose the server-confirmed Range") }
+
+        if case .complete(let file) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/complete-200")!, totalBytes: total) {
+            #expect(file.id == "file")
+        } else { Issue.record("200 status query must be complete") }
+
+        if case .complete(let file) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/complete-201")!, totalBytes: total) {
+            #expect(file.id == "file")
+        } else { Issue.record("201 status query must be complete") }
+
+        if case .expired = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/expired")!, totalBytes: total) {
+            // expected
+        } else { Issue.record("404 status query must expire the session") }
+
+        if case .incomplete(let offset) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/transient")!, totalBytes: total) {
+            #expect(offset == 256)
+            #expect(transientAttempts.next(count: 0) == 2)
+        } else { Issue.record("503 must retry the existing session instead of expiring it") }
     }
 
     // MARK: - Test 5: Unfinished File is NOT Falsely Skipped by Cache on Re-run
