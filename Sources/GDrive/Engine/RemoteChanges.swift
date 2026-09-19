@@ -157,7 +157,7 @@ struct RemoteChanges: Sendable {
         let ids: [String] = try await store.read { conn in
             let q = try Self.statement(conn, """
                 WITH RECURSIVE excluded(item_id) AS (
-                    SELECT item_id FROM remote_scope_exclusions WHERE root_id = ?
+                    SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                     UNION ALL SELECT i.item_id FROM items i JOIN excluded e ON i.parent_id = e.item_id
                 ) SELECT remote_file_id FROM items WHERE root_id = ? AND phase = 'waitingEvidence'
                     AND remote_status = 'unknown' AND remote_file_id IS NOT NULL AND parent_id IS NOT NULL
@@ -211,8 +211,8 @@ struct RemoteChanges: Sendable {
                 let q = try Self.statement(conn, """
                     SELECT remote_file_id FROM items WHERE root_id = ? AND entry_kind = 'directory'
                         AND remote_status = 'present' AND is_tombstone = 0
-                        AND item_id NOT IN (SELECT item_id FROM remote_scope_exclusions WHERE root_id = ?);
-                    """, [.int(rootID), .int(rootID)])
+                        AND remote_scope_excluded = 0;
+                    """, [.int(rootID)])
                 defer { q.reset() }
                 var result: Set<String> = [remoteRootID]
                 while try q.step() { if let id = q.columnText(at: 0) { result.insert(id) } }
@@ -324,7 +324,7 @@ struct RemoteChanges: Sendable {
         return path
     }
     private func exclude(_ conn: SQLiteConnection, itemID: Int64) throws {
-        try Self.execute(conn, "INSERT OR IGNORE INTO remote_scope_exclusions VALUES (?, ?);", [.int(rootID), .int(itemID)])
+        try Self.execute(conn, "UPDATE items SET remote_scope_excluded = 1 WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 0;", [.int(rootID), .int(itemID)])
         try Self.execute(conn, """
             WITH RECURSIVE tree(item_id) AS (
                 SELECT ? UNION ALL SELECT i.item_id FROM items i JOIN tree t ON i.parent_id = t.item_id WHERE i.is_tombstone = 0
@@ -354,13 +354,16 @@ struct RemoteChanges: Sendable {
         guard let file = change.file, let parentRemote = file.parents?.first,
               let parent = try item(conn, remoteID: parentRemote), parent.isDirectory,
               !file.name.isEmpty, file.name != ".", file.name != "..", !file.name.contains("/"), !file.name.contains("\0") else { return false }
+        try RemoteNameMapping.validate(file.name)
         let parentPath = try path(conn, itemID: parent.id)
         let destination = rootURL.appendingPathComponent(parentPath).appendingPathComponent(file.name)
+        try RemoteNameMapping.validateDestination(destination, root: rootURL)
         let collision = try Self.statement(conn, """
-            SELECT item_id, remote_file_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+            SELECT item_id, remote_file_id, name FROM items INDEXED BY idx_items_local_name_key WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?) AND is_tombstone = 0;
             """, [.int(rootID), .int(parent.id), .text(file.name)])
         var localOnlyID: Int64?
-        if try collision.step() {
+        while try collision.step() {
+            if collision.columnText(at: 1) == nil, collision.columnText(at: 2) != file.name { collision.reset(); return false }
             if let remote = collision.columnText(at: 1), remote != file.id { collision.reset(); return false }
             localOnlyID = collision.columnInt64(at: 0)
         }
@@ -404,10 +407,10 @@ struct RemoteChanges: Sendable {
                 [.int((attrs[.systemNumber] as? NSNumber)?.int64Value),
                  .int((attrs[.systemFileNumber] as? NSNumber)?.int64Value), .int(id)])
         }
-        let wasExcluded = try Self.statement(conn, "SELECT 1 FROM remote_scope_exclusions WHERE root_id = ? AND item_id = ?;", [.int(rootID), .int(id)])
+        let wasExcluded = try Self.statement(conn, "SELECT 1 FROM items WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 1;", [.int(rootID), .int(id)])
         let returning = try wasExcluded.step()
         wasExcluded.reset()
-        try Self.execute(conn, "DELETE FROM remote_scope_exclusions WHERE root_id = ? AND item_id = ?;", [.int(rootID), .int(id)])
+        try Self.execute(conn, "UPDATE items SET remote_scope_excluded = 0 WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 1;", [.int(rootID), .int(id)])
         if file.isDirectory, existing == nil || moved || returning || result.entry.scanID != nil {
             try schedule(conn, remoteID: file.id, scanID: result.entry.scanID ?? UUID().uuidString)
         }
@@ -455,16 +458,39 @@ struct RemoteChanges: Sendable {
         }
     }
 
+    /// Explicitly expose blocked name mappings without changing the durable inbox payload.
+    func nameConflictCount() async throws -> Int {
+        try await store.read { conn in
+            let q = try Self.statement(conn, """
+                SELECT COUNT(DISTINCT c.remote_id) FROM remote_change_inbox c
+                CROSS JOIN items p ON p.root_id = c.root_id
+                    AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]') AND p.is_tombstone = 0
+                CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
+                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name')) AND i.is_tombstone = 0
+                WHERE c.root_id = ? AND (i.remote_file_id != c.remote_id
+                    OR (i.remote_file_id IS NULL AND i.name != json_extract(c.payload, '$.file.name')));
+                """, [.int(rootID)])
+            defer { q.reset() }
+            _ = try q.step()
+            return Int(q.columnInt64(at: 0) ?? 0)
+        }
+    }
+
     func gate() async throws -> Gate {
         try await store.read { conn in
             let q = try Self.statement(conn, """
                 SELECT item_id FROM items WHERE root_id = ? AND phase = 'waitingEvidence' AND remote_status = 'unknown' AND is_tombstone = 0
-                UNION SELECT item_id FROM remote_scope_exclusions WHERE root_id = ?
+                UNION SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                 UNION SELECT i.item_id FROM remote_change_inbox c JOIN items i
                     ON i.root_id = c.root_id AND i.remote_file_id = c.remote_id AND i.is_tombstone = 0 WHERE c.root_id = ?
+                UNION SELECT i.item_id FROM remote_change_inbox c CROSS JOIN items p
+                    ON p.root_id = c.root_id AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]')
+                    AND p.is_tombstone = 0 CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
+                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name'))
+                    AND i.is_tombstone = 0 WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_directory_scans d JOIN items i
                     ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending';
-                """, Array(repeating: .int(rootID), count: 4))
+                """, Array(repeating: .int(rootID), count: 5))
             var ids: Set<Int64> = []
             while try q.step() { if let id = q.columnInt64(at: 0) { ids.insert(id) } }
             q.reset()
@@ -544,7 +570,7 @@ struct RemoteChanges: Sendable {
         try await store.read { conn in
             let q = try Self.statement(conn, """
                 WITH RECURSIVE excluded(item_id) AS (
-                    SELECT item_id FROM remote_scope_exclusions WHERE root_id = ?
+                    SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                     UNION ALL SELECT i.item_id FROM items i JOIN excluded e ON i.parent_id = e.item_id
                 ) SELECT (SELECT count(*) FROM remote_change_inbox WHERE root_id = ?)
                      + (SELECT count(*) FROM remote_directory_scans WHERE root_id = ? AND state = 'pending')

@@ -424,4 +424,125 @@ struct ChangesRecoveryTests {
         #expect(second.remoteWorkPending == 0)
     }
 
+    @Test("A14 bootstrap blocks equivalent sibling names before any publication", arguments: [
+        ["same", "same"], ["a", "A"], ["é", "e\u{301}"]
+    ])
+    func bootstrapNameCollision(names: [String]) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        _ = remoteFile("one", parent: "root", content: "first", name: names[0])
+        _ = remoteFile("two", parent: "root", content: "second", name: names[1])
+        await #expect(throws: (any Error).self) {
+            _ = try await f.engine.syncRemoteToLocalEmpty(localPath: f.local.path, remoteRootId: "root")
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.local.path).isEmpty)
+        #expect(ChangesProtocol.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
+        #expect(try await f.changes.pendingCount() > 0)
+    }
+
+    @Test("A14 directory identities cannot collapse on bootstrap", arguments: [false, true])
+    func bootstrapDirectoryCollision(mixed: Bool) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        ChangesProtocol.state.withLock {
+            $0.files["one"] = folder("one", "root", name: "same")
+            $0.files["two"] = mixed ? DriveFile(id: "two", name: "same", parents: ["root"]) : folder("two", "root", name: "same")
+        }
+        await #expect(throws: (any Error).self) {
+            _ = try await f.engine.syncRemoteToLocalEmpty(localPath: f.local.path, remoteRootId: "root")
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.local.path).isEmpty)
+        let count = try await f.store.read { conn in
+            let q = try conn.prepare("SELECT COUNT(*) FROM items WHERE parent_id IS NOT NULL;")
+            _ = try q.step(); return q.columnInt64(at: 0)
+        }
+        #expect(count == 0)
+    }
+
+    @Test("A14 Changes retain colliding identity and gate both sides until rename", arguments: [
+        ["same", "same"], ["a", "A"], ["é", "e\u{301}"]
+    ])
+    func changesNameCollision(names: [String]) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let one = remoteFile("one", parent: "root", content: "first", name: names[0])
+        let two = remoteFile("two", parent: "root", content: "second", name: names[1])
+        ChangesProtocol.state.withLock {
+            $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [
+                DriveChange(fileId: one.id, removed: false, file: one),
+                DriveChange(fileId: two.id, removed: false, file: two)])
+        }
+        let blocked = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+        #expect(blocked.remoteWorkPending > 0)
+        #expect(blocked.remoteNameConflicts == 1)
+        #expect(blocked.filesDownloaded == 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.local.path).isEmpty)
+        let renamed = remoteFile("two", parent: "root", content: "second", name: "unique")
+        ChangesProtocol.state.withLock {
+            $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "done", changes: [DriveChange(fileId: renamed.id, removed: false, file: renamed)])
+        }
+        try await converge(f)
+        #expect(try String(contentsOf: f.local.appendingPathComponent(names[0]), encoding: .utf8) == "first")
+        #expect(try String(contentsOf: f.local.appendingPathComponent("unique"), encoding: .utf8) == "second")
+    }
+
+    @Test("A14 unsafe names cannot escape the bootstrap root", arguments: ["../escape", "/absolute", ".", "..", "nul\0name"])
+    func unsafeBootstrapName(name: String) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        _ = remoteFile("bad", parent: "root", name: name)
+        await #expect(throws: (any Error).self) {
+            _ = try await f.engine.syncRemoteToLocalEmpty(localPath: f.local.path, remoteRootId: "root")
+        }
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.local.path).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: f.directory.appendingPathComponent("escape").path))
+        #expect(ChangesProtocol.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
+    }
+
+    @Test("A14 Changes block symlinked parents without writing outside root")
+    func symlinkedRemoteParent() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let parent = folder("parent", "root")
+        ChangesProtocol.state.withLock {
+            $0.files[parent.id] = parent
+            $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: parent.id, removed: false, file: parent)])
+        }
+        try await converge(f)
+        let outside = f.directory.appendingPathComponent("outside")
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let localParent = f.local.appendingPathComponent("parent")
+        try FileManager.default.removeItem(at: localParent)
+        try FileManager.default.createSymbolicLink(at: localParent, withDestinationURL: outside)
+        #expect(throws: (any Error).self) {
+            try RemoteNameMapping.validateDestination(localParent.appendingPathComponent("missing/child"), root: f.local)
+        }
+        let child = remoteFile("child", parent: "parent")
+        ChangesProtocol.state.withLock {
+            $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "done", changes: [DriveChange(fileId: child.id, removed: false, file: child)])
+        }
+        try await f.changes.consume()
+        #expect(try await f.changes.pendingCount() > 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: outside.path).isEmpty)
+    }
+
+    @Test("A14 name lookup uses index and equivalent names retain distinct item identities")
+    func nameIndex() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        try await f.store.write { conn in
+            for name in ["a", "A"] {
+                let q = try conn.prepare("INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,created_at,updated_at) VALUES (?,? ,?,'file',?,1,1);")
+                q.bindInt64(f.rootID, at: 1); q.bindInt64(f.rootItemID, at: 2)
+                q.bindText(name, at: 3); q.bindText(name, at: 4)
+                _ = try q.step()
+            }
+            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT item_id FROM items INDEXED BY idx_items_local_name_key WHERE root_id = 1 AND parent_id = 1 AND gdrive_name_key(name) = gdrive_name_key('a') AND is_tombstone = 0;")
+            #expect(try plan.step())
+            #expect(plan.columnText(at: 3)?.contains("idx_items_local_name_key") == true)
+            let q = try conn.prepare("SELECT COUNT(*) FROM items WHERE gdrive_name_key(name) = gdrive_name_key('A');")
+            #expect(try q.step())
+            #expect(q.columnInt64(at: 0) == 2)
+        }
+    }
 }

@@ -18,6 +18,18 @@ public final class SQLiteConnection: @unchecked Sendable {
         }
         self.db = pointer
 
+        let functionRC = sqlite3_create_function_v2(pointer, "gdrive_name_key", 1,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC, nil, { context, _, args in
+                guard let value = args?[0], let bytes = sqlite3_value_text(value) else {
+                    sqlite3_result_null(context); return
+                }
+                let key = RemoteNameMapping.key(String(cString: bytes))
+                key.withCString { sqlite3_result_text(context, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
+            }, nil, nil, nil)
+        guard functionRC == SQLITE_OK else {
+            throw NSError(domain: "SQLiteConnection", code: Int(functionRC))
+        }
+
         // 基础性能与稳定性配置
         if !readonly {
             try execute("PRAGMA journal_mode = WAL;")

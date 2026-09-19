@@ -44,19 +44,22 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 
 ## 2. 核心模块设计与职责划分
 
+远端名称落盘前必须完成名称映射检查：同父目录的同名、大小写折叠及 Unicode 规范化等价名称采用明确阻塞策略，不覆盖现有 fileId。初始化按完整目录检查；Changes 通过持久 inbox 和名称表达式索引保留冲突，门控冲突路径，远端重命名后恢复。调用方通过 `remoteNameConflicts` 识别名称冲突；大小写敏感卷也采用此保守策略。
+
+名称索引使用固定的大小写折叠和 NFC 规范化规则，规则改变时必须重建索引。冲突门控从持久 inbox 开始按索引查找，避免空队列扫描文件表。路径检查拒绝非法名称和祖先符号链接映射；父路径缺失时先解析最近的现存祖先，再验证根目录边界。
+
 ### 2.1 存储与基线层 (`Sources/GDrive/Storage/SQLite/`)
 
 以 SQLite 作为同步状态的唯一真相来源（Ground Truth），确保进程崩溃或网络异常时数
 据不损坏、不丢失。
 
-* **`schema.sql`**：
-  * `roots`：管理本地路径与远端目录的映射、初始化同步方向与生命周期。
-  * `items`：记录三方基线元数据，包含 `base_sha256`、`base_size`、`local_mtime`、
-    `local_device`、`local_inode`、`remote_file_id`、`phase`（`inFlight` /
-    `committed`）以及逻辑删除标记 `is_tombstone`。
-  * `resumable_sessions`：持久化 $>8\text{MB}$ 大文件的分块上传 Session URI 与已
-    确认断点偏移量，供跨进程恢复续传。
-  * `sync_cursors`：持久化 Google Drive `Changes API` 的 `startPageToken`。
+* **`schema.sql`**：仅保留 6 张业务表。
+  * `roots`：本地路径与远端目录的绑定、初始化方向和生命周期。
+  * `items`：三方基线、文件身份、观察代次及墓碑；`remote_scope_excluded` 保存范围排除状态，保护对象及其后代免于反向写回。
+  * `operations`：统一保存持久操作。分块上传保存 Session URI 和确认偏移；`resolveConflict` 的 `payload` 保存双方摘要、原文件和副本身份、路径及预期代次。
+  * `cursors`：Changes 等事件流的持久游标。
+  * `remote_change_inbox`：游标已确认但尚未成功应用的远端事件。
+  * `remote_directory_scans`：目录补列任务、扫描身份和分页进度。
 * **`SQLiteConnection.swift`**：
   * 封装底层的 SQLite3 C-API，全生命周期管理编译语句缓存（Prepared Statements），
     杜绝重复解析 SQL 语法开销。
@@ -124,7 +127,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
     通过持久化分页任务补列，安排在已就绪传输之后。缺失游标先捕获 C0，再重建观察。
     `SyncStats.remoteWorkPending` 非零时由后续同步轮次继续处理，不能视为全部收敛。
     验证与调用约定见 [A13 验收记录](a13-validation.md)。
-  * **冲突恢复（A12）**：文件变动前以 `conflict_operations` 持久化双方摘要、发布路径、
+  * **冲突恢复（A12）**：文件变动前以 `operations` 中的 `resolveConflict` 操作持久化双方摘要、发布路径、
     副本 item/远端 ID 和观察代次。先保留并上传本地副本，再安全发布远端原文件，最后
     原子提交两个共同基线与完成回执。pending 在下轮扫描前恢复，失败不计已解决。
     采用并发执行、组提交与 clonefile 保留大文件；验收边界见 [A12 验收记录](a12-validation.md)。

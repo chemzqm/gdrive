@@ -21,9 +21,11 @@ struct ConflictOperation: Codable, Sendable {
     let remoteGeneration: Int64
     let dirtyGeneration: Int64
 
+    private static let activeStates = "'ready', 'inFlight', 'verify', 'unknownOutcome'"
+
     static func pending(store: StateStore, rootID: Int64) async throws -> [Self] {
         try await store.read { conn in
-            let q = try conn.cachedStatement("SELECT payload FROM conflict_operations WHERE root_id = ? AND state = 'pending';")
+            let q = try conn.cachedStatement("SELECT payload FROM operations INDEXED BY idx_operations_conflict_pending_root WHERE root_id = ? AND operation_type = 'resolveConflict' AND state IN (\(activeStates));")
             defer { q.reset() }
             q.bindInt64(rootID, at: 1)
             var result: [Self] = []
@@ -46,7 +48,7 @@ struct ConflictOperation: Codable, Sendable {
         let copy = original.deletingLastPathComponent().appendingPathComponent(name)
         let result = OSAllocatedUnfairLock<ConflictOperation?>(initialState: nil)
         try await store.batchWrite { conn in
-            let existing = try conn.cachedStatement("SELECT payload FROM conflict_operations WHERE item_id = ? AND state = 'pending';")
+            let existing = try conn.cachedStatement("SELECT payload FROM operations INDEXED BY idx_operations_conflict_pending_item WHERE item_id = ? AND operation_type = 'resolveConflict' AND state IN (\(activeStates));")
             existing.bindInt64(itemID, at: 1)
             defer { existing.reset() }
             if try existing.step(), let payload = existing.columnText(at: 0) {
@@ -87,11 +89,17 @@ struct ConflictOperation: Codable, Sendable {
                 copyRemoteID: copyRemoteID, parentRemoteID: parentRemoteID,
                 localSHA: localSHA, remoteSHA: remoteSHA, localGeneration: localGeneration,
                 remoteGeneration: remoteGeneration, dirtyGeneration: dirtyGeneration)
-            let intent = try conn.cachedStatement("INSERT INTO conflict_operations VALUES (?, ?, ?, ?, 'pending');")
+            let intent = try conn.cachedStatement("""
+                INSERT INTO operations(operation_id, root_id, item_id, payload, operation_type, state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'resolveConflict', 'inFlight', ?, ?);
+                """)
             intent.bindText(id, at: 1)
             intent.bindInt64(rootID, at: 2)
             intent.bindInt64(itemID, at: 3)
             intent.bindText(String(decoding: try JSONEncoder().encode(operation), as: UTF8.self), at: 4)
+            let now = Date().timeIntervalSince1970
+            intent.bindDouble(now, at: 5)
+            intent.bindDouble(now, at: 6)
             _ = try intent.step()
             intent.reset()
             result.withLock { $0 = operation }
@@ -228,7 +236,7 @@ extension SyncEngine {
                 _ = try update.step()
                 update.reset()
             }
-            let done = try conn.cachedStatement("UPDATE conflict_operations SET state = 'completed' WHERE operation_id = ?;")
+            let done = try conn.cachedStatement("UPDATE operations SET state = 'completed', updated_at = strftime('%s','now') WHERE operation_id = ? AND operation_type = 'resolveConflict';")
             done.bindText(op.id, at: 1)
             _ = try done.step()
             done.reset()

@@ -88,12 +88,6 @@ public final class StateStore: Sendable {
 
         try await writer.writeImmediate { conn in
             try conn.execute(schemaSQL)
-            // 确保 store_meta 初始化
-            let stmt = try conn.prepare("INSERT OR IGNORE INTO store_meta (singleton, schema_version, created_at, updated_at) VALUES (1, 1, ?, ?);")
-            let now = Date().timeIntervalSince1970
-            stmt.bindDouble(now, at: 1)
-            stmt.bindDouble(now, at: 2)
-            _ = try stmt.step()
         }
     }
 }

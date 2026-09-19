@@ -18,6 +18,8 @@ public struct SyncStats: Sendable {
     public var conflictsResolved: Int = 0
     /// Durable remote observations/pages still awaiting a later reconcile round.
     public var remoteWorkPending: Int = 0
+    /// Remote identities blocked by equivalent local names; rename remotely to resolve.
+    public var remoteNameConflicts: Int = 0
     public var filesFailed: Int = 0
     public var elapsedSeconds: Double = 0
 }
@@ -1053,9 +1055,11 @@ public final class SyncEngine: Sendable {
         // 2. 递归枚举远端文件与流式下载
         func traverseRemote(parentRemoteId: String, currentLocalURL: URL, parentItemId: Int64) async throws {
             let children = try await self.client.listChildren(parentId: parentRemoteId)
+            try RemoteNameMapping.validateSiblings(children)
 
             for item in children {
                 let itemLocalURL = currentLocalURL.appendingPathComponent(item.name)
+                try RemoteNameMapping.validateDestination(itemLocalURL, root: rootURL)
 
                 if item.isDirectory {
                     // 创建本地目录
@@ -1070,7 +1074,7 @@ public final class SyncEngine: Sendable {
                             phase, created_at, updated_at
                         ) VALUES (?, ?, ?, 'directory', ?, 'committed', ?, ?)
                         ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                        DO UPDATE SET remote_file_id = excluded.remote_file_id, updated_at = excluded.updated_at;
+                        DO UPDATE SET updated_at = excluded.updated_at WHERE items.remote_file_id = excluded.remote_file_id;
                         """)
                         stmt.bindInt64(rootId, at: 1)
                         stmt.bindInt64(parentItemId, at: 2)
@@ -1081,6 +1085,9 @@ public final class SyncEngine: Sendable {
                         stmt.bindDouble(ts, at: 6)
                         _ = try stmt.step()
                         stmt.reset()
+                        guard conn.changes == 1 else {
+                            throw SyncEngineError.general("远端目录名称已属于另一个 fileId：\(item.name)")
+                        }
 
                         let qStmt = try conn.cachedStatement("""
                         SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
@@ -1191,7 +1198,10 @@ public final class SyncEngine: Sendable {
         }
 
         // 开始递归列举与下载
-        try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
+        var traversalError: Error?
+        do {
+            try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
+        } catch { traversalError = error }
 
         // 等待所有在途下载任务完成
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
@@ -1201,6 +1211,18 @@ public final class SyncEngine: Sendable {
         }
 
         try await store.flush()
+        if let traversalError {
+            // Preserve a durable recovery route for a partially downloaded bootstrap.
+            try await store.write { conn in
+                let q = try conn.cachedStatement("INSERT INTO remote_directory_scans(root_id, remote_id, scan_id, state) VALUES (?, ?, ?, 'pending') ON CONFLICT(root_id, remote_id) DO UPDATE SET state = 'pending', page_token = NULL;")
+                q.bindInt64(rootId, at: 1)
+                q.bindText(remoteRootId, at: 2)
+                q.bindText(UUID().uuidString, at: 3)
+                _ = try q.step()
+                q.reset()
+            }
+            throw traversalError
+        }
         try await store.checkpoint()
 
         try await store.write { conn in
@@ -3022,6 +3044,7 @@ public final class SyncEngine: Sendable {
         // Even an empty completed listing releases local paths which were gated earlier
         // in this round. Schedule one follow-up discovery instead of claiming convergence.
         stats.remoteWorkPending = max(try await remoteChanges.pendingCount(), enumerated ? 1 : 0)
+        if stats.remoteWorkPending > 0 { stats.remoteNameConflicts = try await remoteChanges.nameConflictCount() }
 
         try await store.flush()
         try await store.checkpoint()

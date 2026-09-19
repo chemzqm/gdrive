@@ -10,16 +10,6 @@
 PRAGMA foreign_keys = ON;
 
 -- -----------------------------------------------------------------------------
--- Metadata / Schema Versioning
--- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS store_meta (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version >= 1),
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-
--- -----------------------------------------------------------------------------
 -- Roots: Synchronized Directory Pairs
 -- Represents binding between a local directory and a Google Drive folder.
 -- -----------------------------------------------------------------------------
@@ -83,6 +73,7 @@ CREATE TABLE IF NOT EXISTS items (
     remote_parent_file_id TEXT,
     remote_name TEXT,
     remote_generation INTEGER NOT NULL DEFAULT 0 CHECK (remote_generation >= 0),
+    remote_scope_excluded INTEGER NOT NULL DEFAULT 0 CHECK (remote_scope_excluded IN (0, 1)),
     remote_status TEXT NOT NULL DEFAULT 'unknown' CHECK (remote_status IN ('present', 'trashed', 'absent', 'unknown')),
 
     -- Lifecycle & Scheduling Phase (§10.1)
@@ -148,7 +139,7 @@ CREATE TABLE IF NOT EXISTS operations (
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
     operation_type TEXT NOT NULL CHECK (operation_type IN (
         'createDirectory', 'uploadMultipart', 'uploadResumable',
-        'download', 'move', 'rename', 'trashRemote', 'deleteLocal'
+        'download', 'move', 'rename', 'trashRemote', 'deleteLocal', 'resolveConflict'
     )),
     state TEXT NOT NULL CHECK (state IN (
         'ready', 'inFlight', 'verify', 'unknownOutcome',
@@ -163,11 +154,13 @@ CREATE TABLE IF NOT EXISTS operations (
     confirmed_offset INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_offset >= 0),
     total_bytes INTEGER CHECK (total_bytes IS NULL OR total_bytes >= 0),
     staging_path TEXT,
+    payload TEXT, -- resolveConflict: fixed identities, paths, digests and generations
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error_code TEXT,
     last_error_message TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    CHECK (operation_type != 'resolveConflict' OR payload IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_operations_item
@@ -179,36 +172,6 @@ CREATE INDEX IF NOT EXISTS idx_operations_root_state
 CREATE INDEX IF NOT EXISTS idx_operations_target_remote
     ON operations(target_remote_id)
     WHERE target_remote_id IS NOT NULL;
-
--- -----------------------------------------------------------------------------
--- Directory Observations: Remote/Local Directory Scan Evidence
--- Tracks pagination tokens, completeness, and proof of emptiness/enumeration (§9.3, §10.3).
--- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS directory_observations (
-    observation_id INTEGER PRIMARY KEY AUTOINCREMENT,
-    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
-    item_id INTEGER REFERENCES items(item_id) ON DELETE CASCADE,
-    remote_folder_id TEXT NOT NULL,
-    local_scan_generation INTEGER NOT NULL DEFAULT 0 CHECK (local_scan_generation >= 0),
-    remote_scan_generation INTEGER NOT NULL DEFAULT 0 CHECK (remote_scan_generation >= 0),
-    next_page_token TEXT,
-    listing_status TEXT NOT NULL CHECK (listing_status IN (
-        'unscanned', 'inProgress', 'complete', 'unknownOrIncomplete'
-    )),
-    child_count INTEGER NOT NULL DEFAULT 0 CHECK (child_count >= 0),
-    evidence_status TEXT NOT NULL DEFAULT 'none' CHECK (evidence_status IN (
-        'none', 'emptyConfirmed', 'childrenEnumerated', 'pageIncomplete', 'accessDenied', 'notFound'
-    )),
-    evidence_summary TEXT,
-    updated_at REAL NOT NULL,
-    UNIQUE (root_id, remote_folder_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_dir_obs_item
-    ON directory_observations(item_id);
-
-CREATE INDEX IF NOT EXISTS idx_dir_obs_status
-    ON directory_observations(root_id, listing_status);
 
 -- -----------------------------------------------------------------------------
 -- Cursors: Change Feed & Event Cursors
@@ -225,40 +188,6 @@ CREATE TABLE IF NOT EXISTS cursors (
     updated_at REAL NOT NULL,
     UNIQUE (root_id, cursor_kind)
 );
-
--- -----------------------------------------------------------------------------
--- Cleanup Queue: Staging Files and Transient Publication Cleanup
--- Recycles staging files and canceled upload sessions after recovery check (§9.6, §10.5).
--- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS cleanup_queue (
-    cleanup_id TEXT PRIMARY KEY NOT NULL,
-    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
-    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('stagingFile', 'publicationFile', 'resumableSession')),
-    resource_locator TEXT NOT NULL CHECK (length(resource_locator) > 0),
-    state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'cleaning', 'completed', 'failed')),
-    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
-    next_attempt_at REAL NOT NULL DEFAULT 0,
-    last_error TEXT,
-    created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_cleanup_due
-    ON cleanup_queue(state, next_attempt_at)
-    WHERE state = 'pending';
-
--- A12: recover before observations can reinterpret an interrupted publication.
-CREATE TABLE IF NOT EXISTS conflict_operations (
-    operation_id TEXT PRIMARY KEY NOT NULL,
-    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
-    item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
-    payload TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ('pending', 'completed'))
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_pending_item
-    ON conflict_operations(item_id) WHERE state = 'pending';
-CREATE INDEX IF NOT EXISTS idx_conflict_pending_root
-    ON conflict_operations(root_id) WHERE state = 'pending';
 
 -- A13: a cursor acknowledges durable observations, never discarded events.
 CREATE TABLE IF NOT EXISTS remote_change_inbox (
@@ -279,8 +208,18 @@ CREATE TABLE IF NOT EXISTS remote_directory_scans (
     PRIMARY KEY(root_id, remote_id)
 );
 CREATE INDEX IF NOT EXISTS idx_remote_scans_pending ON remote_directory_scans(root_id) WHERE state = 'pending';
-CREATE TABLE IF NOT EXISTS remote_scope_exclusions (
-    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
-    item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
-    PRIMARY KEY(root_id, item_id)
-);
+
+
+-- Nonunique to retain distinct item identities when local names are equivalent.
+CREATE INDEX IF NOT EXISTS idx_items_local_name_key
+ON items(root_id, parent_id, gdrive_name_key(name)) WHERE is_tombstone = 0;
+
+-- Scope protection belongs to the item; exclude roots and their descendants at query time.
+CREATE INDEX IF NOT EXISTS idx_items_scope_excluded
+    ON items(root_id) WHERE remote_scope_excluded = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_conflict_pending_item
+    ON operations(item_id)
+    WHERE operation_type = 'resolveConflict' AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
+CREATE INDEX IF NOT EXISTS idx_operations_conflict_pending_root
+    ON operations(root_id)
+    WHERE operation_type = 'resolveConflict' AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
