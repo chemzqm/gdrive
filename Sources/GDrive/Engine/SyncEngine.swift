@@ -1945,32 +1945,36 @@ public final class SyncEngine: Sendable {
                     if let existing = existingDir, (existing.name != name || existing.parentId != parentItemId) {
                         // 本地目录发生重命名或移动
                         seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
-                        seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                        if let rId = existing.remoteId {
-                            let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
-                            let newPRemote = dirContext.getRemoteId(for: parentItemId)
-                            let addP = (parentItemId != existing.parentId) ? newPRemote : nil
-                            let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
-                            _ = try? await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
+                        do {
+                            if let rId = existing.remoteId {
+                                let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
+                                let newPRemote = dirContext.getRemoteId(for: parentItemId)
+                                let addP = (parentItemId != existing.parentId) ? newPRemote : nil
+                                let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
+                                _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
+                            }
+                            try await self.store.write { conn in
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
+                                """)
+                                stmt.bindText(name, at: 1)
+                                stmt.bindInt64(parentItemId, at: 2)
+                                stmt.bindDouble(now, at: 3)
+                                stmt.bindInt64(existing.itemId, at: 4)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
+                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                            dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: name, remoteId: existing.remoteId ?? "")
+                        } catch {
+                            self.logger.error("重命名/移动远端目录失败 [\(existing.name) -> \(name)]: \(error)")
                         }
-                        try await self.store.write { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
-                            """)
-                            stmt.bindText(name, at: 1)
-                            stmt.bindInt64(parentItemId, at: 2)
-                            stmt.bindDouble(now, at: 3)
-                            stmt.bindInt64(existing.itemId, at: 4)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                        dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: name, remoteId: existing.remoteId ?? "")
                     } else if dirContext.getItemId(byRelPath: relPath) == nil {
                         // 新建本地目录
                         let remoteParentId = dirContext.getRemoteId(for: parentItemId) ?? remoteRootId
-                        let candidateRemoteID = try await self.idPool.nextId()
                         var intent: DurableCreateIntent?
                         do {
+                            let candidateRemoteID = try await self.idPool.nextId()
                             let prepared = try await DurableCreateIntentStore.prepareDirectory(
                                 store: self.store,
                                 rootID: rootId,
@@ -2053,34 +2057,37 @@ public final class SyncEngine: Sendable {
                     if let existing = existingFile, (existing.name != name || existing.parentId != parentItemId) {
                         // 本地文件发生重命名或移动
                         seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
-                        seenTracker.markSeen(parentId: parentItemId, name: name)
+                        do {
+                            if let rId = existing.remoteId {
+                                let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
+                                let newPRemote = dirContext.getRemoteId(for: parentItemId)
+                                let addP = (parentItemId != existing.parentId) ? newPRemote : nil
+                                let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
+                                _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
+                            }
 
-                        if let rId = existing.remoteId {
-                            let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
-                            let newPRemote = dirContext.getRemoteId(for: parentItemId)
-                            let addP = (parentItemId != existing.parentId) ? newPRemote : nil
-                            let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
-                            _ = try? await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
-                        }
-
-                        try await self.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET
-                                name = ?,
-                                parent_id = ?,
-                                local_mtime = ?,
-                                local_size = ?,
-                                updated_at = ?
-                            WHERE item_id = ?;
-                            """)
-                            stmt.bindText(name, at: 1)
-                            stmt.bindInt64(parentItemId, at: 2)
-                            stmt.bindInt64(mtime, at: 3)
-                            stmt.bindInt64(fileSize, at: 4)
-                            stmt.bindDouble(now, at: 5)
-                            stmt.bindInt64(existing.itemId, at: 6)
-                            _ = try stmt.step()
-                            stmt.reset()
+                            try await self.store.batchWrite { conn in
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET
+                                    name = ?,
+                                    parent_id = ?,
+                                    local_mtime = ?,
+                                    local_size = ?,
+                                    updated_at = ?
+                                WHERE item_id = ?;
+                                """)
+                                stmt.bindText(name, at: 1)
+                                stmt.bindInt64(parentItemId, at: 2)
+                                stmt.bindInt64(mtime, at: 3)
+                                stmt.bindInt64(fileSize, at: 4)
+                                stmt.bindDouble(now, at: 5)
+                                stmt.bindInt64(existing.itemId, at: 6)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
+                            seenTracker.markSeen(parentId: parentItemId, name: name)
+                        } catch {
+                            self.logger.error("重命名/移动远端文件失败 [\(existing.name) -> \(name)]: \(error)")
                         }
                         continue
                     }
@@ -2406,12 +2413,16 @@ public final class SyncEngine: Sendable {
                             }) ?? false
 
                             if isParentTrashed {
-                                try? await self.client.untrash(remoteId: parentRId)
-                                try? await self.store.write { conn in
-                                    let stmt = try conn.cachedStatement("UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;")
-                                    stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                                    stmt.bindInt64(item.parentId, at: 2)
-                                    _ = try stmt.step()
+                                do {
+                                    try await self.client.untrash(remoteId: parentRId)
+                                    try await self.store.write { conn in
+                                        let stmt = try conn.cachedStatement("UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;")
+                                        stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                                        stmt.bindInt64(item.parentId, at: 2)
+                                        _ = try stmt.step()
+                                    }
+                                } catch {
+                                    self.logger.error("恢复远端父目录失败 [\(parentRId)]: \(error)")
                                 }
                             }
                         }
@@ -2630,19 +2641,23 @@ public final class SyncEngine: Sendable {
                         syncSemaphore.signal()
                         syncGroup.leave()
                     }
-                    if let rId = item.remoteFileId {
-                        try? await self.client.trash(remoteId: rId)
+                    do {
+                        if let rId = item.remoteFileId {
+                            try await self.client.trash(remoteId: rId)
+                        }
+                        try await self.store.batchWrite { conn in
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            """)
+                            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                            stmt.bindInt64(item.itemId, at: 2)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                        actionTracker.deleted += 1
+                    } catch {
+                        self.logger.error("远端文件删除失败 [\(item.name)]: \(error)")
                     }
-                    try? await self.store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                        stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                        stmt.bindInt64(item.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                    actionTracker.deleted += 1
                 }
 
             case .deleteLocal:
@@ -2875,17 +2890,21 @@ public final class SyncEngine: Sendable {
                 // 屏障检查：若后代中存在本地新增、修改或冲突文件，绝对禁止删除本地目录
                 if barrier.localPresent > 0 || barrier.remotePresent > 0 || barrier.pending > 0 {
                     self.logger.info("后代屏障生效：本地目录 [\(relPath)] 包含本地新增或修改的后代文件 (localPresent: \(barrier.localPresent))，阻止本地目录删除扩散")
-                    if let rId = dirItem.remoteFileId {
-                        try? await self.client.untrash(remoteId: rId)
-                    }
-                    try await store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                        stmt.bindDouble(now, at: 1)
-                        stmt.bindInt64(dirItem.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
+                    do {
+                        if let rId = dirItem.remoteFileId {
+                            try await self.client.untrash(remoteId: rId)
+                        }
+                        try await store.batchWrite { conn in
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            """)
+                            stmt.bindDouble(now, at: 1)
+                            stmt.bindInt64(dirItem.itemId, at: 2)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                    } catch {
+                        self.logger.error("后代屏障恢复远端目录失败 [\(relPath)]: \(error)")
                     }
                 } else {
                     // 后代全部已清理，核实本地目录为空后安全移入废纸篓
