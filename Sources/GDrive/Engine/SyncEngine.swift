@@ -2552,6 +2552,7 @@ public final class SyncEngine: Sendable {
             var scanned = 0
             var skipped = 0
             var dirsCreated = 0
+            var failed = 0
             private var lock = os_unfair_lock()
 
             func incScanned() {
@@ -2569,6 +2570,12 @@ public final class SyncEngine: Sendable {
             func incDirs() {
                 os_unfair_lock_lock(&lock)
                 dirsCreated += 1
+                os_unfair_lock_unlock(&lock)
+            }
+
+            func incFailed() {
+                os_unfair_lock_lock(&lock)
+                failed += 1
                 os_unfair_lock_unlock(&lock)
             }
         }
@@ -2600,10 +2607,26 @@ public final class SyncEngine: Sendable {
 
         @Sendable func commitObservations(_ pending: [IncrementalLocalObservation]) async throws {
             guard !pending.isEmpty else { return }
-            let observations = try await IncrementalLocalObservation.hash(pending, concurrency: min(6, effectiveSyncConcurrency))
+            let results = try await IncrementalLocalObservation.hash(pending, concurrency: min(6, effectiveSyncConcurrency))
+            var observations: [IncrementalLocalObservation.Hashed] = []
+            var failures: [IncrementalLocalObservation.Failure] = []
+            observations.reserveCapacity(results.count)
+            failures.reserveCapacity(results.count)
+            for result in results {
+                switch result {
+                case .hashed(let observation):
+                    observations.append(observation)
+                case .failed(let failure):
+                    failures.append(failure)
+                    scanProgress.incFailed()
+                    self.logger.error("本地文件读取或哈希失败，保留既有状态并继续同步 [\(failure.observation.url.path)]: \(failure.message)")
+                }
+            }
+            let successfulObservations = observations
+            let failedObservations = failures
             let ids = try await self.store.write { conn -> [Int64] in
                 var ids: [Int64] = []
-                for result in observations {
+                for result in successfulObservations {
                     let observation = result.observation
                     let parentItemId = observation.parentID
                     let name = observation.name
@@ -2654,9 +2677,43 @@ public final class SyncEngine: Sendable {
                     _ = try stmt.step()
                     stmt.reset()
                 }
+                for failure in failedObservations {
+                    let observation = failure.observation
+                    let stmt = try conn.cachedStatement("""
+                    INSERT INTO items (
+                        root_id, parent_id, name, entry_kind,
+                        local_device, local_inode, local_mtime, local_size,
+                        local_status, remote_status, local_generation,
+                        phase, dirty_generation, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?,
+                        'unknown', 'absent', 1, 'waitingEvidence', 1, ?, ?)
+                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                    DO UPDATE SET
+                        local_device = excluded.local_device,
+                        local_inode = excluded.local_inode,
+                        local_mtime = excluded.local_mtime,
+                        local_size = excluded.local_size,
+                        local_status = 'unknown',
+                        local_generation = items.local_generation + 1,
+                        dirty_generation = items.dirty_generation + 1,
+                        phase = 'waitingEvidence',
+                        updated_at = excluded.updated_at;
+                    """)
+                    stmt.bindInt64(rootId, at: 1)
+                    stmt.bindInt64(observation.parentID, at: 2)
+                    stmt.bindText(observation.name, at: 3)
+                    stmt.bindInt64(observation.device, at: 4)
+                    stmt.bindInt64(observation.inode, at: 5)
+                    stmt.bindInt64(observation.mtime, at: 6)
+                    stmt.bindInt64(observation.size, at: 7)
+                    stmt.bindDouble(now, at: 8)
+                    stmt.bindDouble(now, at: 9)
+                    _ = try stmt.step()
+                    stmt.reset()
+                }
                 return ids
             }
-            try await scheduleFiles(loadDirtyItems(ids), duringScan: true)
+            if !ids.isEmpty { try await scheduleFiles(loadDirtyItems(ids), duringScan: true) }
         }
         let sentFirstObservation = OSAllocatedUnfairLock(initialState: false)
 
@@ -3300,7 +3357,7 @@ public final class SyncEngine: Sendable {
         stats.bytesDownloaded = actionTracker.bytesDown
         stats.filesDeleted = actionTracker.deleted
         stats.conflictsResolved = recoveredConflicts + actionTracker.conflicts.withLock { $0 }
-        stats.filesFailed = actionTracker.failures.withLock { $0 }
+        stats.filesFailed = scanProgress.failed + actionTracker.failures.withLock { $0 }
         stats.elapsedSeconds = elapsed
         notifier.finish()
 

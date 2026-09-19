@@ -750,14 +750,25 @@ struct ChangesRecoveryTests {
     }
 
     private func oneEntry(_ url: URL, type: EntryType = .file) throws -> ScanBatch {
-        var info = stat()
-        guard stat(url.path, &info) == 0 else { throw POSIXError(.EIO) }
-        let bytes = Array(url.path.utf8)
-        return ScanBatch(pathData: bytes + [0], records: [.init(offset: 0, length: UInt32(bytes.count), type: type,
-            metadata: FileMetadata(identity: FileIdentity(device: info.st_dev, inode: info.st_ino),
-                modificationTime: FileTimestamp(seconds: Int64(info.st_mtimespec.tv_sec), nanoseconds: Int32(info.st_mtimespec.tv_nsec)),
-                changeTime: FileTimestamp(seconds: Int64(info.st_ctimespec.tv_sec), nanoseconds: Int32(info.st_ctimespec.tv_nsec)),
-                fileSize: Int64(info.st_size)))])
+        try entries([(url, type)])
+    }
+
+    private func entries(_ entries: [(URL, EntryType)]) throws -> ScanBatch {
+        var data: [UInt8] = []
+        var records: [ScanBatch.Record] = []
+        for (url, type) in entries {
+            var info = stat()
+            guard stat(url.path, &info) == 0 else { throw POSIXError(.EIO) }
+            let bytes = Array(url.path.utf8)
+            records.append(.init(offset: UInt32(data.count), length: UInt32(bytes.count), type: type,
+                metadata: FileMetadata(identity: FileIdentity(device: info.st_dev, inode: info.st_ino),
+                    modificationTime: FileTimestamp(seconds: Int64(info.st_mtimespec.tv_sec), nanoseconds: Int32(info.st_mtimespec.tv_nsec)),
+                    changeTime: FileTimestamp(seconds: Int64(info.st_ctimespec.tv_sec), nanoseconds: Int32(info.st_ctimespec.tv_nsec)),
+                    fileSize: Int64(info.st_size))))
+            data.append(contentsOf: bytes)
+            data.append(0)
+        }
+        return ScanBatch(pathData: data, records: records)
     }
 
     private func waitForUpload(_ name: String) async throws -> Bool {
@@ -766,6 +777,66 @@ struct ChangesRecoveryTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         return false
+    }
+
+    @Test("A vanished observation does not abort later files or become a deletion")
+    func vanishedObservationIsolated() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let vanished = f.local.appendingPathComponent("vanished")
+        let healthy = f.local.appendingPathComponent("healthy")
+        let old = Data("old baseline".utf8)
+        try old.write(to: vanished)
+        try Data("healthy body".utf8).write(to: healthy)
+        let batch = try entries([(vanished, .file), (healthy, .file)])
+        var version = stat()
+        #expect(stat(vanished.path, &version) == 0)
+        let device = Int64(version.st_dev)
+        let inode = Int64(version.st_ino)
+        let oldSHA = SyncEngine.computeSha256(of: old)
+        try await f.store.write { conn in
+            let query = try conn.prepare("""
+                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,
+                    local_device,local_inode,local_mtime,local_size,local_sha256,
+                    base_sha256,base_size,remote_sha256,remote_size,
+                    local_status,remote_status,phase,dirty_generation,created_at,updated_at)
+                VALUES (?,?,?,'file','remote-vanished',?,?,?,?,?,?,?,?,?,
+                    'present','present','committed',0,1,1);
+                """)
+            query.bindInt64(f.rootID, at: 1)
+            query.bindInt64(f.rootItemID, at: 2)
+            query.bindText("vanished", at: 3)
+            query.bindInt64(device, at: 4)
+            query.bindInt64(inode, at: 5)
+            query.bindInt64(0, at: 6) // force hashing instead of the cache fast path
+            query.bindInt64(Int64(old.count), at: 7)
+            query.bindText(oldSHA, at: 8)
+            query.bindText(oldSHA, at: 9)
+            query.bindInt64(Int64(old.count), at: 10)
+            query.bindText(oldSHA, at: 11)
+            query.bindInt64(Int64(old.count), at: 12)
+            _ = try query.step()
+        }
+        let engine = try await SyncEngine(auth: f.auth, store: f.store, client: f.client,
+            idPool: IDPool(initialIds: ["healthy-id"]), incrementalScan: { _, consume in
+                try FileManager.default.removeItem(at: vanished)
+                try await consume(batch)
+            })
+
+        let stats = try await engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+
+        #expect(stats.filesFailed == 1)
+        #expect(stats.filesUploaded == 1)
+        #expect(ChangesProtocol.state.withLock { $0.files.values.contains { $0.name == "healthy" } })
+        let preserved = try await f.store.read { conn in
+            let query = try conn.prepare("SELECT local_status, is_tombstone, base_sha256, dirty_generation, phase, local_sha256 FROM items WHERE name = 'vanished';")
+            guard try query.step() else { return false }
+            return query.columnText(at: 0) == "unknown" && query.columnInt64(at: 1) == 0
+                && query.columnText(at: 2) == oldSHA && (query.columnInt64(at: 3) ?? 0) > 0
+                && query.columnText(at: 4) == "waitingEvidence" && query.columnText(at: 5) == oldSHA
+        }
+        #expect(preserved)
+        #expect(!ChangesProtocol.state.withLock { $0.requests.contains { $0.contains("remote-vanished") } })
     }
 
     @Test("Streaming downloads stay outside the active scan and use the configured remote-root folder")
