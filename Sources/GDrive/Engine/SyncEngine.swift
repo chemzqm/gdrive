@@ -442,57 +442,56 @@ public final class SyncEngine: Sendable {
                         uploadGroup.enter()
                         Task {
                             defer { uploadGroup.leave() }
+                            var createIntent: DurableCreateIntent?
                             do {
-                                let remoteId = try await self.idPool.nextId()
+                                let candidateRemoteId = try await self.idPool.nextId()
                                 let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
-
-                                // 远端创建目录
-                                _ = try await self.client.createDirectory(name: name, parentId: remoteParentId, remoteId: remoteId)
-
-                                // 记录数据库项
                                 let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
-                                let dirItemId: Int64 = try await self.store.write { conn in
-                                    let dirDev = Int64(record.metadata?.identity.device ?? 1)
-                                    let dirIno = Int64(record.metadata?.identity.inode ?? 0)
-                                    let stmt = try conn.cachedStatement("""
-                                    INSERT INTO items (
-                                        root_id, parent_id, name, entry_kind, remote_file_id,
-                                        local_device, local_inode, local_status,
-                                        phase, created_at, updated_at
-                                    ) VALUES (?, ?, ?, 'directory', ?, ?, ?, 'present', 'committed', ?, ?)
-                                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                    DO UPDATE SET remote_file_id = excluded.remote_file_id, local_device = excluded.local_device, local_inode = excluded.local_inode, local_status = 'present', updated_at = excluded.updated_at;
-                                    """)
-                                    stmt.bindInt64(rootId, at: 1)
-                                    stmt.bindInt64(grandParentItemId, at: 2)
-                                    stmt.bindText(name, at: 3)
-                                    stmt.bindText(remoteId, at: 4)
-                                    stmt.bindInt64(dirDev, at: 5)
-                                    stmt.bindInt64(dirIno, at: 6)
+                                let intent = try await DurableCreateIntentStore.prepareDirectory(
+                                    store: self.store,
+                                    rootID: rootId,
+                                    parentItemID: grandParentItemId,
+                                    name: name,
+                                    targetParentRemoteID: remoteParentId,
+                                    candidateRemoteID: candidateRemoteId,
+                                    device: Int64(record.metadata?.identity.device ?? 1),
+                                    inode: Int64(record.metadata?.identity.inode ?? 0)
+                                )
+                                createIntent = intent
+
+                                // Intent 的 group-commit 已确认后，才允许发出远端创建请求。
+                                _ = try await self.client.createDirectory(
+                                    name: name,
+                                    parentId: intent.targetParentRemoteID,
+                                    remoteId: intent.targetRemoteID
+                                )
+
+                                try await self.store.batchWrite { conn in
                                     let ts = Date().timeIntervalSince1970
-                                    stmt.bindDouble(ts, at: 7)
-                                    stmt.bindDouble(ts, at: 8)
+                                    let stmt = try conn.cachedStatement("""
+                                    UPDATE items SET
+                                        remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                                    WHERE item_id = ?;
+                                    """)
+                                    stmt.bindDouble(ts, at: 1)
+                                    stmt.bindInt64(intent.itemID, at: 2)
                                     _ = try stmt.step()
                                     stmt.reset()
-
-                                    let qStmt = try conn.cachedStatement("""
-                                    SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                                    """)
-                                    qStmt.bindInt64(rootId, at: 1)
-                                    qStmt.bindInt64(grandParentItemId, at: 2)
-                                    qStmt.bindText(name, at: 3)
-                                    guard try qStmt.step(), let dId = qStmt.columnInt64(at: 0) else {
-                                        throw NSError(domain: "SyncEngine", code: 5, userInfo: [NSLocalizedDescriptionKey: "无法获取 dir item_id"])
-                                    }
-                                    qStmt.reset()
-                                    return dId
+                                    try DurableCreateIntentStore.completeOperation(conn: conn, operationID: intent.operationID, now: ts)
                                 }
-                                localDirMap.set(relPath, id: dirItemId)
+                                localDirMap.set(relPath, id: intent.itemID)
 
                                 // 广播唤醒等待该目录的全部子项
-                                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: remoteId)
+                                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
                                 progress.recordDirCreated()
                             } catch {
+                                if let createIntent {
+                                    await DurableCreateIntentStore.markUnknownOutcome(
+                                        store: self.store,
+                                        operationID: createIntent.operationID,
+                                        error: error
+                                    )
+                                }
                                 self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
                             }
                         }
@@ -513,6 +512,7 @@ public final class SyncEngine: Sendable {
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
+                            var createIntent: DurableCreateIntent?
                             // 先等待直接父目录在 Google Drive 远端就绪，避免空占并发上传槽位
                             let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
 
@@ -525,8 +525,6 @@ public final class SyncEngine: Sendable {
                             }
 
                             do {
-                                let remoteFileId = try await self.idPool.nextId()
-
                                 let fileURL = URL(fileURLWithPath: fullPath)
                                 let limit8MB: Int64 = 8 * 1024 * 1024
                                 let metaSize = Int64(record.metadata?.fileSize ?? 0)
@@ -566,72 +564,101 @@ public final class SyncEngine: Sendable {
 
                                 // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
                                 if fileSize <= limit8MB, let content = smallContent {
-                                    // 小文件：直接发送内存数据，零磁盘暂存与二次读盘
-                                    _ = try await self.client.uploadMultipart(
-                                        name: name,
-                                        parentId: remoteParentId,
-                                        remoteId: remoteFileId,
-                                        content: content,
-                                        expectedSha256: sha256Hex
-                                    )
+                                    let committedTarget: (itemID: Int64, remoteID: String)? = try await self.store.read { conn in
+                                        let stmt = try conn.cachedStatement("""
+                                        SELECT item_id, remote_file_id
+                                        FROM items
+                                        WHERE root_id = ? AND parent_id = ? AND name = ?
+                                          AND is_tombstone = 0 AND phase = 'committed'
+                                          AND remote_status = 'present' AND remote_file_id IS NOT NULL;
+                                        """)
+                                        stmt.bindInt64(rootId, at: 1)
+                                        stmt.bindInt64(parentDirItemId, at: 2)
+                                        stmt.bindText(name, at: 3)
+                                        defer { stmt.reset() }
+                                        guard try stmt.step(),
+                                              let itemID = stmt.columnInt64(at: 0),
+                                              let remoteID = stmt.columnText(at: 1) else { return nil }
+                                        return (itemID, remoteID)
+                                    }
+
+                                    let uploadedFile: DriveFile
+                                    let committedItemID: Int64
+                                    if let committedTarget {
+                                        // 已提交对象是内容更新，不创建新的 Drive 对象或 create intent。
+                                        uploadedFile = try await self.client.updateMultipart(
+                                            remoteId: committedTarget.remoteID,
+                                            content: content,
+                                            expectedSha256: sha256Hex
+                                        )
+                                        committedItemID = committedTarget.itemID
+                                    } else {
+                                        let candidateRemoteID = try await self.idPool.nextId()
+                                        let intent = try await DurableCreateIntentStore.prepareMultipartUpload(
+                                            store: self.store,
+                                            rootID: rootId,
+                                            parentItemID: parentDirItemId,
+                                            name: name,
+                                            targetParentRemoteID: remoteParentId,
+                                            candidateRemoteID: candidateRemoteID,
+                                            device: dev,
+                                            inode: ino,
+                                            mtime: mtime,
+                                            size: fileSize,
+                                            sha256: sha256Hex
+                                        )
+                                        createIntent = intent
+                                        uploadedFile = try await self.client.uploadMultipart(
+                                            name: name,
+                                            parentId: intent.targetParentRemoteID,
+                                            remoteId: intent.targetRemoteID,
+                                            content: content,
+                                            expectedSha256: sha256Hex
+                                        )
+                                        committedItemID = intent.itemID
+                                    }
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
 
                                     // 上传成功后，通过 batchWrite（Group Commit，合并 256 项或 5ms 刷盘）写入基线
+                                    let completedCreateIntent = createIntent
                                     try await self.store.batchWrite { conn in
                                         let itemStmt = try conn.cachedStatement("""
-                                        INSERT INTO items (
-                                            root_id, parent_id, name, entry_kind, remote_file_id,
-                                            local_device, local_inode, local_mtime, local_size, local_sha256,
-                                            base_sha256, base_size,
-                                            remote_sha256, remote_size, remote_status,
-                                            local_generation, local_status, phase, dirty_generation,
-                                            created_at, updated_at
-                                        ) VALUES (
-                                            ?, ?, ?, 'file', ?,
-                                            ?, ?, ?, ?, ?,
-                                            ?, ?,
-                                            ?, ?, 'present',
-                                            1, 'present', 'committed', 0,
-                                            ?, ?
-                                        )
-                                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                        DO UPDATE SET
-                                            remote_file_id = excluded.remote_file_id,
-                                            local_device = excluded.local_device,
-                                            local_inode = excluded.local_inode,
-                                            local_mtime = excluded.local_mtime,
-                                            local_size = excluded.local_size,
-                                            local_sha256 = excluded.local_sha256,
-                                            base_sha256 = excluded.base_sha256,
-                                            base_size = excluded.base_size,
-                                            remote_sha256 = excluded.remote_sha256,
-                                            remote_size = excluded.remote_size,
-                                            remote_status = 'present',
-                                            phase = 'committed',
-                                            dirty_generation = 0,
-                                            updated_at = excluded.updated_at;
+                                        UPDATE items SET
+                                            remote_file_id = ?,
+                                            local_device = ?, local_inode = ?, local_mtime = ?,
+                                            local_size = ?, local_sha256 = ?,
+                                            base_sha256 = ?, base_size = ?,
+                                            remote_sha256 = ?, remote_size = ?, remote_status = 'present',
+                                            local_status = 'present', phase = 'committed', dirty_generation = 0,
+                                            updated_at = ?
+                                        WHERE item_id = ?;
                                         """)
-                                        itemStmt.bindInt64(rootId, at: 1)
-                                        itemStmt.bindInt64(parentDirItemId, at: 2)
-                                        itemStmt.bindText(name, at: 3)
-                                        itemStmt.bindText(remoteFileId, at: 4)
-                                        itemStmt.bindInt64(dev, at: 5)
-                                        itemStmt.bindInt64(ino, at: 6)
-                                        itemStmt.bindInt64(mtime, at: 7)
+                                        itemStmt.bindText(uploadedFile.id, at: 1)
+                                        itemStmt.bindInt64(dev, at: 2)
+                                        itemStmt.bindInt64(ino, at: 3)
+                                        itemStmt.bindInt64(mtime, at: 4)
+                                        itemStmt.bindInt64(fileSize, at: 5)
+                                        itemStmt.bindText(sha256Hex, at: 6)
+                                        itemStmt.bindText(sha256Hex, at: 7)
                                         itemStmt.bindInt64(fileSize, at: 8)
                                         itemStmt.bindText(sha256Hex, at: 9)
-                                        itemStmt.bindText(sha256Hex, at: 10)
-                                        itemStmt.bindInt64(fileSize, at: 11)
-                                        itemStmt.bindText(sha256Hex, at: 12)
-                                        itemStmt.bindInt64(fileSize, at: 13)
+                                        itemStmt.bindInt64(fileSize, at: 10)
                                         let ts = Date().timeIntervalSince1970
-                                        itemStmt.bindDouble(ts, at: 14)
-                                        itemStmt.bindDouble(ts, at: 15)
+                                        itemStmt.bindDouble(ts, at: 11)
+                                        itemStmt.bindInt64(committedItemID, at: 12)
                                         _ = try itemStmt.step()
                                         itemStmt.reset()
+                                        if let createIntent = completedCreateIntent {
+                                            try DurableCreateIntentStore.completeOperation(
+                                                conn: conn,
+                                                operationID: createIntent.operationID,
+                                                now: ts
+                                            )
+                                        }
                                     }
                                 } else {
                                     // 大文件 (> 8MB)：上传前单次写入 inFlight 状态，获取 itemId 以支持断点分块续传
+                                    let remoteFileId = try await self.idPool.nextId()
                                     let currentItemId: Int64 = try await self.store.write { conn in
                                         let itemStmt = try conn.cachedStatement("""
                                         INSERT INTO items (
@@ -727,6 +754,13 @@ public final class SyncEngine: Sendable {
 
                                 progress.recordSuccess(bytes: fileSize)
                             } catch {
+                                if let createIntent {
+                                    await DurableCreateIntentStore.markUnknownOutcome(
+                                        store: self.store,
+                                        operationID: createIntent.operationID,
+                                        error: error
+                                    )
+                                }
                                 progress.recordFailure()
                                 self.logger.error("上传文件失败 [\(relPath)]: \(error)")
                             }
@@ -1921,42 +1955,56 @@ public final class SyncEngine: Sendable {
                     } else if dirContext.getItemId(byRelPath: relPath) == nil {
                         // 新建本地目录
                         let remoteParentId = dirContext.getRemoteId(for: parentItemId) ?? remoteRootId
-                        let newDirRemoteId = (try? await self.idPool.nextId()) ?? UUID().uuidString
-
-                        _ = try? await self.client.createDirectory(name: name, parentId: remoteParentId, remoteId: newDirRemoteId)
-                        let dItemId: Int64 = try await self.store.write { conn in
-                            let stmt = try conn.cachedStatement("""
-                            INSERT INTO items (
-                                root_id, parent_id, name, entry_kind, remote_file_id,
-                                local_device, local_inode, local_status, phase, created_at, updated_at
-                            ) VALUES (?, ?, ?, 'directory', ?, ?, ?, 'present', 'committed', ?, ?)
-                            ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                            DO UPDATE SET remote_file_id = excluded.remote_file_id, local_device = excluded.local_device, local_inode = excluded.local_inode, local_status = 'present', updated_at = excluded.updated_at;
-                            """)
-                            stmt.bindInt64(rootId, at: 1)
-                            stmt.bindInt64(parentItemId, at: 2)
-                            stmt.bindText(name, at: 3)
-                            stmt.bindText(newDirRemoteId, at: 4)
-                            stmt.bindInt64(dev, at: 5)
-                            stmt.bindInt64(ino, at: 6)
-                            stmt.bindDouble(now, at: 7)
-                            stmt.bindDouble(now, at: 8)
-                            _ = try stmt.step()
-                            stmt.reset()
-
-                            let q = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;")
-                            q.bindInt64(rootId, at: 1)
-                            q.bindInt64(parentItemId, at: 2)
-                            q.bindText(name, at: 3)
-                            guard try q.step(), let id = q.columnInt64(at: 0) else {
-                                throw NSError(domain: "SyncEngine", code: 22, userInfo: nil)
+                        let candidateRemoteID = try await self.idPool.nextId()
+                        var intent: DurableCreateIntent?
+                        do {
+                            let prepared = try await DurableCreateIntentStore.prepareDirectory(
+                                store: self.store,
+                                rootID: rootId,
+                                parentItemID: parentItemId,
+                                name: name,
+                                targetParentRemoteID: remoteParentId,
+                                candidateRemoteID: candidateRemoteID,
+                                device: dev,
+                                inode: ino
+                            )
+                            intent = prepared
+                            _ = try await self.client.createDirectory(
+                                name: name,
+                                parentId: prepared.targetParentRemoteID,
+                                remoteId: prepared.targetRemoteID
+                            )
+                            try await self.store.batchWrite { conn in
+                                let ts = Date().timeIntervalSince1970
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET
+                                    remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                                WHERE item_id = ?;
+                                """)
+                                stmt.bindDouble(ts, at: 1)
+                                stmt.bindInt64(prepared.itemID, at: 2)
+                                _ = try stmt.step()
+                                stmt.reset()
+                                try DurableCreateIntentStore.completeOperation(conn: conn, operationID: prepared.operationID, now: ts)
                             }
-                            q.reset()
-                            return id
+                            dirContext.register(
+                                itemId: prepared.itemID,
+                                parentItemId: parentItemId,
+                                name: name,
+                                remoteId: prepared.targetRemoteID
+                            )
+                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                            scanProgress.incDirs()
+                        } catch {
+                            if let intent {
+                                await DurableCreateIntentStore.markUnknownOutcome(
+                                    store: self.store,
+                                    operationID: intent.operationID,
+                                    error: error
+                                )
+                            }
+                            self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
                         }
-                        dirContext.register(itemId: dItemId, parentItemId: parentItemId, name: name, remoteId: newDirRemoteId)
-                        seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                        scanProgress.incDirs()
                     } else {
                         seenDirTracker.markSeen(parentId: parentItemId, name: name)
                     }
@@ -2165,16 +2213,28 @@ public final class SyncEngine: Sendable {
             let baseline: ItemBaseline?
             let local: LocalObservation?
             let remote: RemoteObservation?
+            let pendingCreate: DurableCreateIntent?
         }
 
         let dirtyItems: [DirtyRecord] = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
-            SELECT item_id, parent_id, name, remote_file_id, entry_kind,
-                   base_sha256, base_size,
-                   local_sha256, local_size, local_status,
-                   remote_sha256, remote_size, remote_status
+            SELECT items.item_id, items.parent_id, items.name, items.remote_file_id, items.entry_kind,
+                   items.base_sha256, items.base_size,
+                   items.local_sha256, items.local_size, items.local_status,
+                   items.remote_sha256, items.remote_size, items.remote_status,
+                   op.operation_id, op.target_remote_id, op.target_parent_remote_id,
+                   op.expected_local_generation, op.expected_sha256, op.total_bytes
             FROM items
-            WHERE root_id = ? AND dirty_generation > 0 AND is_tombstone = 0;
+            LEFT JOIN operations op ON op.operation_id = (
+                SELECT candidate.operation_id
+                FROM operations candidate
+                WHERE candidate.item_id = items.item_id
+                  AND candidate.operation_type IN ('createDirectory', 'uploadMultipart')
+                  AND candidate.state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
+                ORDER BY candidate.created_at DESC
+                LIMIT 1
+            )
+            WHERE items.root_id = ? AND items.dirty_generation > 0 AND items.is_tombstone = 0;
             """)
             stmt.bindInt64(rootId, at: 1)
             var records: [DirtyRecord] = []
@@ -2201,9 +2261,27 @@ public final class SyncEngine: Sendable {
                 let rStatus = RemoteObservation.Status(rawValue: rStatusStr) ?? .unknown
                 let remote = RemoteObservation(status: rStatus, sha256: rSha, size: rSize)
 
+                let pendingCreate: DurableCreateIntent?
+                if let operationID = stmt.columnText(at: 13),
+                   let targetRemoteID = stmt.columnText(at: 14),
+                   let targetParentRemoteID = stmt.columnText(at: 15) {
+                    pendingCreate = DurableCreateIntent(
+                        operationID: operationID,
+                        itemID: iId,
+                        targetRemoteID: targetRemoteID,
+                        targetParentRemoteID: targetParentRemoteID,
+                        expectedLocalGeneration: stmt.columnInt64(at: 16) ?? 0,
+                        expectedSHA256: stmt.columnText(at: 17),
+                        totalBytes: stmt.columnInt64(at: 18)
+                    )
+                } else {
+                    pendingCreate = nil
+                }
+
                 records.append(DirtyRecord(
                     itemId: iId, parentId: pId, name: name, remoteFileId: rFileId,
-                    entryKind: kind, baseline: baseline, local: local, remote: remote
+                    entryKind: kind, baseline: baseline, local: local, remote: remote,
+                    pendingCreate: pendingCreate
                 ))
             }
             stmt.reset()
@@ -2231,8 +2309,54 @@ public final class SyncEngine: Sendable {
         let fileItems = dirtyItems.filter { $0.entryKind == "file" }
         let dirItems = dirtyItems.filter { $0.entryKind == "directory" }
 
+        // 恢复上次在请求前已持久化、但尚未提交完成回执的目录创建。
+        // createDirectory 使用相同预生成 ID 重试；若服务端上次已成功，DriveClient 会在 409 后核验同一对象。
+        let pendingDirectoryCreates = dirItems.compactMap { item -> (DirtyRecord, DurableCreateIntent)? in
+            guard let intent = item.pendingCreate else { return nil }
+            return (item, intent)
+        }.sorted { lhs, rhs in
+            let left = dirContext.getRelPath(for: lhs.0.itemId) ?? lhs.0.name
+            let right = dirContext.getRelPath(for: rhs.0.itemId) ?? rhs.0.name
+            return left.split(separator: "/").count < right.split(separator: "/").count
+        }
+
+        for (item, intent) in pendingDirectoryCreates {
+            do {
+                _ = try await client.createDirectory(
+                    name: item.name,
+                    parentId: intent.targetParentRemoteID,
+                    remoteId: intent.targetRemoteID
+                )
+                try await store.batchWrite { conn in
+                    let ts = Date().timeIntervalSince1970
+                    let stmt = try conn.cachedStatement("""
+                    UPDATE items SET
+                        remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                    WHERE item_id = ?;
+                    """)
+                    stmt.bindDouble(ts, at: 1)
+                    stmt.bindInt64(intent.itemID, at: 2)
+                    _ = try stmt.step()
+                    stmt.reset()
+                    try DurableCreateIntentStore.completeOperation(conn: conn, operationID: intent.operationID, now: ts)
+                }
+            } catch {
+                await DurableCreateIntentStore.markUnknownOutcome(
+                    store: store,
+                    operationID: intent.operationID,
+                    error: error
+                )
+                logger.error("恢复远端目录创建失败 [\(item.name)]: \(error)")
+            }
+        }
+
         for item in fileItems {
-            let decision = Reconciler.decide(baseline: item.baseline, local: item.local, remote: item.remote)
+            let decision: ReconcileDecision
+            if item.pendingCreate != nil {
+                decision = .upload(reason: "恢复已持久化的小文件创建意图")
+            } else {
+                decision = Reconciler.decide(baseline: item.baseline, local: item.local, remote: item.remote)
+            }
 
             switch decision {
             case .upload, .keepModified(preferLocal: true):
@@ -2241,6 +2365,7 @@ public final class SyncEngine: Sendable {
                 self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
                 syncGroup.enter()
                 Task {
+                    var createIntent = item.pendingCreate
                     await syncSemaphore.wait()
                     defer {
                         self.monitor.finishUpload(id: item.name)
@@ -2291,29 +2416,57 @@ public final class SyncEngine: Sendable {
                         self.monitor.startUpload(id: item.name, name: item.name, totalBytes: fSize)
 
                         let fileData = try Data(contentsOf: localFileURL)
+                        let attrs = try FileManager.default.attributesOfItem(atPath: localFileURL.path)
+                        let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? Date().timeIntervalSince1970) * 1_000_000_000
+                        let dev = (attrs[.systemNumber] as? NSNumber)?.int64Value ?? 0
+                        let ino = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
                         let uploadedFile: DriveFile
-                        if let existingRemoteId = item.remoteFileId {
+                        if let pending = createIntent {
+                            guard let expectedSHA256 = pending.expectedSHA256,
+                                  expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
+                                  pending.totalBytes == fSize else {
+                                throw SyncEngineError.general("未完成的小文件创建意图输入已变化: \(item.name)")
+                            }
+                            uploadedFile = try await self.client.uploadMultipart(
+                                name: item.name,
+                                parentId: pending.targetParentRemoteID,
+                                remoteId: pending.targetRemoteID,
+                                content: fileData,
+                                expectedSha256: sha256Hex
+                            )
+                        } else if let existingRemoteId = item.remoteFileId {
                             uploadedFile = try await self.client.updateMultipart(
                                 remoteId: existingRemoteId,
                                 content: fileData,
                                 expectedSha256: sha256Hex
                             )
                         } else {
-                            let newRemoteId = (try? await self.idPool.nextId()) ?? UUID().uuidString
+                            let newRemoteId = try await self.idPool.nextId()
+                            let prepared = try await DurableCreateIntentStore.prepareMultipartUpload(
+                                store: self.store,
+                                rootID: rootId,
+                                itemID: item.itemId,
+                                parentItemID: item.parentId,
+                                name: item.name,
+                                targetParentRemoteID: remoteParentId,
+                                candidateRemoteID: newRemoteId,
+                                device: dev,
+                                inode: ino,
+                                mtime: Int64(mtime),
+                                size: fSize,
+                                sha256: sha256Hex
+                            )
+                            createIntent = prepared
                             uploadedFile = try await self.client.uploadMultipart(
                                 name: item.name,
-                                parentId: remoteParentId,
-                                remoteId: newRemoteId,
+                                parentId: prepared.targetParentRemoteID,
+                                remoteId: prepared.targetRemoteID,
                                 content: fileData,
                                 expectedSha256: sha256Hex
                             )
                         }
 
-                        let attrs = try FileManager.default.attributesOfItem(atPath: localFileURL.path)
-                        let mtime = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? Date().timeIntervalSince1970) * 1_000_000_000
-                        let dev = (attrs[.systemNumber] as? NSNumber)?.int64Value ?? 0
-                        let ino = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
-
+                        let completedCreateIntent = createIntent
                         try await self.store.batchWrite { conn in
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET
@@ -2345,11 +2498,25 @@ public final class SyncEngine: Sendable {
                             stmt.bindInt64(item.itemId, at: 11)
                             _ = try stmt.step()
                             stmt.reset()
+                            if let createIntent = completedCreateIntent {
+                                try DurableCreateIntentStore.completeOperation(
+                                    conn: conn,
+                                    operationID: createIntent.operationID,
+                                    now: now
+                                )
+                            }
                         }
 
                         actionTracker.uploaded += 1
                         actionTracker.bytesUp += fSize
                     } catch {
+                        if let createIntent {
+                            await DurableCreateIntentStore.markUnknownOutcome(
+                                store: self.store,
+                                operationID: createIntent.operationID,
+                                error: error
+                            )
+                        }
                         self.logger.error("增量上传失败 [\(item.name)]: \(error)")
                     }
                 }

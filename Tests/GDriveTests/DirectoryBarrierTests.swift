@@ -299,6 +299,12 @@ struct DirectoryBarrierTests {
                 return (response, json.data(using: .utf8)!)
             }
 
+            if url.contains("/drive/v3/files/generateIds") {
+                let json = "{\"ids\":[\"generated-child-file-id\"]}"
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, json.data(using: .utf8)!)
+            }
+
             if url.contains("/drive/v3/changes") {
                 let json = "{\"newStartPageToken\": \"token_456\", \"changes\": []}"
                 let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
@@ -336,6 +342,7 @@ struct DirectoryBarrierTests {
 
         // 2. 远端目录被执行 untrash
         #expect(untrashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must be untrashed to protect child upload")
+        #expect(uploadedFiles.contains("local_new.txt"), "Local child must be uploaded after its durable ID is allocated")
 
         // 3. 数据库状态：sub 的 remote_status 恢复为 present，is_tombstone 为 0
         try await store.read { conn in
