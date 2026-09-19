@@ -16,6 +16,8 @@ private struct ChangesServer: Sendable {
     var failFolder: String?
     var incompleteFolder: String?
     var listingPages: [String: Data] = [:]
+    var resumableContents: [String: Data] = [:]
+    var resumableFiles: [String: DriveFile] = [:]
     var requests: [String] = []
     var verifyUpload: (@Sendable (String) throws -> Void)?
     var uploadDelay: TimeInterval = 0
@@ -45,6 +47,59 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
     private func respond() {
         do {
             let url = request.url!
+            if request.httpMethod == "POST", url.query?.contains("uploadType=resumable") == true {
+                let metadata = try #require(JSONSerialization.jsonObject(with: request.extractBodyData ?? Data()) as? [String: Any])
+                let id = try #require(metadata["id"] as? String)
+                let name = try #require(metadata["name"] as? String)
+                let parent = (metadata["parents"] as? [String])?.first ?? "root"
+                let size = request.value(forHTTPHeaderField: "X-Upload-Content-Length") ?? "0"
+                ChangesProtocol.state.withLock {
+                    $0.requests.append("POST \(url.path)?\(url.query ?? "")")
+                    $0.resumableFiles[id] = DriveFile(id: id, name: name, parents: [parent], size: size, version: "1")
+                    $0.resumableContents[id] = Data()
+                }
+                let response = HTTPURLResponse(
+                    url: url,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Location": "https://upload.test/resumable/\(id)"]
+                )!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: Data())
+                client?.urlProtocolDidFinishLoading(self)
+                return
+            }
+            if request.httpMethod == "PUT", url.host == "upload.test" {
+                let id = url.lastPathComponent
+                let body = request.extractBodyData ?? Data()
+                let result = try ChangesProtocol.state.withLock { state -> (Int, Data, [String: String]?) in
+                    state.requests.append("PUT \(url.path)?\(url.query ?? "")")
+                    state.resumableContents[id, default: Data()].append(body)
+                    let file = try #require(state.resumableFiles[id])
+                    let total = try #require(file.sizeBytes)
+                    let received = Int64(state.resumableContents[id]?.count ?? 0)
+                    if received < total {
+                        return (308, Data(), ["Range": "bytes=0-\(received - 1)"])
+                    }
+                    let bytes = state.resumableContents[id] ?? Data()
+                    let completed = DriveFile(
+                        id: file.id,
+                        name: file.name,
+                        parents: file.parents,
+                        size: String(bytes.count),
+                        sha256Checksum: SyncEngine.computeSha256(of: bytes),
+                        version: "1"
+                    )
+                    state.files[id] = completed
+                    state.contents[id] = bytes
+                    return (200, try JSONEncoder().encode(completed), nil)
+                }
+                let response = HTTPURLResponse(url: url, statusCode: result.0, httpVersion: nil, headerFields: result.2)!
+                client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+                client?.urlProtocol(self, didLoad: result.1)
+                client?.urlProtocolDidFinishLoading(self)
+                return
+            }
             let response: (Int, Data) = try Self.state.withLock { state in
                 let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
                 func value(_ key: String) -> String? { query.first { $0.name == key }?.value }
@@ -1011,6 +1066,33 @@ struct ChangesRecoveryTests {
         #expect(result.filesFailed == 0)
         #expect(ChangesProtocol.state.withLock { $0.peakUploads } == 2)
         #expect(ChangesProtocol.state.withLock { $0.activeUploads } == 0)
+    }
+
+    @Test("A17 incremental large files use bounded resumable chunks")
+    func incrementalLargeFileUsesResumableChunks() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let file = f.local.appendingPathComponent("large.bin")
+        let mebibyte = Data(repeating: 0x5a, count: 1024 * 1024)
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        for _ in 0..<9 { try handle.write(contentsOf: mebibyte) }
+        try handle.close()
+
+        let result = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root", maxConcurrency: 1)
+        #expect(result.filesUploaded == 1)
+        #expect(result.filesFailed == 0)
+        let requests = ChangesProtocol.state.withLock { $0.requests }
+        #expect(requests.contains { $0.contains("uploadType=resumable") })
+        #expect(requests.filter { $0.hasPrefix("PUT /resumable/") }.count == 2)
+        #expect(!requests.contains { $0.contains("uploadType=multipart") })
+        try await f.store.read { conn in
+            let item = try conn.prepare("SELECT phase, dirty_generation, base_size FROM items WHERE name = 'large.bin';")
+            #expect(try item.step())
+            #expect(item.columnText(at: 0) == "committed")
+            #expect(item.columnInt64(at: 1) == 0)
+            #expect(item.columnInt64(at: 2) == Int64(9 * 1024 * 1024))
+        }
     }
 
     @Test("A16 early child upload waits for a pending parent create to recover")

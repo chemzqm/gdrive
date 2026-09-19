@@ -460,6 +460,13 @@ public final class SyncEngine: Sendable {
         // 3. 设置有界并发上传流水线（严格上限 64 并发）
         let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
         let uploadSemaphore = AsyncSemaphore(count: effectiveConcurrency)
+        // Bound all bootstrap work admitted beyond the scanner. This window is
+        // deliberately larger than the transfer pool so scanning can stay ahead
+        // of slow requests without retaining one Task per tree entry.
+        let bootstrapTaskWindow = AsyncSemaphore(count: 512)
+        // Directory metadata requests do not consume file transfer slots, but
+        // they still need their own network concurrency bound.
+        let directorySemaphore = AsyncSemaphore(count: max(1, min(8, effectiveConcurrency)))
         let uploadGroup = DispatchGroup()
 
         // 加载快速变更比对基线缓存 (§6.2)
@@ -548,6 +555,13 @@ public final class SyncEngine: Sendable {
         let scanner = DirectoryScanner()
 
         _ = try await scanner.scan(request) { batch in
+            struct BootstrapScanRecord: Sendable {
+                let type: EntryType
+                let metadata: FileMetadata?
+                let fullPath: String
+            }
+            var copiedRecords: [BootstrapScanRecord] = []
+            copiedRecords.reserveCapacity(batch.count)
             batch.withRawData { rawBuf in
                 guard let basePtr = rawBuf.baseAddress else { return }
 
@@ -555,7 +569,16 @@ public final class SyncEngine: Sendable {
                     let record = batch.records[idx]
                     let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
                     let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
-                    let fullPath = String(cString: cPath)
+                    copiedRecords.append(BootstrapScanRecord(
+                        type: record.type,
+                        metadata: record.metadata,
+                        fullPath: String(cString: cPath)
+                    ))
+                }
+            }
+
+            for record in copiedRecords {
+                    let fullPath = record.fullPath
 
                     let relPath: String
                     if fullPath.hasPrefix(staticPrefix) {
@@ -574,13 +597,19 @@ public final class SyncEngine: Sendable {
                         if localDirMap.get(relPath) != nil {
                             continue
                         }
+                        await bootstrapTaskWindow.wait()
                         uploadGroup.enter()
                         Task {
-                            defer { uploadGroup.leave() }
+                            defer {
+                                bootstrapTaskWindow.signal()
+                                uploadGroup.leave()
+                            }
                             var createIntent: DurableCreateIntent?
                             do {
-                                let candidateRemoteId = try await self.idPool.nextId()
                                 let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                                await directorySemaphore.wait()
+                                defer { directorySemaphore.signal() }
+                                let candidateRemoteId = try await self.idPool.nextId()
                                 let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
                                 let intent = try await DurableCreateIntentStore.prepareDirectory(
                                     store: self.store,
@@ -643,12 +672,16 @@ public final class SyncEngine: Sendable {
                             continue
                         }
 
+                        await bootstrapTaskWindow.wait()
                         // 文件处理：等待其直接父目录就绪后立即上传
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
-                            defer { uploadGroup.leave() }
+                            defer {
+                                bootstrapTaskWindow.signal()
+                                uploadGroup.leave()
+                            }
                             var createIntent: DurableCreateIntent?
                             var didAcquireSemaphore = false
 
@@ -748,7 +781,7 @@ public final class SyncEngine: Sendable {
                                         } else {
                                             targetRemoteId = try await self.idPool.nextId()
                                         }
-                                        let intent = try await DurableCreateIntentStore.prepareMultipartUpload(
+                                        let intent = try await DurableCreateIntentStore.prepareFileUpload(
                                             store: self.store,
                                             rootID: rootId,
                                             itemID: existingTarget?.itemID,
@@ -760,7 +793,8 @@ public final class SyncEngine: Sendable {
                                             inode: ino,
                                             mtime: mtime,
                                             size: fileSize,
-                                            sha256: sha256Hex
+                                            sha256: sha256Hex,
+                                            transport: .multipart
                                         )
                                         createIntent = intent
 
@@ -984,7 +1018,6 @@ public final class SyncEngine: Sendable {
                             }
                         }
                     }
-                }
             }
         }
 
@@ -1918,7 +1951,7 @@ public final class SyncEngine: Sendable {
                     SELECT candidate.operation_id
                     FROM operations candidate
                     WHERE candidate.item_id = items.item_id
-                      AND candidate.operation_type IN ('createDirectory', 'uploadMultipart')
+                      AND candidate.operation_type IN ('createDirectory', 'uploadMultipart', 'createResumableUpload')
                       AND candidate.state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
                     ORDER BY candidate.created_at DESC
                     LIMIT 1
@@ -2129,16 +2162,57 @@ public final class SyncEngine: Sendable {
                             guard input.size == fSize, input.sha256 == sha256Hex else {
                                 throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
                             }
-                            let fileData = try input.data ?? Data(contentsOf: input.fileURL)
                             let mtime = input.version.mtime
                             let dev = input.version.device
                             let ino = input.version.inode
                             let uploadedFile: DriveFile
-                            if let pending = createIntent {
+                            if fSize > 8 * 1024 * 1024 {
+                                let target: DurableCreateIntent
+                                if let pending = createIntent {
+                                    guard let expectedSHA256 = pending.expectedSHA256,
+                                          expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
+                                          pending.totalBytes == fSize else {
+                                        throw SyncEngineError.general("未完成的大文件创建意图输入已变化: \(item.name)")
+                                    }
+                                    target = pending
+                                } else {
+                                    let newRemoteId = try await self.idPool.nextId()
+                                    target = try await DurableCreateIntentStore.prepareFileUpload(
+                                        store: self.store,
+                                        rootID: rootId,
+                                        itemID: item.itemId,
+                                        parentItemID: item.parentId,
+                                        name: item.name,
+                                        targetParentRemoteID: remoteParentId,
+                                        candidateRemoteID: newRemoteId,
+                                        device: dev,
+                                        inode: ino,
+                                        mtime: Int64(mtime),
+                                        size: fSize,
+                                        sha256: sha256Hex,
+                                        transport: .resumable
+                                    )
+                                    createIntent = target
+                                }
+                                uploadedFile = try await self.performResumableUpload(
+                                    rootId: rootId,
+                                    itemId: target.itemID,
+                                    fileURL: input.fileURL,
+                                    fileSize: fSize,
+                                    expectedSha256: sha256Hex,
+                                    remoteId: target.targetRemoteID,
+                                    parentId: target.targetParentRemoteID,
+                                    name: item.name,
+                                    isUpdate: false
+                                )
+                            } else if let pending = createIntent {
                                 guard let expectedSHA256 = pending.expectedSHA256,
                                       expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
                                       pending.totalBytes == fSize else {
                                     throw SyncEngineError.general("未完成的小文件创建意图输入已变化: \(item.name)")
+                                }
+                                guard let fileData = input.data else {
+                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
                                 }
                                 uploadedFile = try await self.client.uploadMultipart(
                                     name: item.name,
@@ -2148,14 +2222,20 @@ public final class SyncEngine: Sendable {
                                     expectedSha256: sha256Hex
                                 )
                             } else if let existingRemoteId = item.remoteFileId {
+                                guard let fileData = input.data else {
+                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
+                                }
                                 uploadedFile = try await self.client.updateMultipart(
                                     remoteId: existingRemoteId,
                                     content: fileData,
                                     expectedSha256: sha256Hex
                                 )
                             } else {
+                                guard let fileData = input.data else {
+                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
+                                }
                                 let newRemoteId = try await self.idPool.nextId()
-                                let prepared = try await DurableCreateIntentStore.prepareMultipartUpload(
+                                let prepared = try await DurableCreateIntentStore.prepareFileUpload(
                                     store: self.store,
                                     rootID: rootId,
                                     itemID: item.itemId,
@@ -2167,7 +2247,8 @@ public final class SyncEngine: Sendable {
                                     inode: ino,
                                     mtime: Int64(mtime),
                                     size: fSize,
-                                    sha256: sha256Hex
+                                    sha256: sha256Hex,
+                                    transport: .multipart
                                 )
                                 createIntent = prepared
                                 uploadedFile = try await self.client.uploadMultipart(

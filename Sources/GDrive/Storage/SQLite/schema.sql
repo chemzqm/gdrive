@@ -138,7 +138,7 @@ CREATE TABLE IF NOT EXISTS operations (
     root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
     operation_type TEXT NOT NULL CHECK (operation_type IN (
-        'createDirectory', 'uploadMultipart', 'uploadResumable',
+        'createDirectory', 'uploadMultipart', 'createResumableUpload', 'uploadResumable',
         'download', 'move', 'rename', 'trashRemote', 'deleteLocal', 'resolveConflict'
     )),
     state TEXT NOT NULL CHECK (state IN (

@@ -37,6 +37,18 @@ private final class IntentResultBox: @unchecked Sendable {
 enum DurableCreateIntentStore {
     private static let recoverableStates = "'ready', 'inFlight', 'verify', 'unknownOutcome'"
 
+    enum FileUploadTransport: Sendable {
+        case multipart
+        case resumable
+
+        var operationType: String {
+            switch self {
+            case .multipart: "uploadMultipart"
+            case .resumable: "createResumableUpload"
+            }
+        }
+    }
+
     static func prepareDirectory(
         store: StateStore,
         rootID: Int64,
@@ -82,7 +94,7 @@ enum DurableCreateIntentStore {
         return try box.load()
     }
 
-    static func prepareMultipartUpload(
+    static func prepareFileUpload(
         store: StateStore,
         rootID: Int64,
         itemID: Int64? = nil,
@@ -94,8 +106,10 @@ enum DurableCreateIntentStore {
         inode: Int64,
         mtime: Int64,
         size: Int64,
-        sha256: String
+        sha256: String,
+        transport: FileUploadTransport
     ) async throws -> DurableCreateIntent {
+        let operationType = transport.operationType
         let box = IntentResultBox()
         try await store.batchWrite { conn in
             do {
@@ -112,13 +126,14 @@ enum DurableCreateIntentStore {
                     mtime: mtime,
                     size: size,
                     sha256: sha256,
+                    operationType: operationType,
                     now: now
                 )
                 let intent = try upsertOperation(
                     conn: conn,
                     rootID: rootID,
                     itemID: item.itemID,
-                    operationType: "uploadMultipart",
+                    operationType: operationType,
                     expectedLocalGeneration: item.localGeneration,
                     expectedSHA256: sha256,
                     totalBytes: size,
@@ -133,6 +148,37 @@ enum DurableCreateIntentStore {
             }
         }
         return try box.load()
+    }
+
+    static func prepareMultipartUpload(
+        store: StateStore,
+        rootID: Int64,
+        itemID: Int64? = nil,
+        parentItemID: Int64,
+        name: String,
+        targetParentRemoteID: String,
+        candidateRemoteID: String,
+        device: Int64,
+        inode: Int64,
+        mtime: Int64,
+        size: Int64,
+        sha256: String
+    ) async throws -> DurableCreateIntent {
+        try await prepareFileUpload(
+            store: store,
+            rootID: rootID,
+            itemID: itemID,
+            parentItemID: parentItemID,
+            name: name,
+            targetParentRemoteID: targetParentRemoteID,
+            candidateRemoteID: candidateRemoteID,
+            device: device,
+            inode: inode,
+            mtime: mtime,
+            size: size,
+            sha256: sha256,
+            transport: .multipart
+        )
     }
 
     static func markUnknownOutcome(
@@ -221,6 +267,7 @@ enum DurableCreateIntentStore {
         mtime: Int64,
         size: Int64,
         sha256: String,
+        operationType: String,
         now: Double
     ) throws -> (itemID: Int64, remoteID: String, localGeneration: Int64) {
         if let requestedItemID {
@@ -279,10 +326,10 @@ enum DurableCreateIntentStore {
         }
 
         let item = try loadItemIdentity(conn: conn, rootID: rootID, parentItemID: parentItemID, name: name)
-        let pending = try loadActiveOperation(conn: conn, itemID: item.itemID, operationType: "uploadMultipart")
+        let pending = try loadActiveOperation(conn: conn, itemID: item.itemID, operationType: operationType)
         if let pending, let persistedSHA = pending.expectedSHA256,
            persistedSHA.caseInsensitiveCompare(sha256) != .orderedSame {
-            throw SyncEngineError.general("未完成的小文件创建意图与当前正文摘要不一致: \(name)")
+            throw SyncEngineError.general("未完成的文件创建意图与当前正文摘要不一致: \(name)")
         }
         return item
     }
