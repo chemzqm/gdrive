@@ -27,6 +27,7 @@ public struct SyncStats: Sendable {
 /// SyncEngine Exception type definition
 public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     case localRootNotFound(path: String)
+    case rootBusy(path: String)
     case remoteRootLost(remoteId: String, reason: String)
     case rootNotConfigured(remoteId: String)
     case invalidDirectory(path: String)
@@ -40,6 +41,8 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
         switch self {
         case .localRootNotFound(let path):
             return "The local sync root no longer exists or is not a valid directory: \(path). Sync stopped to prevent remote deletion propagation."
+        case .rootBusy(let path):
+            return "The local sync root is already being synchronized in this process: \(path)"
         case .remoteRootLost(let remoteId, let reason):
             return "The remote sync root was removed or trashed (\(reason)): \(remoteId). Sync stopped to prevent local deletion propagation."
         case .rootNotConfigured(let remoteId):
@@ -124,6 +127,22 @@ public final class SyncEngine: Sendable {
         monitor.getSnapshot()
     }
 
+    private func withRootSyncLock<T: Sendable>(
+        localPath: String,
+        operation: @Sendable () async throws -> T
+    ) async throws -> T {
+        let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
+        try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
+        do {
+            let result = try await operation()
+            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+            return result
+        } catch {
+            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+            throw error
+        }
+    }
+
     // MARK: - Unified synchronization portal (Automatic status detection and direction diversion)
 
     /// Unified two-way synchronization entrance:
@@ -140,6 +159,22 @@ public final class SyncEngine: Sendable {
         remoteFolderId: String,
         concurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
+    ) async throws -> SyncStats {
+        try await withRootSyncLock(localPath: localPath) {
+            try await self.syncUnlocked(
+                localPath: localPath,
+                remoteFolderId: remoteFolderId,
+                concurrency: concurrency,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func syncUnlocked(
+        localPath: String,
+        remoteFolderId: String,
+        concurrency: Int,
+        onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
@@ -165,13 +200,13 @@ public final class SyncEngine: Sendable {
         if let existing = existingRoot {
             if existing.bootstrapState == "existingKnown" {
                 logger.info("[Sync] Found a shared baseline; starting incremental bidirectional sync: \(resolvedLocalPath) <-> \(remoteFolderId)")
-                return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
+                return try await syncIncrementalUnlocked(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
             } else {
                 logger.info("[Sync] Found an unfinished initialization baseline (bootstrapState: \(existing.bootstrapState)); resuming initialization...")
                 if existing.initialDir == "remoteToLocalEmpty" {
-                    return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress)
+                    return try await initializeRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress, initialCursor: nil)
                 } else {
-                    return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
+                    return try await syncLocalToRemoteEmptyUnlocked(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
                 }
             }
         }
@@ -197,7 +232,7 @@ public final class SyncEngine: Sendable {
         // 3. Safe diversion based on detection results
         if !isLocalEmpty && isRemoteEmpty {
             logger.info("[Sync] Local content and an empty remote directory detected; starting localToRemoteEmpty initialization")
-            return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
+            return try await syncLocalToRemoteEmptyUnlocked(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
         } else if isLocalEmpty && !isRemoteEmpty {
             logger.info("[Sync] Remote content and an empty local directory detected; starting remoteToLocalEmpty initialization")
             return try await initializeRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress, initialCursor: emptyRootCursor)
@@ -300,6 +335,22 @@ public final class SyncEngine: Sendable {
         remoteRootId: String,
         maxUploadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
+    ) async throws -> SyncStats {
+        try await withRootSyncLock(localPath: localPath) {
+            try await self.syncLocalToRemoteEmptyUnlocked(
+                localPath: localPath,
+                remoteRootId: remoteRootId,
+                maxUploadConcurrency: maxUploadConcurrency,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func syncLocalToRemoteEmptyUnlocked(
+        localPath: String,
+        remoteRootId: String,
+        maxUploadConcurrency: Int,
+        onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
@@ -1072,8 +1123,10 @@ public final class SyncEngine: Sendable {
         maxDownloadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await initializeRemoteToLocalEmpty(localPath: localPath, remoteRootId: remoteRootId,
-            maxDownloadConcurrency: maxDownloadConcurrency, onProgress: onProgress, initialCursor: nil)
+        try await withRootSyncLock(localPath: localPath) {
+            try await self.initializeRemoteToLocalEmpty(localPath: localPath, remoteRootId: remoteRootId,
+                maxDownloadConcurrency: maxDownloadConcurrency, onProgress: onProgress, initialCursor: nil)
+        }
     }
 
     private func initializeRemoteToLocalEmpty(
@@ -1690,6 +1743,22 @@ public final class SyncEngine: Sendable {
         maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
+        try await withRootSyncLock(localPath: localPath) {
+            try await self.syncIncrementalUnlocked(
+                localPath: localPath,
+                remoteRootId: remoteRootId,
+                maxConcurrency: maxConcurrency,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func syncIncrementalUnlocked(
+        localPath: String,
+        remoteRootId: String,
+        maxConcurrency: Int,
+        onProgress: (@Sendable (SyncProgress) -> Void)?
+    ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
         // Find rootId with rootItemId
@@ -1716,7 +1785,7 @@ public final class SyncEngine: Sendable {
             throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "No matching sync root was found. Run initial sync first: \(remoteRootId)"])
         }
 
-        return try await syncIncremental(
+        return try await syncIncrementalUnlocked(
             rootId: rootInfo.rootId,
             rootItemId: rootInfo.rootItemId,
             localPath: resolvedLocalPath,
@@ -1735,6 +1804,26 @@ public final class SyncEngine: Sendable {
         remoteRootId: String,
         maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
+    ) async throws -> SyncStats {
+        try await withRootSyncLock(localPath: localPath) {
+            try await self.syncIncrementalUnlocked(
+                rootId: rootId,
+                rootItemId: rootItemId,
+                localPath: localPath,
+                remoteRootId: remoteRootId,
+                maxConcurrency: maxConcurrency,
+                onProgress: onProgress
+            )
+        }
+    }
+
+    private func syncIncrementalUnlocked(
+        rootId: Int64,
+        rootItemId: Int64,
+        localPath: String,
+        remoteRootId: String,
+        maxConcurrency: Int,
+        onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
