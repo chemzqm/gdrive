@@ -120,9 +120,13 @@ public struct DriveChangesPage: Codable, Sendable {
 /// - Large Files (> 8MB) Continuing in chunks Resumable Upload
 /// - Response Field One-Time Validation (id,name,mimeType,parents,size,sha256Checksum,version)
 public final class DriveClient: Sendable {
+    typealias RetrySleep = @Sendable (TimeInterval) async throws -> Void
+
     public let auth: Auth
     public let rateLimiter: DriveRateLimiter
     private let session: URLSession
+    private let retrySleep: RetrySleep
+    private let retryLimitOverride: Int?
     private let logger = Logger(label: "gdrive.client")
 
     public static let fields = "id,name,mimeType,parents,size,sha256Checksum,version,trashed"
@@ -153,6 +157,24 @@ public final class DriveClient: Sendable {
         self.auth = auth
         self.session = session
         self.rateLimiter = rateLimiter
+        self.retryLimitOverride = nil
+        self.retrySleep = { delay in
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    init(
+        auth: Auth,
+        session: URLSession,
+        rateLimiter: DriveRateLimiter = DriveRateLimiter(),
+        maxRetries: Int,
+        retrySleep: @escaping RetrySleep
+    ) {
+        self.auth = auth
+        self.session = session
+        self.rateLimiter = rateLimiter
+        self.retryLimitOverride = max(0, maxRetries)
+        self.retrySleep = retrySleep
     }
 
     /// High concurrency fast get effective Access Token(Memory atomic level cache, avoiding Actor contention)
@@ -178,6 +200,7 @@ public final class DriveClient: Sendable {
         maxRetries: Int = 5,
         acceptableStatusCodes: Set<Int> = Set(200..<300)
     ) async throws -> (Data, HTTPURLResponse) {
+        let retryLimit = retryLimitOverride ?? maxRetries
         var attempt = 0
         var currentReq = request
         var didRefreshAfterUnauthorized = false
@@ -192,11 +215,11 @@ public final class DriveClient: Sendable {
                 (data, response) = try await session.data(for: currentReq)
             } catch {
                 try Task.checkCancellation()
-                if attempt <= maxRetries {
+                if attempt <= retryLimit {
                     let jitter = Double.random(in: 0.1...0.5)
                     let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
                     await rateLimiter.reportRateLimit(retryAfter: delay)
-                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    try await retrySleep(delay)
                     continue
                 }
                 throw error
@@ -232,22 +255,22 @@ public final class DriveClient: Sendable {
             }
 
             if isRateLimit {
-                if attempt <= maxRetries {
+                if attempt <= retryLimit {
                     let jitter = Double.random(in: 0.2...0.8)
                     let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
                     let backoff = max(retryDelay ?? 0, exponential)
                     await rateLimiter.reportRateLimit(retryAfter: backoff)
-                    try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    try await retrySleep(backoff)
                     continue
                 }
                 throw DriveError.rateLimited(retryAfter: retryDelay)
             }
 
-            if [500, 502, 504].contains(http.statusCode), attempt <= maxRetries {
+            if [500, 502, 504].contains(http.statusCode), attempt <= retryLimit {
                 let jitter = Double.random(in: 0.2...0.8)
                 let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
                 let backoff = max(retryDelay ?? 0, exponential)
-                try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                try await retrySleep(backoff)
                 continue
             }
 
@@ -278,6 +301,7 @@ public final class DriveClient: Sendable {
         _ request: URLRequest,
         maxRetries: Int = 5
     ) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        let retryLimit = retryLimitOverride ?? maxRetries
         var attempt = 0
         var currentRequest = request
         var didRefreshAfterUnauthorized = false
@@ -292,11 +316,11 @@ public final class DriveClient: Sendable {
                 (bytes, response) = try await session.bytes(for: currentRequest)
             } catch {
                 try Task.checkCancellation()
-                guard attempt <= maxRetries else { throw error }
+                guard attempt <= retryLimit else { throw error }
                 let jitter = Double.random(in: 0.1...0.5)
                 let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
                 await rateLimiter.reportRateLimit(retryAfter: delay)
-                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                try await retrySleep(delay)
                 continue
             }
 
@@ -313,7 +337,7 @@ public final class DriveClient: Sendable {
             let rateLimited = http.statusCode == 429 || http.statusCode == 503
             let transientServerError = [500, 502, 504].contains(http.statusCode)
             if rateLimited || transientServerError {
-                guard attempt <= maxRetries else {
+                guard attempt <= retryLimit else {
                     if rateLimited { throw DriveError.rateLimited(retryAfter: retryAfter) }
                     throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
                 }
@@ -321,7 +345,7 @@ public final class DriveClient: Sendable {
                 let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
                 let backoff = max(retryAfter ?? 0, exponential)
                 if rateLimited { await rateLimiter.reportRateLimit(retryAfter: backoff) }
-                try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                try await retrySleep(backoff)
                 continue
             }
 

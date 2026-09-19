@@ -67,7 +67,12 @@ struct FailureStateSafetyTests {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockFailureSafetyURLProtocol.self]
         let session = URLSession(configuration: config)
-        return DriveClient(auth: auth, session: session)
+        return DriveClient(
+            auth: auth,
+            session: session,
+            maxRetries: 1,
+            retrySleep: { _ in try Task.checkCancellation() }
+        )
     }
 
     @Test("Directory rename failure does not commit new name to SQLite; retrying succeeds")
