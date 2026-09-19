@@ -1,14 +1,14 @@
 import Foundation
 
-/// 同步进度模型
+/// Synchronization Progress Model
 public struct SyncProgress: Sendable, CustomStringConvertible {
-    /// 已完成处理（上传/下载）的文件数量
+    /// Processed (Uploaded/Files downloaded)
     public let completedFiles: Int
-    /// 当前已发现的需处理（上传/下载）的文件总数（随扫描流式累加）
+    /// Currently found needs to be processed (upload/Total number of files downloaded (accumulated with scan streaming)
     public let totalDiscoveredFiles: Int
-    /// 已完成的字节数
+    /// Bytes Completed
     public let completedBytes: Int64
-    /// 当前已发现的需处理文件总字节数
+    /// Total number of bytes of files currently found to be processed
     public let totalDiscoveredBytes: Int64
 
     public init(
@@ -33,7 +33,7 @@ public struct SyncProgress: Sendable, CustomStringConvertible {
     }
 }
 
-/// 线程安全的高性能进度通知器（后台 500ms 独立采样与解耦派发，工作线程零阻塞）
+/// Thread-Safe High-Performance Progress Notifier (Background 500ms Independent sampling and decoupling distribution, zero blocking of worker threads)
 public final class ProgressNotifier: @unchecked Sendable {
     private let onProgress: (@Sendable (SyncProgress) -> Void)?
     private let interval: TimeInterval
@@ -54,7 +54,7 @@ public final class ProgressNotifier: @unchecked Sendable {
 
         guard onProgress != nil else { return }
 
-        // 启动专属独立后台采样 Ticker，将外部回调与扫描/网络流水线完全物理隔离
+        // Launch Exclusive Independent Background Sampling Ticker,External callbacks and scans/Network pipeline is completely physically isolated
         self.tickerTask = Task { [weak self] in
             guard let self = self else { return }
             let nanoseconds = UInt64(interval * 1_000_000_000)
@@ -66,7 +66,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         }
     }
 
-    /// 累加新发现的待传输文件（纯内存轻量操作，零系统调用，耗时 ~2ns，不阻塞扫描线程）
+    /// Accumulate newly discovered files to be transferred (pure memory lightweight operation, zero system calls, time-consuming ~2ns,Non-blocking scanning threads)
     @inline(__always)
     public func addDiscovered(files: Int = 1, bytes: Int64 = 0) {
         guard onProgress != nil else { return }
@@ -76,7 +76,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
 
-    /// 累加已完成传输的文件（纯内存轻量操作，零系统调用，耗时 ~2ns，不阻塞上传线程）
+    /// Accumulate files that have finished transferring (pure memory lightweight operation, zero system calls, time consuming ~2ns,Do not block upload threads)
     @inline(__always)
     public func addCompleted(files: Int = 1, bytes: Int64 = 0) {
         guard onProgress != nil else { return }
@@ -86,7 +86,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
 
-    /// 获取当前最新进度快照
+    /// Take a snapshot of your current progress
     public func currentProgress() -> SyncProgress {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -98,7 +98,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         )
     }
 
-    /// 检查并派发变动（仅由后台 Ticker 触发，工作线程永远不执行外部闭包）
+    /// Review and distribute changes (back office only Ticker triggered, the worker thread never executes an external closure)
     private func notifyIfChanged() {
         guard let onProgress = self.onProgress else { return }
         os_unfair_lock_lock(&lock)
@@ -119,7 +119,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         onProgress(p)
     }
 
-    /// 完成全部同步，停止后台轮询并强刷最终 100% 进度
+    /// Synchronize All, Stop Background Polling and Force Brush Final 100% Progress
     public func finish() {
         guard let onProgress = self.onProgress else { return }
         tickerTask?.cancel()

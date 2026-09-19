@@ -28,7 +28,7 @@ private final class IntentResultBox: @unchecked Sendable {
         let result = value
         os_unfair_lock_unlock(&lock)
         guard let result else {
-            throw SyncEngineError.general("持久化创建意图未返回结果")
+            throw SyncEngineError.general("Persisting the creation intent returned no result")
         }
         return try result.get()
     }
@@ -329,7 +329,7 @@ enum DurableCreateIntentStore {
         let pending = try loadActiveOperation(conn: conn, itemID: item.itemID, operationType: operationType)
         if let pending, let persistedSHA = pending.expectedSHA256,
            persistedSHA.caseInsensitiveCompare(sha256) != .orderedSame {
-            throw SyncEngineError.general("未完成的文件创建意图与当前正文摘要不一致: \(name)")
+            throw SyncEngineError.general("Incomplete file creation intent does not match the current content digest: \(name)")
         }
         return item
     }
@@ -352,7 +352,7 @@ enum DurableCreateIntentStore {
         guard try query.step(),
               let itemID = query.columnInt64(at: 0),
               let remoteID = query.columnText(at: 1) else {
-            throw SyncEngineError.general("无法读取创建意图对应的 item: \(name)")
+            throw SyncEngineError.general("Unable to read the corresponding creation intent item: \(name)")
         }
         return (itemID, remoteID, query.columnInt64(at: 2) ?? 0)
     }

@@ -11,7 +11,7 @@ enum RemoteNameMapping {
     static func validate(_ name: String) throws {
         guard !name.isEmpty, name != ".", name != "..", !name.contains("/"),
               !name.contains("\0"), name.utf8.count <= 255 else {
-            throw SyncEngineError.general("远端名称无法安全映射到本地：\(name.debugDescription)")
+            throw SyncEngineError.general("Remote name cannot be mapped safely to a local path: \(name.debugDescription)")
         }
     }
 
@@ -21,7 +21,7 @@ enum RemoteNameMapping {
             try validate(file.name)
             let key = key(file.name)
             if let owner = owners[key], owner != file.id {
-                throw SyncEngineError.general("远端名称冲突：\(file.name.debugDescription)，fileIds=\(owner),\(file.id)；请在远端重命名后重试")
+                throw SyncEngineError.general("Remote name conflict: \(file.name.debugDescription), fileIds=\(owner),\(file.id). Rename the remote item and try again.")
             }
             owners[key] = file.id
         }
@@ -42,18 +42,18 @@ enum RemoteNameMapping {
         }
         if let attrs = try? FileManager.default.attributesOfItem(atPath: ancestor.path),
            attrs[.type] as? FileAttributeType == .typeSymbolicLink, ancestor.path != root.standardizedFileURL.path {
-            throw SyncEngineError.general("远端父目录映射到符号链接：\(ancestor.path)")
+            throw SyncEngineError.general("Remote parent directory maps to a symbolic link: \(ancestor.path)")
         }
         var resolvedURL = ancestor.resolvingSymlinksInPath()
         for name in missing.reversed() { resolvedURL.appendPathComponent(name) }
         let resolved = resolvedURL.standardizedFileURL.path
         guard lexical.hasPrefix(lexicalRoot), resolved.hasPrefix(resolvedRoot + "/"),
               resolved == resolvedRoot + "/" + String(lexical.dropFirst(lexicalRoot.count)) else {
-            throw SyncEngineError.general("远端路径超出同步根：\(destination.path)")
+            throw SyncEngineError.general("Remote path resolves outside the sync root: \(destination.path)")
         }
         if let attrs = try? FileManager.default.attributesOfItem(atPath: destination.path),
            attrs[.type] as? FileAttributeType == .typeSymbolicLink {
-            throw SyncEngineError.general("远端路径映射到符号链接：\(destination.path)")
+            throw SyncEngineError.general("Remote path maps to a symbolic link: \(destination.path)")
         }
     }
 }

@@ -1,6 +1,6 @@
 import Foundation
 
-/// 本地基线缓存项，用于极速识别未改变的文件
+/// Local baseline cache entry for identifying unchanged files at breakneck speed
 public struct CachedItemMetadata: Sendable {
     public let itemId: Int64
     public let parentId: Int64?
@@ -29,10 +29,10 @@ public struct CachedItemMetadata: Sendable {
     }
 }
 
-/// 快速变更检测器（FastChangeDetector）
-/// 遵循 v1.md §6.2 规范：
-/// 利用 scanner `.basic` 模式获取的 FileMetadata (device + inode) 以及 mtime + size 与基线缓存比对
-/// 全部匹配时，该文件以极高概率未被修改，直接跳过内容读取与 SHA-256 计算（跳过率 > 95%）
+/// Rapid Change Detector (FastChangeDetector)
+/// Follow the v1.md §6.2 Specification:
+/// Use scanner `.basic` Mode Acquired FileMetadata (device + inode) and mtime + size Compare to baseline cache
+/// When all match, the file is unmodified with a very high probability, skipping content reading and SHA-256 Calculated (Skip Rate > 95%)
 public final class LocalBaselineCache: @unchecked Sendable {
     public struct Key: Hashable, Sendable {
         public let device: Int64
@@ -49,7 +49,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
 
     public init() {}
 
-    /// 从 SQLite 加载指定 rootId 的全部有效文件基线元数据
+    /// From SQLite Load Assignments rootId All valid document baseline metadata
     public static func load(store: StateStore, rootId: Int64) async throws -> LocalBaselineCache {
         let detector = LocalBaselineCache()
 
@@ -100,8 +100,8 @@ public final class LocalBaselineCache: @unchecked Sendable {
         return detector
     }
 
-    /// 检查文件是否完全未变
-    /// - Returns: 若未变返回既有 CachedItemMetadata，若已变更或为新文件则返回 nil
+    /// Check if the file is completely unchanged
+    /// - Returns: If it does not change to return to the existing CachedItemMetadata,Go back if changed or as a new file nil
     public func lookupUnchanged(device: Int64, inode: Int64, mtime: Int64, size: Int64) -> CachedItemMetadata? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -117,7 +117,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
         return nil
     }
 
-    /// 当前缓存条目总数
+    /// Total number of current cache entries
     public var count: Int {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }

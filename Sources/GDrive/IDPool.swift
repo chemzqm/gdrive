@@ -1,6 +1,6 @@
 import Foundation
 
-/// 具有批量生成 Google Drive 文件 ID 能力的生成器协议
+/// Has Batch Build Google Drive File ID Capability Generator Protocol
 public protocol DriveIDGenerator: Sendable {
     func generateIds(count: Int, space: String) async throws -> [String]
 }
@@ -13,14 +13,14 @@ extension DriveIDGenerator {
 
 extension DriveClient: DriveIDGenerator {}
 
-/// Google Drive 内存 ID 缓冲池
-/// 遵循 AGENTS.md 规范：
-/// "google driver 支持本地 file id，先调用 Google Drive 的 files.generateIds 批量拿到一批服务器认可的 ID，然后客户端本地缓存使用"
+/// In-memory buffer of Google Drive IDs.
+/// Follow the AGENTS.md Specification:
+/// "google driver Support local file id,Call first Google Drive of files.generateIds Batch approved by a batch of servers ID,Then the client local cache uses"
 public actor IDPool {
     private let api: (any DriveIDGenerator)?
     private var availableIds: [String] = []
 
-    /// 当前进行中的单飞补池任务与代次
+    /// Currently in progress Single Fly Pool Missions and Generations
     private var currentFetchTask: Task<Void, any Error>?
     private var currentGeneration: UInt64 = 0
 
@@ -29,12 +29,12 @@ public actor IDPool {
         self.availableIds = initialIds
     }
 
-    /// 当前可用 ID 数量
+    /// Currently Available ID Quantity
     public var count: Int {
         availableIds.count
     }
 
-    /// 获取一批可用 ID
+    /// Get a batch of available ID
     public func takeIds(count: Int) -> [String] {
         let n = min(count, availableIds.count)
         guard n > 0 else { return [] }
@@ -44,23 +44,23 @@ public actor IDPool {
         return sub
     }
 
-    /// 获取单个可用 ID（内存缓冲耗尽时自动向 Google Drive 批量补充 1000 个，余量不足时后台自动预取）
+    /// Get Individual Available ID(Automatically when memory buffer is exhausted Google Drive Bulk Replenishment 1000 , automatic background prefetching when there is insufficient margin)
     public func nextId() async throws -> String {
         while true {
-            // 如果有现成 ID，直接返回，并在水位低时后台静默预取
+            // If available ID,Go straight back and silently prefetch in the background when the water level is low
             if let id = availableIds.popLast() {
                 triggerPrefetchIfNeeded()
                 return id
             }
 
-            // 内存耗尽：获取或发起 single-flight 补池任务并等待其完成
+            // Memory depletion: fetch or initiate single-flight Pool task and wait for it to complete
             let task = try getOrStartFetchTask()
             try await task.value
-            // 补池完成后自动循环重新从 availableIds 取号
+            // Automatic recirculation after completion of replenishment pool from availableIds Take sign
         }
     }
 
-    /// 预分配指定数量的服务器 ID（并发批量拉取至内存中）
+    /// Preallocate specified number of servers ID(concurrent batch pull into memory)
     public func ensureCapacity(_ targetCount: Int) async throws {
         let needed = targetCount - availableIds.count
         guard needed > 0, let api = self.api else { return }
@@ -83,21 +83,21 @@ public actor IDPool {
         availableIds.append(contentsOf: fetched)
     }
 
-    // MARK: - 内部 Single-flight 补池实现
+    // MARK: - Internal Single-flight Pool replenishment implementation
 
-    /// 检查并在水位低时触发后台预取
+    /// Check and trigger background prefetch when water level is low
     private func triggerPrefetchIfNeeded() {
         guard availableIds.count < 200, currentFetchTask == nil, self.api != nil else { return }
         _ = try? getOrStartFetchTask()
     }
 
-    /// 获取现有在途补池任务，或发起新的单飞任务
+    /// Get existing in-transit refill missions or launch new solo missions
     private func getOrStartFetchTask() throws -> Task<Void, any Error> {
         if let existing = currentFetchTask {
             return existing
         }
         guard let api = self.api else {
-            throw NSError(domain: "IDPool", code: 1, userInfo: [NSLocalizedDescriptionKey: "ID 缓冲池已耗尽且未配置 API 客户端"])
+            throw NSError(domain: "IDPool", code: 1, userInfo: [NSLocalizedDescriptionKey: "ID buffer is exhausted and no API client is configured"])
         }
 
         currentGeneration &+= 1
@@ -119,7 +119,7 @@ public actor IDPool {
         return task
     }
 
-    /// 补池成功后的单写者合并逻辑（仅当前代次可合并，入池且仅入池一次）
+    /// Single-writer merge logic after successful replenishment of the pool (only the current generation can be merged, enter the pool and enter the pool only once)
     private func didFetchBatch(_ ids: [String], generation: UInt64) throws {
         defer {
             if currentGeneration == generation {
@@ -128,12 +128,12 @@ public actor IDPool {
         }
         guard currentGeneration == generation else { return }
         guard !ids.isEmpty else {
-            throw NSError(domain: "IDPool", code: 2, userInfo: [NSLocalizedDescriptionKey: "未能从 Google Drive 获取有效 ID"])
+            throw NSError(domain: "IDPool", code: 2, userInfo: [NSLocalizedDescriptionKey: "Failed to obtain a valid ID from Google Drive"])
         }
         availableIds.append(contentsOf: ids)
     }
 
-    /// 补池失败时清理当前代次，避免毒丸残留导致后续调用永久失败
+    /// Clean up the current generation when the replenishment pool fails to avoid permanent failure of subsequent calls due to residual poison pills
     private func didFailFetch(_ error: any Error, generation: UInt64) {
         if currentGeneration == generation {
             currentFetchTask = nil

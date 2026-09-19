@@ -17,7 +17,7 @@ struct StateStoreTests {
 
         let store = try await StateStore(path: tempDB, maxReaders: 4)
 
-        // 1. 写入一个根同步对
+        // 1. Write a root sync pair
         let rootId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO roots (account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at)
@@ -31,7 +31,7 @@ struct StateStoreTests {
         }
         #expect(rootId > 0)
 
-        // 2. 通过读连接池并发读取验证
+        // 2. Concurrent read verification through read connection pool
         let readRootId = try await store.read { conn in
             let stmt = try conn.prepare("SELECT root_id, local_root_path FROM roots WHERE account_id = 'acc_test';")
             let hasRow = try stmt.step()
@@ -53,7 +53,7 @@ struct StateStoreTests {
 
         let store = try await StateStore(path: tempDB, maxReaders: 8)
 
-        // 初始化 root
+        // initialization root
         let rootId = try await store.write { conn -> Int64 in
             let stmt = try conn.prepare("""
                 INSERT INTO roots (account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at)
@@ -63,13 +63,13 @@ struct StateStoreTests {
             return conn.lastInsertRowId
         }
 
-        // 并发进行：1 个 Writer 持续批量写入，同时 16 个 Task 并发高速读取
+        // Perform concurrently:1 a Writer Continue batch writing while 16 a Task Concurrent high-speed reading
         let writeCount = 500
         let readIterationsPerTask = 50
         let readTaskCount = 16
 
         try await withThrowingTaskGroup(of: Void.self) { group in
-            // Writer 任务：分批插入条目
+            // Writer Task: Insert entries in batches
             group.addTask {
                 for batch in 0..<(writeCount / 50) {
                     try await store.write { conn in
@@ -88,7 +88,7 @@ struct StateStoreTests {
                 }
             }
 
-            // 16 个并发读取 Task
+            // 16 concurrent reads Task
             for _ in 0..<readTaskCount {
                 group.addTask {
                     for _ in 0..<readIterationsPerTask {
@@ -106,7 +106,7 @@ struct StateStoreTests {
             try await group.waitForAll()
         }
 
-        // 校验最终写入总数
+        // Verify the final write total
         let finalCount = try await store.read { conn in
             let stmt = try conn.prepare("SELECT count(*) FROM items WHERE root_id = ?;")
             stmt.bindInt64(rootId, at: 1)
@@ -115,7 +115,7 @@ struct StateStoreTests {
         }
         #expect(finalCount == Int64(writeCount))
 
-        // 测试 WAL checkpoint
+        // test WAL checkpoint
         try await store.checkpoint()
     }
 
@@ -140,7 +140,7 @@ struct StateStoreTests {
             return conn.lastInsertRowId
         }
 
-        // 1. 测试 150 个独立的并发 batchWrite 调用（自动合并为满批次 64*2 + 尾批次）
+        // 1. test 150 independent concurrent batchWrite Call (automatically merge into a full batch 64*2 + last batch)
         let concurrentWrites = 150
         try await withThrowingTaskGroup(of: Void.self) { group in
             for i in 0..<concurrentWrites {
@@ -168,7 +168,7 @@ struct StateStoreTests {
         }
         #expect(count1 == Int64(concurrentWrites))
 
-        // 2. 测试少于批次上限的小量写入（5条），验证 5ms 超时自动触发 commit
+        // 2. Test for small writes less than the batch limit (5), verify 5ms Automatically trigger on timeout commit
         for i in 0..<5 {
             try await store.batchWrite { conn in
                 let stmt = try conn.prepare("""

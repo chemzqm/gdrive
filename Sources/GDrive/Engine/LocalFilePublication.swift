@@ -24,7 +24,7 @@ enum LocalFilePublication {
             // rename changes ctime itself; identity, mtime and size remain comparable.
             guard displaced?.device == expected.device, displaced?.inode == expected.inode,
                   displaced?.mtime == expected.mtime, displaced?.size == expected.size else {
-                throw SyncEngineError.general("发布时本地文件发生并发变化，已保留原内容: \(recovery.path)")
+                throw SyncEngineError.general("The local file changed during publication; the original content was retained: \(recovery.path)")
             }
             // Keep the previous version recoverable (also preserves open writers).
             // If Trash is unavailable, leave the recovery file outside the sync tree.

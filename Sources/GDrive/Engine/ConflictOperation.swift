@@ -57,7 +57,7 @@ struct ConflictOperation: Codable, Sendable {
                 return
             }
             guard !FileManager.default.fileExists(atPath: copy.path) else {
-                throw SyncEngineError.general("冲突副本路径已被占用: \(copy.path)")
+                throw SyncEngineError.general("Conflict copy path already taken: \(copy.path)")
             }
             let reserve = try conn.cachedStatement("""
                 UPDATE items SET phase = 'conflict', conflict_id = ?, conflict_winner = 'remote'
@@ -70,7 +70,7 @@ struct ConflictOperation: Codable, Sendable {
             reserve.bindInt64(dirtyGeneration, at: 5)
             _ = try reserve.step()
             reserve.reset()
-            guard conn.changes == 1 else { throw SyncEngineError.general("冲突计划已过期") }
+            guard conn.changes == 1 else { throw SyncEngineError.general("Conflict plan is stale") }
             let insert = try conn.cachedStatement("""
                 INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
                     phase, dirty_generation, created_at, updated_at)
@@ -119,7 +119,7 @@ struct ConflictOperation: Codable, Sendable {
         q.bindInt64(remoteGeneration, at: 3)
         q.bindInt64(dirtyGeneration, at: 4)
         q.bindText(id, at: 5)
-        guard try q.step() else { throw SyncEngineError.general("冲突计划已过期，保留 pending 状态") }
+        guard try q.step() else { throw SyncEngineError.general("Conflict plan is stale; pending state was preserved") }
         let copy = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND remote_file_id = ? AND root_id = ?
                 AND local_generation = 0 AND remote_generation = 0 AND dirty_generation = 1
@@ -129,7 +129,7 @@ struct ConflictOperation: Codable, Sendable {
         copy.bindInt64(copyItemID, at: 1)
         copy.bindText(copyRemoteID, at: 2)
         copy.bindInt64(rootID, at: 3)
-        guard try copy.step() else { throw SyncEngineError.general("冲突副本计划已过期，保留 pending 状态") }
+        guard try copy.step() else { throw SyncEngineError.general("Conflict copy plan is stale; pending state was preserved") }
     }
 }
 
@@ -151,7 +151,7 @@ extension SyncEngine {
                 query.bindInt64(op.rootID, at: 1)
                 guard try query.step(), let remoteID = query.columnText(at: 0),
                       let localPath = query.columnText(at: 1) else {
-                    throw SyncEngineError.general("冲突恢复缺少同步根")
+                    throw SyncEngineError.general("Conflict recovery is missing its sync root")
                 }
                 return (remoteID, localPath)
             }
@@ -197,7 +197,7 @@ extension SyncEngine {
               uploaded.sizeBytes == input.size, uploaded.trashed != true,
               uploaded.name == copy.lastPathComponent,
               uploaded.parents?.contains(op.parentRemoteID) == true else {
-            throw SyncEngineError.general("冲突远端副本核验失败: \(op.copyRemoteID)")
+            throw SyncEngineError.general("Conflicting remote copy verification failed: \(op.copyRemoteID)")
         }
         try checkpoint?(.upload)
         guard let originalVersion = try LocalFileVersion.read(at: original) else { throw CocoaError(.fileNoSuchFile) }
@@ -223,7 +223,7 @@ extension SyncEngine {
         guard remote.sha256Checksum?.lowercased() == op.remoteSHA, remote.trashed != true,
               remote.name == original.lastPathComponent,
               remote.parents?.contains(op.parentRemoteID) == true else {
-            throw SyncEngineError.general("冲突期间远端原文件再次变化，保留 pending 状态")
+            throw SyncEngineError.general("During the conflict, the remote original file changes again and is retained pending Status")
         }
         try checkpoint?(.beforeCommit)
         try await store.batchWrite { conn in

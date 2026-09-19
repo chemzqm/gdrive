@@ -1,9 +1,9 @@
 import Foundation
 
-/// 目录依赖跟踪与异步唤醒调度器
-/// 遵循 v1.md §4.1 与 §4.3 规范：
-/// - 消除全量目录预先创建等待
-/// - 父目录在远端确认创建的瞬间，立即广播唤醒所有等待该父目录的子项（文件与子目录）
+/// Directory Dependency Tracking & Asynchronous Wakeup Scheduler
+/// Follow the v1.md §4.1 And §4.3 Specification:
+/// - Eliminate full catalog pre-creation waiting
+/// - As soon as the parent directory is confirmed at the remote end, all children (files and subdirectories) waiting for the parent directory are immediately broadcasted to wake up.
 public actor DirectoryTracker {
     public enum DirectoryTrackerError: Error, LocalizedError, Sendable {
         case parentDirectoryFailed(parentRelPath: String, reason: String)
@@ -12,9 +12,9 @@ public actor DirectoryTracker {
         public var errorDescription: String? {
             switch self {
             case .parentDirectoryFailed(let parentRelPath, let reason):
-                return "父目录 [\(parentRelPath)] 创建失败: \(reason)"
+                return "Parent Directory [\(parentRelPath)] Failed to create: \(reason)"
             case .cancelled:
-                return "等待父目录已被取消"
+                return "Waiting for parent directory has been canceled"
             }
         }
     }
@@ -24,19 +24,19 @@ public actor DirectoryTracker {
         case failed(error: Error)
     }
 
-    /// 目录终态映射表：本地相对路径 -> 状态（已就绪或失败）
+    /// Directory Terminal State Mapping Table: Local Relative Path -> Status (Ready or Failed)
     private var states: [String: State] = [:]
 
-    /// 正在等待某个父目录就绪的挂起协程队列：本地相对路径 -> (等待者 ID -> 续体)
+    /// Suspended coroutine queue waiting for a parent directory to be ready: local relative path -> (Waiters ID -> Continuations)
     private var waiters: [String: [UInt64: CheckedContinuation<String, Error>]] = [:]
     private var nextWaiterId: UInt64 = 0
 
     public init(remoteRootId: String) {
-        // 根目录（相对路径为 ""）在启动时即为已确认就绪
+        // Root directory (relative path is "")Confirmed ready at startup
         self.states[""] = .ready(remoteId: remoteRootId)
     }
 
-    /// 检查指定父目录是否已就绪，若已就绪直接返回其 remoteId
+    /// Check that the specified parent directory is ready, and if so, return to it directly remoteId
     public func getReadyParentId(for parentRelPath: String) -> String? {
         if case .ready(let id) = states[parentRelPath] {
             return id
@@ -44,7 +44,7 @@ public actor DirectoryTracker {
         return nil
     }
 
-    /// 等待指定父目录就绪（若已就绪立即返回；若尚未就绪则挂起当前协程，待创建成功后瞬时唤醒；若失败或取消则抛出错误）
+    /// Wait for the specified parent directory to be ready (return immediately if it is ready; suspend the current coroutine if it is not ready, wake up instantly after successful creation; throw an error if it fails or cancels)
     public func awaitParentReady(parentRelPath: String) async throws -> String {
         if Task.isCancelled {
             throw CancellationError()
@@ -82,7 +82,7 @@ public actor DirectoryTracker {
         }
     }
 
-    /// 标记某个目录已在远端创建成功，并广播唤醒所有正在等待该目录的子项
+    /// Marks that a directory has been created remotely successfully and broadcasts a wakeup call to all children waiting for the directory
     public func markDirectoryReady(relPath: String, remoteId: String) {
         guard states[relPath] == nil else { return }
         states[relPath] = .ready(remoteId: remoteId)
@@ -94,7 +94,7 @@ public actor DirectoryTracker {
         }
     }
 
-    /// 标记某个目录创建失败，并广播通知所有正在等待该目录的子项抛出错误
+    /// Flag a directory creation failure and broadcast notification to all children waiting for the directory to throw an error
     public func markDirectoryFailed(relPath: String, error: Error) {
         guard states[relPath] == nil else { return }
         let failureError: Error
@@ -117,7 +117,7 @@ public actor DirectoryTracker {
         }
     }
 
-    /// 取消所有正在等待的协程
+    /// Cancel all pending processes
     public func cancelAll() {
         for (relPath, dict) in waiters {
             states[relPath] = .failed(error: DirectoryTrackerError.cancelled)

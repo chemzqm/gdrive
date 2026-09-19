@@ -1,6 +1,6 @@
 import Foundation
 
-/// 并发只读连接池，多线程无锁并发读取
+/// Concurrent read-only connection pools, multi-threaded lockless concurrent reads
 public actor ReaderPool {
     private let path: String
     private let maxConnections: Int
@@ -13,7 +13,7 @@ public actor ReaderPool {
         self.maxConnections = maxConnections
     }
 
-    /// 从读连接池借用连接执行只读查询，完成后自动归还
+    /// Borrow the connection from the read connection pool to perform a read-only query, and automatically return it after completion
     public func withReader<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) async throws -> T {
         let conn = await acquire()
         defer { release(conn) }
@@ -30,7 +30,7 @@ public actor ReaderPool {
                 totalCreated += 1
                 return conn
             } catch {
-                // 若只读连接创建失败，回退等待已有连接
+                // Fallback waiting for existing connection if read-only connection creation fails
             }
         }
         return await withCheckedContinuation { continuation in
@@ -48,7 +48,7 @@ public actor ReaderPool {
     }
 }
 
-/// 写入统计指标
+/// Write statistics metrics
 public struct WriterStats: Sendable {
     public var totalCommits: Int = 0
     public var totalItems: Int = 0
@@ -61,7 +61,7 @@ public struct WriterStats: Sendable {
     }
 }
 
-/// 专职单写者 Actor，支持即时写与 Group Commit 自动批次合并提交
+/// Full-time single writer Actor,Supports instant writing and Group Commit Automatic batch merge submissions
 public actor DedicatedWriter {
     private let connection: SQLiteConnection
     public let batchCapacity: Int
@@ -92,20 +92,20 @@ public actor DedicatedWriter {
         self.batchTimeoutMs = batchTimeoutMs
     }
 
-    /// 获取写入统计信息
+    /// Get write statistics
     public func getStats() -> WriterStats {
         stats
     }
 
-    /// 重置统计信息
+    /// Reset stats
     public func resetStats() {
         stats = WriterStats()
     }
 
-    /// 立即独立提交事务（首文件意图、关键目录解锁等，绝不等待凑批）
+    /// Immediately submit transactions independently (first file intention, key directory unlock, etc., never wait for approval)
     @discardableResult
     public func writeImmediate<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) throws -> T {
-        // 先将当前缓冲中的批次提交，保证顺序一致性
+        // First commit the batches in the current buffer to ensure sequential consistency
         flushPending(reason: .immediate)
         stats.immediateCommits += 1
         stats.totalCommits += 1
@@ -115,16 +115,16 @@ public actor DedicatedWriter {
         }
     }
 
-    /// 别名：立即独立提交
+    /// Slug: Submit now independently
     @discardableResult
     public func write<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) throws -> T {
         try writeImmediate(block)
     }
 
-    /// Group Commit 批量写入：多个并发 Worker 提交时自动合并为一个事务
-    /// 满足任意条件即提交：
-    /// 1. 缓冲区满 batchCapacity (默认 64 项)
-    /// 2. 距离首个任务入队超时 batchTimeoutMs (默认 5ms)
+    /// Group Commit Batch Write: Multiple Concurrency Worker Automatically merge into one transaction on submission
+    /// Submit when any condition is met:
+    /// 1. Buffer Full batchCapacity (Default 64 Item)
+    /// 2. Timeout before first mission enlistment batchTimeoutMs (Default 5ms)
     public func batchWrite(_ block: @escaping @Sendable (SQLiteConnection) throws -> Void) async throws {
         try await withCheckedThrowingContinuation { continuation in
             let task = PendingWriteTask(block: block, continuation: continuation)
@@ -184,17 +184,17 @@ public actor DedicatedWriter {
         }
     }
 
-    /// 执行直接 SQL（如 schema 初始化）
+    /// Execute Directly SQL(As schema Initialization)
     public func executeDirect(_ sql: String) throws {
         try connection.execute(sql)
     }
 
-    /// 强制清空当前缓冲区并提交事务
+    /// Force current buffer to be emptied and transaction committed
     public func flush() throws {
         flushPending(reason: .immediate)
     }
 
-    /// 受控 WAL Checkpoint，将 WAL 日志刷回主库文件
+    /// Controlled WAL Checkpoint,will WAL Log flush back to master library file
     public func checkpoint() throws {
         flushPending(reason: .immediate)
         try connection.execute("PRAGMA wal_checkpoint(TRUNCATE);")

@@ -18,7 +18,7 @@ enum DownloadStaging {
         guard base.isFileURL, !remoteRootID.isEmpty,
               remoteRootID != ".", remoteRootID != "..",
               !remoteRootID.contains("/"), !remoteRootID.contains("\0") else {
-            throw SyncEngineError.general("下载临时目录或远端根 ID 无效")
+            throw SyncEngineError.general("Invalid download temporary directory or remote root ID")
         }
         let directory = base.appendingPathComponent(remoteRootID, isDirectory: true)
         let resolvedDirectory = resolved(directory)
@@ -26,7 +26,7 @@ enum DownloadStaging {
             let path = resolved(root).path
             let prefix = path.hasSuffix("/") ? path : path + "/"
             guard resolvedDirectory.path != path, !resolvedDirectory.path.hasPrefix(prefix) else {
-                throw SyncEngineError.general("下载临时目录不能位于同步目录内: \(directory.path)")
+                throw SyncEngineError.general("Download temp directory cannot be in sync directory: \(directory.path)")
             }
         }
         return resolvedDirectory
@@ -34,7 +34,7 @@ enum DownloadStaging {
 
     /// Atomic publication requires both directories to be on the same filesystem.
     static func prepare(_ directory: URL, destination: URL) throws {
-        guard directory.isFileURL else { throw SyncEngineError.general("下载临时目录必须是本地文件路径") }
+        guard directory.isFileURL else { throw SyncEngineError.general("Download temporary directory must be local file path") }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         var staging = stat()
         var target = stat()
@@ -43,7 +43,7 @@ enum DownloadStaging {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         guard staging.st_dev == target.st_dev else {
-            throw SyncEngineError.general("下载临时目录必须与目标位于同一文件系统，请配置 downloadTemporaryDirectory: \(directory.path)")
+            throw SyncEngineError.general("The download temporary directory must be on the same file system as the target, please configure downloadTemporaryDirectory: \(directory.path)")
         }
     }
 }

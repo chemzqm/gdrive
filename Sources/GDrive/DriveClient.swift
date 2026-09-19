@@ -4,7 +4,7 @@ import Logging
 import os
 import Darwin
 
-/// Google Drive 文件及目录元数据资源模型
+/// Google Drive File and Catalog Metadata Resource Model
 public struct DriveFile: Codable, Sendable {
     public let id: String
     public let name: String
@@ -59,7 +59,7 @@ public enum ResumableUploadResult: Sendable {
     case expired
 }
 
-/// Google Drive API 错误类型
+/// Google Drive API Error type
 public enum DriveError: Error, Sendable, CustomStringConvertible {
     case rateLimited(retryAfter: TimeInterval?)
     case notFound(fileId: String)
@@ -75,50 +75,50 @@ public enum DriveError: Error, Sendable, CustomStringConvertible {
     public var description: String {
         switch self {
         case .rateLimited(let delay):
-            return "Google Drive API 限流 (429/403)，建议等待: \(delay ?? 1.0)s"
+            return "Google Drive API Current limiting (429/403),Suggest waiting: \(delay ?? 1.0)s"
         case .notFound(let id):
-            return "文件或目录未找到 (404): ID \(id)"
+            return "File or directory not found (404): ID \(id)"
         case .conflict(let id, let msg):
-            return "ID 冲突 (409): ID \(id), \(msg)"
+            return "ID Conflict (409): ID \(id), \(msg)"
         case .checksumMismatch(let exp, let act):
-            return "SHA-256 校验不匹配: 预期 \(exp), 实际 \(act ?? "nil")"
+            return "SHA-256 Validation mismatch: Expected \(exp), Actual \(act ?? "nil")"
         case .sizeMismatch(let exp, let act):
-            return "文件大小不匹配: 预期 \(exp) 字节, 实际 \(act ?? -1) 字节"
+            return "File size mismatch: Expected \(exp) Bytes, Actual \(act ?? -1) Bytes"
         case .serverError(let code, let msg):
-            return "服务端错误 (\(code)): \(msg)"
+            return "Server-side error (\(code)): \(msg)"
         case .invalidResponse(let msg):
-            return "无效的 API 响应: \(msg)"
+            return "Invalid API Response: \(msg)"
         case .fileModifiedDuringUpload(let path):
-            return "本地文件在传输或发布期间发生变化: \(path)"
+            return "Local file changed during transfer or publication: \(path)"
         case .unsafeOverwrite(let id):
-            return "已阻断远端正文覆盖，Drive 条件写尚未验证，保留待同步状态: \(id)"
+            return "Remote body overlay blocked,Drive Conditional write has not been verified, keep pending sync: \(id)"
         case .stableInputUnavailable(let path):
-            return "文件系统不支持写时复制快照，无法安全且高效地捕获大文件上传输入: \(path)"
+            return "File system does not support copy-on-write snapshots, failing to capture large file upload inputs safely and efficiently: \(path)"
         }
     }
 }
 
-/// Changes 变更条目
+/// Changes Change Entry
 public struct DriveChange: Codable, Sendable {
     public let fileId: String
     public let removed: Bool?
     public let file: DriveFile?
 }
 
-/// Changes 响应模型
+/// Changes Response Model
 public struct DriveChangesPage: Codable, Sendable {
     public let nextPageToken: String?
     public let newStartPageToken: String?
     public let changes: [DriveChange]
 }
 
-/// Google Drive 核心通信与传输客户端
-/// 遵循 v1.md 传输规范：
-/// - 单会话复用 URLSession
-/// - 预生成 ID 幂等创建与上传
-/// - 小文件 (≤ 8MB) 零磁盘暂存 Multipart 一步上传
-/// - 大文件 (> 8MB) 分块续传 Resumable Upload
-/// - 响应字段一次性校验 (id,name,mimeType,parents,size,sha256Checksum,version)
+/// Google Drive Core communication and transport client
+/// Follow the v1.md Transmission specification:
+/// - Single-session multiplexing URLSession
+/// - Pregeneration ID Idempotent Creation and Upload
+/// - Small Files (≤ 8MB) Zero Disk Staging Multipart One-step upload
+/// - Large Files (> 8MB) Continuing in chunks Resumable Upload
+/// - Response Field One-Time Validation (id,name,mimeType,parents,size,sha256Checksum,version)
 public final class DriveClient: Sendable {
     public let auth: Auth
     public let rateLimiter: DriveRateLimiter
@@ -134,7 +134,7 @@ public final class DriveClient: Sendable {
 
     private let tokenState = OSAllocatedUnfairLock<CachedToken?>(initialState: nil)
 
-    /// 创建针对高并发传输优化的专属 URLSession
+    /// Create exclusive optimizations for high concurrency transmissions URLSession
     public static func makeDefaultSession() -> URLSession {
         let config = URLSessionConfiguration.default
         config.httpMaximumConnectionsPerHost = 128
@@ -155,7 +155,7 @@ public final class DriveClient: Sendable {
         self.rateLimiter = rateLimiter
     }
 
-    /// 高并发快速获取有效 Access Token（内存原子级缓存，避免 Actor 争用）
+    /// High concurrency fast get effective Access Token(Memory atomic level cache, avoiding Actor contention)
     public func getValidToken() async throws -> String {
         let cached = tokenState.withLock { $0 }
         if let cached, cached.expiresAt.timeIntervalSinceNow > 60 {
@@ -170,9 +170,9 @@ public final class DriveClient: Sendable {
         return freshToken
     }
 
-    // MARK: - 核心执行器 (自适应限流与弹性重试)
+    // MARK: - Core Actuators (Adaptive current limiting and resilient retries)
 
-    /// 统一执行 HTTP 请求，具备平滑限流调度、全局退避协同、401 自动刷新与 429/503/403 指数退避重试
+    /// Unified Execution HTTP Request, with smooth current limiting scheduling, global withdrawal coordination,401 Auto Refresh vs. 429/503/403 Exponential back-off retry
     public func executeRequest(
         _ request: URLRequest,
         maxRetries: Int = 5,
@@ -201,10 +201,10 @@ public final class DriveClient: Sendable {
             }
 
             guard let http = response as? HTTPURLResponse else {
-                throw DriveError.invalidResponse(message: "非 HTTP 响应")
+                throw DriveError.invalidResponse(message: "Response is not HTTP")
             }
 
-            // 401 凭证过期：清空内存 Token 缓存，重新拉取有效 Token 自动重试
+            // 401 Certificate Expired: Empty Memory Token Cache, reload valid Token Automatic Retry
             if http.statusCode == 401 && attempt <= 2 {
                 tokenState.withLock { $0 = nil }
                 let freshToken = try await getValidToken()
@@ -212,7 +212,7 @@ public final class DriveClient: Sendable {
                 continue
             }
 
-            // 检查限流 (429, 503, 或 403 包含 rateLimitExceeded / userRateLimitExceeded / quotaExceeded)
+            // Check current limiting (429, 503, or 403 Contains rateLimitExceeded / userRateLimitExceeded / quotaExceeded)
             let isRateLimit: Bool
             var retryDelay: Double? = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
 
@@ -241,21 +241,21 @@ public final class DriveClient: Sendable {
                 throw DriveError.rateLimited(retryAfter: retryDelay)
             }
 
-            // 遇到 409（通常作为业务已存在核验）或 308（Resumable 分块未完成），直接返回供上层处理
+            // Encounter 409(Often verified as existing in the business) or 308(Resumable chunking incomplete), returning directly to the upper level for processing
             if http.statusCode == 409 || http.statusCode == 308 || acceptableStatusCodes.contains(http.statusCode) {
                 await rateLimiter.reportSuccess()
                 return (data, http)
             }
 
-            // 其他 HTTP 错误状态
+            // Other HTTP Error Status
             let detail = String(decoding: data, as: UTF8.self)
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
     }
 
-    // MARK: - 预分配 ID
+    // MARK: - Pre-allocation ID
 
-    /// 批量预取服务器认可的 ID
+    /// Batch Prefetch Server Approved ID
     public func generateIds(count: Int = 100, space: String = "drive") async throws -> [String] {
         var remaining = count
         var result: [String] = []
@@ -269,7 +269,7 @@ public final class DriveClient: Sendable {
                 URLQueryItem(name: "space", value: space)
             ]
             guard let url = components.url else {
-                throw DriveError.invalidResponse(message: "无法构建 generateIds URL")
+                throw DriveError.invalidResponse(message: "Unable to build the generateIds URL")
             }
 
             var req = URLRequest(url: url)
@@ -289,10 +289,10 @@ public final class DriveClient: Sendable {
         return result
     }
 
-    // MARK: - 目录创建 (createDirectory)
+    // MARK: - Directory Creation (createDirectory)
 
-    /// 创建远端目录（使用预分配 ID）
-    /// 若遇到 409，自动向远端核验同 ID 是否已正确创建
+    /// Create a remote directory (using pre-allocation ID)
+    /// If you encounter 409,Automatic remote verification ID Has it been created correctly?
     public func createDirectory(
         name: String,
         parentId: String,
@@ -318,7 +318,7 @@ public final class DriveClient: Sendable {
 
         let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
 
-        // 409 冲突：预生成 ID 重试或并发已被创建，核验证实对象
+        // 409 Conflict: Pre-Built ID Retry or concurrency has been created, verify validation object
         if http.statusCode == 409 {
             return try await verifyExistingFolder(remoteId: remoteId, expectedName: name, expectedParentId: parentId)
         }
@@ -329,20 +329,20 @@ public final class DriveClient: Sendable {
     private func verifyExistingFolder(remoteId: String, expectedName: String, expectedParentId: String) async throws -> DriveFile {
         let existing = try await getFile(remoteId: remoteId)
         guard existing.isDirectory else {
-            throw DriveError.conflict(fileId: remoteId, message: "已有对象不是目录")
+            throw DriveError.conflict(fileId: remoteId, message: "Existing object is not a directory")
         }
         guard existing.name == expectedName else {
-            throw DriveError.conflict(fileId: remoteId, message: "已有目录名称不一致: \(existing.name) != \(expectedName)")
+            throw DriveError.conflict(fileId: remoteId, message: "Existing directory names are inconsistent: \(existing.name) != \(expectedName)")
         }
         if let parents = existing.parents, !parents.contains(expectedParentId) {
-            throw DriveError.conflict(fileId: remoteId, message: "已有目录父级不匹配: \(parents)")
+            throw DriveError.conflict(fileId: remoteId, message: "Existing directory parent mismatch: \(parents)")
         }
         return existing
     }
 
     public static let multipartBoundary = "-------GDriveMultipartBoundary7MA4YWxkTrZu0gW"
 
-    /// 使用 Multipart/related 一步上传文件（不落临时磁盘，正文直接发送并校验校验和）
+    /// Use Multipart/related Upload the file in one step (do not lose the temporary disk, the body is sent directly and the checksum is verified)
     public func uploadMultipart(
         name: String,
         parentId: String,
@@ -371,7 +371,7 @@ public final class DriveClient: Sendable {
         ]
         let metadataData = try JSONSerialization.data(withJSONObject: metadataObj)
 
-        // 构造 multipart 请求体
+        // Construction multipart Request body
         var body = Data()
         body.reserveCapacity(content.count + metadataData.count + 256)
         body.append("--\(boundary)\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n".data(using: .utf8)!)
@@ -384,7 +384,7 @@ public final class DriveClient: Sendable {
 
         let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
 
-        // 409 冲突核验
+        // 409 Conflict check
         if http.statusCode == 409 {
             return try await verifyExistingFile(
                 remoteId: remoteId,
@@ -397,7 +397,7 @@ public final class DriveClient: Sendable {
 
         let driveFile = try JSONDecoder().decode(DriveFile.self, from: data)
 
-        // 校验响应中的大小与 SHA-256
+        // Validate size in response vs. SHA-256
         if let actualSize = driveFile.sizeBytes, actualSize != Int64(content.count) {
             throw DriveError.sizeMismatch(expected: Int64(content.count), actual: actualSize)
         }
@@ -418,10 +418,10 @@ public final class DriveClient: Sendable {
     ) async throws -> DriveFile {
         let existing = try await getFile(remoteId: remoteId)
         guard existing.name == expectedName else {
-            throw DriveError.conflict(fileId: remoteId, message: "文件名不匹配")
+            throw DriveError.conflict(fileId: remoteId, message: "File name mismatch")
         }
         if let parents = existing.parents, !parents.contains(expectedParentId) {
-            throw DriveError.conflict(fileId: remoteId, message: "父目录不匹配")
+            throw DriveError.conflict(fileId: remoteId, message: "Parent directory mismatch")
         }
         if let size = existing.sizeBytes, size != expectedSize {
             throw DriveError.sizeMismatch(expected: expectedSize, actual: size)
@@ -432,10 +432,10 @@ public final class DriveClient: Sendable {
         return existing
     }
 
-    // MARK: - 文件内容更新 (Update)
+    // MARK: - Document content update (Update)
 
-    /// 已有文件正文覆盖目前被安全阻断：抛出 unsafeOverwrite，不发出 HTTP 请求。
-    /// 仅在真实服务端原子条件写契约验证通过后才能重新启用。
+    /// Existing file body overwrite is currently blocked safely: thrown unsafeOverwrite,Do not issue HTTP Request.
+    /// It can only be re-enabled after the real server-side atomic conditional write contract validation is passed.
     public func updateMultipart(
         remoteId: String,
         mimeType: String = "application/octet-stream",
@@ -447,7 +447,7 @@ public final class DriveClient: Sendable {
         throw DriveError.unsafeOverwrite(fileId: remoteId)
     }
 
-    /// 已有文件 Resumable 覆盖目前被安全阻断，不创建上传会话。
+    /// Existing Documents Resumable The override is currently blocked safely from creating an upload session.
     public func initiateResumableUpdate(
         remoteId: String,
         totalBytes: Int64,
@@ -458,9 +458,9 @@ public final class DriveClient: Sendable {
         throw DriveError.unsafeOverwrite(fileId: remoteId)
     }
 
-    // MARK: - 大文件 Resumable Upload (> 8MB)
+    // MARK: - Large Files Resumable Upload (> 8MB)
 
-    /// 发起大文件 Resumable 上传会话，返回用于分块续传的 sessionURI
+    /// Initiate large files Resumable Upload session, return to for block continuation sessionURI
     public func initiateResumableUpload(
         name: String,
         parentId: String,
@@ -492,14 +492,14 @@ public final class DriveClient: Sendable {
         let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
         guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
             let detail = String(decoding: data, as: UTF8.self)
-            throw DriveError.serverError(statusCode: http.statusCode, message: "创建 Resumable 会话失败: \(detail)")
+            throw DriveError.serverError(statusCode: http.statusCode, message: "Failed to create resumable upload session: \(detail)")
         }
 
         return sessionURL
     }
 
-    /// 向已有的 Resumable 会话发送分块数据
-    /// - Returns: 服务端确认的会话状态。调用方必须按 confirmedOffset 推进，不能按发送长度推断。
+    /// to the existing Resumable Session sends chunked data
+    /// - Returns: The session state confirmed by the server.The caller must press confirmedOffset Propulsion, cannot be inferred by the length of the transmission.
     public func uploadResumableChunk(
         sessionURL: URL,
         chunkData: Data,
@@ -523,11 +523,11 @@ public final class DriveClient: Sendable {
             return .expired
         } else {
             let detail = String(decoding: data, as: UTF8.self)
-            throw DriveError.serverError(statusCode: http.statusCode, message: "分块上传失败: \(detail)")
+            throw DriveError.serverError(statusCode: http.statusCode, message: "Chunked upload failed: \(detail)")
         }
     }
 
-    /// 查询 Resumable 会话的已确认断点偏移量
+    /// Query Resumable Acknowledged breakpoint offset for the session
     public func queryResumableOffset(sessionURL: URL, totalBytes: Int64) async throws -> ResumableUploadResult {
         var req = URLRequest(url: sessionURL)
         req.httpMethod = "PUT"
@@ -557,14 +557,14 @@ public final class DriveClient: Sendable {
               let last = Int64(range.dropFirst(prefix.count)),
               last >= 0,
               last < totalBytes else {
-            throw DriveError.invalidResponse(message: "无效的 Resumable Range: \(range)")
+            throw DriveError.invalidResponse(message: "Invalid resumable upload range: \(range)")
         }
         return last + 1
     }
 
-    // MARK: - 元数据获取与核验
+    // MARK: - Metadata Capture and Verification
 
-    /// 获取单个文件或目录的元数据
+    /// Get metadata for a single file or directory
     public func getFile(remoteId: String) async throws -> DriveFile {
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
@@ -583,9 +583,9 @@ public final class DriveClient: Sendable {
         return try JSONDecoder().decode(DriveFile.self, from: data)
     }
 
-    // MARK: - 列举目录子项 (List Files)
+    // MARK: - List table of contents sub-items (List Files)
 
-    /// 列举指定父目录下的直接子项（自动处理分页）
+    /// List direct children of the specified parent directory (automatic paging)
     public func listChildren(parentId: String) async throws -> [DriveFile] {
         var items: [DriveFile] = []
         var token: String?
@@ -621,18 +621,18 @@ public final class DriveClient: Sendable {
         let (data, _) = try await executeRequest(req, acceptableStatusCodes: [200])
         let page = try JSONDecoder().decode(ChildrenPage.self, from: data)
         guard page.incompleteSearch != true, page.nextPageToken != "" else {
-            throw DriveError.invalidResponse(message: "远端目录列举不完整: \(parentId)")
+            throw DriveError.invalidResponse(message: "Incomplete enumeration of remote directories: \(parentId)")
         }
         return page
     }
 
-    // MARK: - 文件下载 (Download)
+    // MARK: - File Download (Download)
 
     public static var defaultDownloadTemporaryDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive", isDirectory: true)
     }
 
-    /// 下载文件正文并流式校验 SHA-256，原子落盘到目标路径
+    /// Download file body and stream checksum SHA-256,Atomic Fall to Target Path
     public func downloadFile(
         remoteId: String,
         destinationURL: URL,
@@ -682,13 +682,13 @@ public final class DriveClient: Sendable {
 
         let (asyncBytes, response) = try await session.bytes(for: req)
         guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
+            throw DriveError.invalidResponse(message: "Response is not HTTP")
         }
         if http.statusCode == 404 {
             throw DriveError.notFound(fileId: remoteId)
         }
         if !(200..<300).contains(http.statusCode) {
-            throw DriveError.serverError(statusCode: http.statusCode, message: "下载失败")
+            throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
         }
 
         FileManager.default.createFile(atPath: tempURL.path, contents: nil)
@@ -732,9 +732,9 @@ public final class DriveClient: Sendable {
         return published
     }
 
-    // MARK: - Changes 增量变更
+    // MARK: - Changes Incremental Changes
 
-    /// 获取当前最新起始 Changes Token
+    /// Get current latest start Changes Token
     public func getStartPageToken() async throws -> String {
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/changes/startPageToken")!
@@ -754,7 +754,7 @@ public final class DriveClient: Sendable {
         return decoded.startPageToken
     }
 
-    /// 列举自 pageToken 之后发生的所有远端变更
+    /// Listed by pageToken All remote changes that occur after
     public func listChanges(pageToken: String, pageSize: Int = 1000) async throws -> DriveChangesPage {
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/changes")!
@@ -773,9 +773,9 @@ public final class DriveClient: Sendable {
         return try JSONDecoder().decode(DriveChangesPage.self, from: data)
     }
 
-    // MARK: - 元数据更新与重命名 (Rename / Move)
+    // MARK: - Metadata updates and renaming (Rename / Move)
 
-    /// 重命名或移动远端对象（文件或目录）
+    /// Rename or move remote objects (files or directories)
     @discardableResult
     public func updateMetadata(
         remoteId: String,
@@ -812,7 +812,7 @@ public final class DriveClient: Sendable {
         return try JSONDecoder().decode(DriveFile.self, from: data)
     }
 
-    // MARK: - 回收站操作 (Trash)
+    // MARK: - Recycle Bin Actions (Trash)
 
     public func trash(remoteId: String) async throws {
         let token = try await getValidToken()
@@ -829,7 +829,7 @@ public final class DriveClient: Sendable {
         _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
     }
 
-    /// 将远端对象移出回收站 (恢复)
+    /// Move remote objects out of the Trash (Restore)
     public func untrash(remoteId: String) async throws {
         let token = try await getValidToken()
         let url = URL(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
@@ -845,11 +845,11 @@ public final class DriveClient: Sendable {
         _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
     }
 
-    // MARK: - 私有辅助
+    // MARK: - Private Auxiliary
 
     private func checkHTTPStatus(response: URLResponse, data: Data) throws {
         guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "非 HTTP 响应")
+            throw DriveError.invalidResponse(message: "Response is not HTTP")
         }
         if http.statusCode == 429 {
             let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
@@ -869,5 +869,5 @@ public final class DriveClient: Sendable {
     }
 }
 
-/// 兼容别名
+/// Compatible aliases
 public typealias DriveAPI = DriveClient

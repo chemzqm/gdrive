@@ -8,7 +8,7 @@ struct TransferMonitorTests {
     func testTransferMonitorQueueAndSpeed() async throws {
         let monitor = TransferMonitor()
 
-        // 1. 初始状态快照为空
+        // 1. The initial state snapshot is empty
         let initialSnapshot = monitor.getSnapshot()
         #expect(initialSnapshot.activeUploads.isEmpty)
         #expect(initialSnapshot.activeDownloads.isEmpty)
@@ -17,7 +17,7 @@ struct TransferMonitorTests {
         #expect(initialSnapshot.uploadSpeedBytesPerSecond == 0.0)
         #expect(initialSnapshot.downloadSpeedBytesPerSecond == 0.0)
 
-        // 2. 将文件加入上传与下载等待队列
+        // 2. Add files to upload and download waiting queues
         monitor.enqueueUpload(id: "up_1", name: "upload1.bin", totalBytes: 10 * 1024 * 1024)
         monitor.enqueueDownload(id: "down_1", name: "download1.bin", totalBytes: 5 * 1024 * 1024)
 
@@ -30,7 +30,7 @@ struct TransferMonitorTests {
         #expect(queuedSnapshot.queuedDownloads[0].fileId == "down_1")
         #expect(queuedSnapshot.queuedDownloads[0].name == "download1.bin")
 
-        // 3. 开始上传与下载任务（从队列移入 active）
+        // 3. Start upload and download tasks (moved from queue active)
         monitor.startUpload(id: "up_1", name: "upload1.bin", totalBytes: 10 * 1024 * 1024)
         monitor.startDownload(id: "down_1", name: "download1.bin", totalBytes: 5 * 1024 * 1024)
 
@@ -43,7 +43,7 @@ struct TransferMonitorTests {
         #expect(activeSnapshot.activeDownloads.count == 1)
         #expect(activeSnapshot.activeDownloads[0].fileId == "down_1")
 
-        // 4. 模拟传输数据与滑动速率计算 (等待 > 100ms 模拟字节流)
+        // 4. Simulate transmission data and slip rate calculation (wait > 100ms Simulate byte stream)
         try await Task.sleep(nanoseconds: 150_000_000) // 150ms
         monitor.reportUploadProgress(id: "up_1", additionalBytes: 2 * 1024 * 1024) // 2MB
         monitor.reportDownloadProgress(id: "down_1", additionalBytes: 1 * 1024 * 1024) // 1MB
@@ -55,7 +55,7 @@ struct TransferMonitorTests {
         #expect(progressSnapshot.uploadSpeedBytesPerSecond > 0)
         #expect(progressSnapshot.downloadSpeedBytesPerSecond > 0)
 
-        // 5. 完成任务并清空
+        // 5. Complete tasks and clear
         monitor.finishUpload(id: "up_1")
         monitor.finishDownload(id: "down_1")
 
@@ -72,7 +72,7 @@ struct TransferMonitorTests {
 
         let initialTime = monitor.getSnapshot().refreshedAt
 
-        // 等待后台 timer 周期自动刷新 (> 600ms)
+        // Waiting for background timer Periodic automatic refresh (> 600ms)
         try await Task.sleep(nanoseconds: 650_000_000)
 
         let nextSnapshot = monitor.getSnapshot()

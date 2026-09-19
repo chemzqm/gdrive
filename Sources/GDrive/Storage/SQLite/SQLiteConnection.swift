@@ -1,18 +1,18 @@
 import Foundation
 import SQLite3
 
-/// 轻量 SQLite 连接包装器，封装 libsqlite3 C 接口
+/// Lightweight SQLite Connect wrapper, encapsulate libsqlite3 C Interface
 public final class SQLiteConnection: @unchecked Sendable {
     private var db: OpaquePointer?
 
     public init(path: String, readonly: Bool = false) throws {
         var flags = readonly ? SQLITE_OPEN_READONLY : (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
-        flags |= SQLITE_OPEN_NOMUTEX // 使用单线程无锁模式，并发由外层连接池与 Actor 调度
+        flags |= SQLITE_OPEN_NOMUTEX // Use single-threaded lockless mode, concurrently connected by the outer connection pool and Actor Scheduling
 
         var pointer: OpaquePointer?
         let rc = sqlite3_open_v2(path, &pointer, flags, nil)
         guard rc == SQLITE_OK, let pointer else {
-            let msg = pointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "打开数据库失败 (code \(rc))"
+            let msg = pointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open database (code \(rc))"
             if let pointer { sqlite3_close(pointer) }
             throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: msg])
         }
@@ -30,7 +30,7 @@ public final class SQLiteConnection: @unchecked Sendable {
             throw NSError(domain: "SQLiteConnection", code: Int(functionRC))
         }
 
-        // 基础性能与稳定性配置
+        // Basic Performance and Stability Configuration
         if !readonly {
             try execute("PRAGMA journal_mode = WAL;")
             try execute("PRAGMA synchronous = NORMAL;")
@@ -38,7 +38,7 @@ public final class SQLiteConnection: @unchecked Sendable {
         try execute("PRAGMA foreign_keys = ON;")
         try execute("PRAGMA busy_timeout = 5000;")
         try execute("PRAGMA temp_store = MEMORY;")
-        try execute("PRAGMA cache_size = -64000;") // 64MB 页面缓存
+        try execute("PRAGMA cache_size = -64000;") // 64MB Page Cache
     }
 
     private var statementCache: [String: SQLiteStatement] = [:]
@@ -55,7 +55,7 @@ public final class SQLiteConnection: @unchecked Sendable {
         }
     }
 
-    /// 获取或重用预编译语句（自动 reset），显著提升批量操作吞吐量
+    /// Get or reuse precompiled statements (automatic reset),Significantly increase throughput for bulk operations
     public func cachedStatement(_ sql: String) throws -> SQLiteStatement {
         if let stmt = statementCache[sql] {
             stmt.reset()
@@ -67,28 +67,28 @@ public final class SQLiteConnection: @unchecked Sendable {
     }
 
     public func execute(_ sql: String) throws {
-        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "数据库已关闭"]) }
+        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
         var errMsg: UnsafeMutablePointer<CChar>?
         let rc = sqlite3_exec(db, sql, nil, nil, &errMsg)
         if rc != SQLITE_OK {
-            let msg = errMsg.flatMap { String(cString: $0) } ?? "执行 SQL 失败"
+            let msg = errMsg.flatMap { String(cString: $0) } ?? "Execution SQL Failed"
             sqlite3_free(errMsg)
             throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "\(msg): \(sql)"])
         }
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {
-        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "数据库已关闭"]) }
+        guard let db else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nil)
         guard rc == SQLITE_OK, let stmt else {
             let msg = String(cString: sqlite3_errmsg(db))
-            throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Prepare 失败: \(msg) [\(sql)]"])
+            throw NSError(domain: "SQLiteConnection", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Prepare failed: \(msg) [\(sql)]"])
         }
         return SQLiteStatement(stmt: stmt, db: db)
     }
 
-    /// 在事务中执行代码块
+    /// Execute a block of code in a transaction
     public func transaction<T>(_ block: () throws -> T) throws -> T {
         try execute("BEGIN IMMEDIATE TRANSACTION;")
         do {
@@ -112,7 +112,7 @@ public final class SQLiteConnection: @unchecked Sendable {
     }
 }
 
-/// 预编译 SQL 语句包装
+/// Precompiled SQL Statement Wrapping
 public final class SQLiteStatement: @unchecked Sendable {
     private let stmt: OpaquePointer
     private let db: OpaquePointer
@@ -181,7 +181,7 @@ public final class SQLiteStatement: @unchecked Sendable {
             return false
         } else {
             let msg = String(cString: sqlite3_errmsg(db))
-            throw NSError(domain: "SQLiteStatement", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Step 失败: \(msg)"])
+            throw NSError(domain: "SQLiteStatement", code: Int(rc), userInfo: [NSLocalizedDescriptionKey: "Step failed: \(msg)"])
         }
     }
 

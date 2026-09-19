@@ -1,6 +1,6 @@
 import Foundation
 
-/// 线程安全的异步信号量，用于精确限制并发在途任务数与内存配额
+/// Thread-safe asynchronous semaphores to precisely limit the number of concurrent in-transit tasks and memory quotas
 public final class AsyncSemaphore: @unchecked Sendable {
     private var count: Int
     private var waiters: [CheckedContinuation<Void, Never>] = []

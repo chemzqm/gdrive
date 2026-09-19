@@ -15,7 +15,7 @@ struct ReconcilerTests {
         let remote = RemoteObservation(status: .present, sha256: baseSha, size: 100)
 
         let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
-        #expect(decision == .upload(reason: "仅本地内容更新"))
+        #expect(decision == .upload(reason: "Only local content changed"))
     }
 
     @Test("Only remote changed triggers download")
@@ -25,7 +25,7 @@ struct ReconcilerTests {
         let remote = RemoteObservation(status: .present, sha256: modSha1, size: 150)
 
         let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
-        #expect(decision == .download(reason: "仅远端内容更新"))
+        #expect(decision == .download(reason: "Only remote content changed"))
     }
 
     @Test("Both changed with identical SHA-256 advances baseline without transfer")
@@ -103,7 +103,7 @@ struct ReconcilerTests {
         #expect(decision == .unchanged)
     }
 
-    // MARK: - A02 审计问题专项回归测试 (P05 - P08)
+    // MARK: - A02 Specialized regression testing for audit issues (P05 - P08)
 
     @Test("P05 Regression: Baseline exists, L absent, R unknown -> waitingEvidence (refuses trashRemote without remote evidence)")
     func testP05AbsentUnknown() {
@@ -181,7 +181,7 @@ struct ReconcilerTests {
         let remote = RemoteObservation(status: .absent)
 
         let decision = Reconciler.decide(baseline: nil, local: local, remote: remote)
-        #expect(decision == .upload(reason: "本地新文件"))
+        #expect(decision == .upload(reason: "New local file"))
     }
 
     @Test("No baseline: new remote file proven absent on local downloads")
@@ -190,7 +190,7 @@ struct ReconcilerTests {
         let remote = RemoteObservation(status: .present, sha256: modSha1, size: 120)
 
         let decision = Reconciler.decide(baseline: nil, local: local, remote: remote)
-        #expect(decision == .download(reason: "远端新文件"))
+        #expect(decision == .download(reason: "New remote file"))
     }
 
     @Test("No baseline: new local file with unknown remote returns waitingEvidence")

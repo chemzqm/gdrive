@@ -29,6 +29,6 @@ struct AuthTests {
         let ids = try await api.generateIds(count: 1000)
         #expect(ids.count == 1000)
         #expect(Set(ids).count == 1000)
-        print("成功获取 1000 个 Google Drive ID: \(ids.prefix(3).joined(separator: ", ")) ... \(ids.suffix(3).joined(separator: ", "))")
+        print("Retrieved 1000 Google Drive IDs: \(ids.prefix(3).joined(separator: ", ")) ... \(ids.suffix(3).joined(separator: ", "))")
     }
 }

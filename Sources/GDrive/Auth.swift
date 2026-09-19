@@ -4,7 +4,7 @@ import Foundation
 import Darwin
 #endif
 
-/// ~/.gdrive/auth.json 数据结构
+/// Data stored in ~/.gdrive/auth.json.
 public struct AuthData: Codable, Sendable {
     public var clientId: String
     public var clientSecret: String?
@@ -33,7 +33,7 @@ public struct AuthData: Codable, Sendable {
     }
 }
 
-/// Google Drive 最小化授权管理
+/// Manages the minimal authorization flow required for Google Drive.
 public actor Auth {
     public static let defaultPath: String = {
         (NSHomeDirectory() as NSString).appendingPathComponent(".gdrive/auth.json")
@@ -45,7 +45,7 @@ public actor Auth {
     public init(path: String = defaultPath) throws {
         self.fileURL = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: path) else {
-            throw NSError(domain: "GDriveAuth", code: 1, userInfo: [NSLocalizedDescriptionKey: "未找到凭据文件: \(path)"])
+            throw NSError(domain: "GDriveAuth", code: 1, userInfo: [NSLocalizedDescriptionKey: "Credential file not found: \(path)"])
         }
         let rawData = try Data(contentsOf: fileURL)
         let decoder = JSONDecoder()
@@ -53,12 +53,12 @@ public actor Auth {
         self.data = try decoder.decode(AuthData.self, from: rawData)
     }
 
-    /// 获取当前凭据
+    /// Get current credentials
     public func authData() -> AuthData {
         data
     }
 
-    /// 获取有效 Access Token（过期自动刷新）
+    /// Returns a valid access token, refreshing it when necessary.
     public func token() async throws -> String {
         if let token = data.accessToken,
            let expiresAt = data.expiresAt,
@@ -66,17 +66,17 @@ public actor Auth {
             return token
         }
         guard let refreshToken = data.refreshToken, !refreshToken.isEmpty else {
-            throw NSError(domain: "GDriveAuth", code: 2, userInfo: [NSLocalizedDescriptionKey: "缺少 refresh token，请先执行授权"])
+            throw NSError(domain: "GDriveAuth", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing refresh token. Complete authorization first."])
         }
         return try await refresh(with: refreshToken)
     }
 
-    /// 启动浏览器授权并保存 Token
+    /// Opens browser authorization and saves the resulting token.
     public func login(timeoutSeconds: Int = 300) async throws {
         let (verifier, challenge) = generatePKCE()
         let state = UUID().uuidString
 
-        // 启动本地 loopback 接收回调
+        // Start a local loopback server to receive the callback.
         let (serverFD, port) = try bindLoopback()
         let redirectURI = "http://127.0.0.1:\(port)/oauth2callback"
 
@@ -100,19 +100,19 @@ public actor Auth {
         ]
         guard let authURL = components.url else {
             close(serverFD)
-            throw NSError(domain: "GDriveAuth", code: 3, userInfo: [NSLocalizedDescriptionKey: "构建授权链接失败"])
+            throw NSError(domain: "GDriveAuth", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to build authorization link"])
         }
 
-        print("正在打开浏览器进行 Google 授权：\n\(authURL.absoluteString)\n")
+        print("Opening the browser for Google authorization:\n\(authURL.absoluteString)\n")
         let openProcess = Process()
         openProcess.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         openProcess.arguments = [authURL.absoluteString]
         try? openProcess.run()
 
-        // 接收回调 code
+        // Receive the authorization code.
         let code = try await waitForCode(serverFD: serverFD, expectedState: state, timeout: timeoutSeconds)
 
-        // 兑换 token
+        // Exchange the authorization code for tokens.
         var params = [
             "client_id": data.clientId,
             "code": code,
@@ -152,7 +152,7 @@ public actor Auth {
         let (respData, response) = try await URLSession.shared.data(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let detail = String(decoding: respData, as: UTF8.self)
-            throw NSError(domain: "GDriveAuth", code: 4, userInfo: [NSLocalizedDescriptionKey: "Token 请求失败: \(detail)"])
+            throw NSError(domain: "GDriveAuth", code: 4, userInfo: [NSLocalizedDescriptionKey: "Token request failed: \(detail)"])
         }
 
         struct TokenResponse: Decodable {
@@ -203,7 +203,7 @@ public actor Auth {
 
     private func bindLoopback() throws -> (serverFD: Int32, port: UInt16) {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
-        guard fd >= 0 else { throw NSError(domain: "GDriveAuth", code: 5, userInfo: [NSLocalizedDescriptionKey: "创建套接字失败"]) }
+        guard fd >= 0 else { throw NSError(domain: "GDriveAuth", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create socket"]) }
 
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
@@ -218,12 +218,12 @@ public actor Auth {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
         }) == 0 else {
             close(fd)
-            throw NSError(domain: "GDriveAuth", code: 6, userInfo: [NSLocalizedDescriptionKey: "绑定端口失败"])
+            throw NSError(domain: "GDriveAuth", code: 6, userInfo: [NSLocalizedDescriptionKey: "Failed to bind port"])
         }
 
         guard listen(fd, 1) == 0 else {
             close(fd)
-            throw NSError(domain: "GDriveAuth", code: 7, userInfo: [NSLocalizedDescriptionKey: "监听端口失败"])
+            throw NSError(domain: "GDriveAuth", code: 7, userInfo: [NSLocalizedDescriptionKey: "Failed to listen on port"])
         }
 
         var len = socklen_t(MemoryLayout<sockaddr_in>.size)
@@ -242,13 +242,13 @@ public actor Auth {
                 var pfd = pollfd(fd: serverFD, events: Int16(POLLIN), revents: 0)
                 let pollRet = poll(&pfd, 1, Int32(timeout * 1000))
                 guard pollRet > 0 else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 8, userInfo: [NSLocalizedDescriptionKey: "授权等待超时"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 8, userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for authorization"]))
                     return
                 }
 
                 let clientFD = accept(serverFD, nil, nil)
                 guard clientFD >= 0 else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 9, userInfo: [NSLocalizedDescriptionKey: "接收回调失败"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 9, userInfo: [NSLocalizedDescriptionKey: "Failed to receive callback"]))
                     return
                 }
                 defer { close(clientFD) }
@@ -256,7 +256,7 @@ public actor Auth {
                 var buffer = [UInt8](repeating: 0, count: 4096)
                 let n = read(clientFD, &buffer, buffer.count)
                 guard n > 0, let reqText = String(bytes: buffer[0..<n], encoding: .utf8) else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 10, userInfo: [NSLocalizedDescriptionKey: "读取回调数据失败"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 10, userInfo: [NSLocalizedDescriptionKey: "Failed to read callback data"]))
                     return
                 }
 
@@ -264,23 +264,23 @@ public actor Auth {
                       let urlPart = line.split(separator: " ").dropFirst().first,
                       let components = URLComponents(string: "http://127.0.0.1" + urlPart),
                       let queryItems = components.queryItems else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 11, userInfo: [NSLocalizedDescriptionKey: "解析回调链接失败"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 11, userInfo: [NSLocalizedDescriptionKey: "Failed to parse callback link"]))
                     return
                 }
 
                 let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { a, _ in a })
                 guard query["state"] == expectedState else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 12, userInfo: [NSLocalizedDescriptionKey: "state 校验不匹配"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 12, userInfo: [NSLocalizedDescriptionKey: "OAuth state validation failed"]))
                     return
                 }
 
                 guard let code = query["code"], !code.isEmpty else {
                     let err = query["error"] ?? "unknown"
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 13, userInfo: [NSLocalizedDescriptionKey: "授权未通过: \(err)"]))
+                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 13, userInfo: [NSLocalizedDescriptionKey: "Authorization failed: \(err)"]))
                     return
                 }
 
-                let body = "Google Drive 授权成功！您可以关闭此窗口返回终端。"
+                let body = "Google Drive authorization succeeded. You can close this window and return to the terminal."
                 let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
                 _ = resp.withCString { Darwin.write(clientFD, $0, strlen($0)) }
 

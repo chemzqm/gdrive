@@ -34,7 +34,7 @@ struct ProgressNotifierTests {
             tracker.record(progress)
         }
 
-        // 1. 密集快速触发 100 次更新（模拟边扫描边上传）
+        // 1. Intensive and rapid triggering 100 Updates (simulating uploading while scanning)
         for i in 1...100 {
             notifier.addDiscovered(files: 1, bytes: 1024)
             if i % 2 == 0 {
@@ -42,13 +42,13 @@ struct ProgressNotifierTests {
             }
         }
 
-        // 密集调用期间，由于 500ms 防抖节流，不会被调用 100 次
+        // During intensive calls, due to 500ms Anti-shake throttling, will not be called 100 times
         #expect(tracker.count <= 2)
 
-        // 2. 等待 > 550ms 触发 trailing debounce 定时器
+        // 2. wait > 550ms trigger trailing debounce timer
         try await Task.sleep(nanoseconds: 600_000_000)
 
-        // 应当触发了合并后的 trailing 回调
+        // should trigger the merged trailing callback
         #expect(tracker.count >= 1)
         if let latest = tracker.last {
             #expect(latest.totalDiscoveredFiles == 100)
@@ -58,11 +58,11 @@ struct ProgressNotifierTests {
             #expect(latest.percentage == 0.5)
         }
 
-        // 3. 完成剩余 50 个文件并调用 finish()
+        // 3. Complete the rest 50 file and call finish()
         notifier.addCompleted(files: 50, bytes: 50 * 1024)
         notifier.finish()
 
-        // 强刷后最终状态 100%
+        // Final state after strong brushing 100%
         let finalSnapshot = tracker.last!
         #expect(finalSnapshot.completedFiles == 100)
         #expect(finalSnapshot.totalDiscoveredFiles == 100)

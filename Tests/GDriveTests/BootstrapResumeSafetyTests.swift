@@ -195,12 +195,12 @@ struct BootstrapResumeSafetyTests {
             return 1
         }
 
-        // 插入三种状态的文件：
-        // 1. inFlight 状态的大文件（未提交基线，dirty_generation = 1）
-        // 2. committed 但 dirty_generation = 1 的文件（本地被修改）
-        // 3. committed、remote_status = 'present'、dirty_generation = 0 的已确认基线文件
+        // Insert files in three states:
+        // 1. inFlight Large file of status (uncommitted baseline,dirty_generation = 1)
+        // 2. committed But dirty_generation = 1 file (modified locally)
+        // 3. committed,remote_status = 'present',dirty_generation = 0 Confirmed baseline files for
         try await store.write { conn in
-            // File 1: inFlight 未竟上传
+            // File 1: inFlight Unfinished upload
             let s1 = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
@@ -214,7 +214,7 @@ struct BootstrapResumeSafetyTests {
             _ = try s1.step()
             s1.reset()
 
-            // File 2: committed 但本地又有变更 (dirty_generation = 1)
+            // File 2: committed But there are local changes (dirty_generation = 1)
             let s2 = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
@@ -229,7 +229,7 @@ struct BootstrapResumeSafetyTests {
             _ = try s2.step()
             s2.reset()
 
-            // File 3: 完全已同步基线 (phase = 'committed', dirty_generation = 0, base_sha256 != nil)
+            // File 3: Fully synchronized baseline (phase = 'committed', dirty_generation = 0, base_sha256 != nil)
             let s3 = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
@@ -248,7 +248,7 @@ struct BootstrapResumeSafetyTests {
         let cache = try await LocalBaselineCache.load(store: store, rootId: rootId)
         #expect(cache.count == 1)
 
-        // 验证 lookupUnchanged
+        // Verify lookupUnchanged
         #expect(cache.lookupUnchanged(device: 1, inode: 1001, mtime: 100, size: 500) == nil)
         #expect(cache.lookupUnchanged(device: 1, inode: 1002, mtime: 200, size: 600) == nil)
         let hit = cache.lookupUnchanged(device: 1, inode: 1003, mtime: 300, size: 700)
@@ -358,7 +358,7 @@ struct BootstrapResumeSafetyTests {
         #expect(round1.filesSkipped == 0)
         #expect(round1.filesFailed == 0)
 
-        // 验证 SQLite 中 bootstrap_state 已置为 existingKnown
+        // Verify SQLite in bootstrap_state has been set to existingKnown
         let bootstrapStateRound1: String? = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT bootstrap_state FROM roots WHERE remote_root_id = 'mock_remote_root';")
             defer { s.reset() }
@@ -367,7 +367,7 @@ struct BootstrapResumeSafetyTests {
         }
         #expect(bootstrapStateRound1 == "existingKnown")
 
-        // 记录 Round 1 产生的所有 remote_file_id
+        // record Round 1 all produced remote_file_id
         let itemRemoteIdsRound1: [String] = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
             defer { s.reset() }
@@ -379,7 +379,7 @@ struct BootstrapResumeSafetyTests {
         }
         #expect(itemRemoteIdsRound1.count == 4) // 2 dirs + 2 files
 
-        // Round 2 (无任何变更再次运行初始化调用)
+        // Round 2 (Run the initialization call again without any changes)
         let round2 = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
         #expect(round2.directoriesCreated == 0)
         #expect(round2.filesUploaded == 0)
@@ -393,11 +393,11 @@ struct BootstrapResumeSafetyTests {
         #expect(round3.filesSkipped == 2)
         #expect(round3.filesFailed == 0)
 
-        // 断言：服务端记录的目录创建请求总数严格等于 2，文件创建请求总数严格等于 2！
+        // Assert: The total number of directory creation requests recorded by the server is strictly equal to 2,The total number of file creation requests is strictly equal to 2!
         #expect(recorder.dirCreateCount == 2)
         #expect(recorder.fileCreateCount == 2)
 
-        // 断言：SQLite 中的 remote_file_id 序列完全未变，绝不重新生成 ID！
+        // Assert:SQLite in remote_file_id The sequence is completely unchanged and never regenerated ID!
         let itemRemoteIdsRound3: [String] = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
             defer { s.reset() }
@@ -460,7 +460,7 @@ struct BootstrapResumeSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"startPageToken": "token_1"}"#.data(using: .utf8)!)
             }
 
-            // POST /upload/drive/v3/files (Multipart 创建新文件)
+            // POST /upload/drive/v3/files (Multipart Create new file)
             if request.httpMethod == "POST" && url.absoluteString.contains("/upload/drive/v3/files") {
                 recorder.recordFileCreate(id: fixedFileId)
                 let v1Sha = SyncEngine.computeSha256(of: v1Content.data(using: .utf8)!)
@@ -470,7 +470,7 @@ struct BootstrapResumeSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
             }
 
-            // PATCH /upload/drive/v3/files/{remoteId} (updateMultipart 更新已有文件)
+            // PATCH /upload/drive/v3/files/{remoteId} (updateMultipart Update existing files)
             if request.httpMethod == "PATCH" && url.absoluteString.contains("/upload/drive/v3/files/\(fixedFileId)") {
                 recorder.recordFilePatch()
                 let body = request.extractBodyData ?? Data()
@@ -486,17 +486,17 @@ struct BootstrapResumeSafetyTests {
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
-        // Round 1: 首次上传
+        // Round 1: First upload
         let round1 = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
         #expect(round1.filesUploaded == 1)
         #expect(recorder.fileCreateCount == 1)
         #expect(recorder.filePatchCount == 0)
 
-        // 修改文件内容
+        // Modify file content
         let v2Content = "Version 2 Modified Content with different size and hash\n"
         try v2Content.write(to: targetFile, atomically: true, encoding: .utf8)
 
-        // Round 2: 变更后重跑同步
+        // Round 2: Rerun synchronization after changes
         let round2 = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
         #expect(round2.filesUploaded == 0)
         #expect(round2.filesFailed == 1)
@@ -506,7 +506,7 @@ struct BootstrapResumeSafetyTests {
         #expect(recorder.fileCreateCount == 1)
         #expect(recorder.filePatchCount == 0)
 
-        // 断言 SQLite 中 items 表仅有 1 个文件项，且其 remote_file_id 保持为 fixedFileId
+        // assert SQLite in items The table only has 1 file items, and their remote_file_id remain as fixedFileId
         let (itemCount, currentRemoteId, currentBaseSha): (Int, String?, String?) = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT COUNT(*), remote_file_id, base_sha256 FROM items WHERE entry_kind = 'file' AND is_tombstone = 0;")
             defer { s.reset() }
@@ -538,7 +538,7 @@ struct BootstrapResumeSafetyTests {
         let localRootDir = tempDir.appendingPathComponent("local_root")
         try FileManager.default.createDirectory(at: localRootDir, withIntermediateDirectories: true)
 
-        // 创建一个 9MB 本地大文件
+        // Create a 9MB Large local files
         let largeFilePath = localRootDir.appendingPathComponent("large_9mb.bin")
         let chunk1MB = Data(repeating: 0x42, count: 1024 * 1024)
         FileManager.default.createFile(atPath: largeFilePath.path, contents: nil)
@@ -557,7 +557,7 @@ struct BootstrapResumeSafetyTests {
         let persistentRemoteId = "large_file_remote_42"
         let sessionURIString = "https://upload.invalid/resumable_session_42"
 
-        // 预设未完成的断点与 inFlight 记录（模拟上次运行在 4MB 处中断）
+        // Default unfinished breakpoints and inFlight logging (simulation was last run on 4MB interrupted)
         try await store.write { conn in
             _ = try conn.execute("""
             INSERT INTO roots (
@@ -622,15 +622,15 @@ struct BootstrapResumeSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, #"{"startPageToken": "token_1"}"#.data(using: .utf8)!)
             }
 
-            // queryResumableOffset (PUT 到 sessionURIString，带 Content-Range: bytes */total)
+            // queryResumableOffset (PUT Arrive sessionURIString,bring Content-Range: bytes */total)
             if url.absoluteString == sessionURIString {
                 if let contentRange = request.value(forHTTPHeaderField: "Content-Range") {
                     if contentRange.starts(with: "bytes */") {
-                        // 探测请求，服务端确认已收到 0-4194303 (4MB)
+                        // Detection request, the server confirms that it has been received 0-4194303 (4MB)
                         let headers = ["Range": "bytes=0-4194303"]
                         return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: headers)!, Data())
                     } else if contentRange.starts(with: "bytes 4194304-") && resumedChunkAttempt.next() == 0 {
-                        // 服务端只确认到 6MB；引擎必须按 Range 而非发送长度推进。
+                        // The server only confirms 6MB;The engine must press Range Instead of sending length advance.
                         recorder.recordResumedRange(start: 4194304)
                         return (HTTPURLResponse(url: url, statusCode: 308, httpVersion: nil, headerFields: ["Range": "bytes=0-6291455"])!, Data())
                     } else if contentRange.starts(with: "bytes 6291456-") {
@@ -643,7 +643,7 @@ struct BootstrapResumeSafetyTests {
                 }
             }
 
-            // 严禁发起重新生成 ID 或全新创建 session 的请求
+            // It is strictly prohibited to initiate a regeneration ID Or create a new one session request
             if path.hasSuffix("/files/generateIds") {
                 return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, #"{"error": "Should not generate new ID"}"#.data(using: .utf8)!)
             }
@@ -656,16 +656,16 @@ struct BootstrapResumeSafetyTests {
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
-        // 执行同步
+        // Perform synchronization
         let stats = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
         #expect(stats.filesUploaded == 1)
         #expect(stats.filesFailed == 0)
 
-        // 断言：确实复用了既有 session，从 4194304 (4MB) 处续传！
+        // Assertion: indeed reuse existing session,from 4194304 (4MB) Continued!
         #expect(recorder.resumedRangeStarts.contains(4194304))
         #expect(recorder.resumedRangeStarts.contains(6291456))
 
-        // 断言：SQLite 中的文件已转为 committed 且 remote_file_id 严格保持为 persistentRemoteId
+        // Assert:SQLite The files in have been converted to committed and remote_file_id strictly maintained as persistentRemoteId
         let (phase, dirtyGen, baseSha, finalRemoteId): (String?, Int64?, String?, String?) = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256, remote_file_id FROM items WHERE name = 'large_9mb.bin';")
             defer { s.reset() }
@@ -773,7 +773,7 @@ struct BootstrapResumeSafetyTests {
         let dbPath = tempDir.appendingPathComponent("state.sqlite").path
         let store = try await StateStore(path: dbPath)
 
-        // 预设：在 SQLite 中存有该文件的元数据（mtime、size完全匹配），但状态为 inFlight 且 base_sha256 为 NULL
+        // Default: on SQLite The metadata of the file is stored in (mtime,sizeexact match), but the status is inFlight and base_sha256 for NULL
         try await store.write { conn in
             _ = try conn.execute("""
             INSERT INTO roots (
@@ -844,12 +844,12 @@ struct BootstrapResumeSafetyTests {
 
         let stats = try await engine.syncLocalToRemoteEmpty(localPath: localRootDir.path, remoteRootId: "mock_remote_root")
 
-        // 关键断言：即使 mtime 和 size 在 items 中存在，由于此前为 inFlight，绝不能被缓存跳过！
+        // Key assertion: Even if mtime and size in items exists in , since it was previously inFlight,Must not be skipped by cache!
         #expect(stats.filesSkipped == 0)
         #expect(stats.filesUploaded == 1)
         #expect(recorder.fileCreateCount == 1)
 
-        // 验证 SQLite 最终处于 committed
+        // Verify SQLite finally at committed
         let (phase, dirtyGen, baseSha): (String?, Int64?, String?) = try await store.read { conn in
             let s = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256 FROM items WHERE name = 'unfinished.txt';")
             defer { s.reset() }

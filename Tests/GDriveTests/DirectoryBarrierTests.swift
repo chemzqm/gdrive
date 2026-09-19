@@ -75,7 +75,7 @@ struct DirectoryBarrierTests {
         let parentDirRemoteId = "remote_folder_sub"
         let childFileRemoteId = "remote_file_child"
 
-        // 1. 设置根记录与目录基线
+        // 1. Set root records and directory baselines
         let rootId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO roots (account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at)
@@ -196,11 +196,11 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // 验证：
-        // 1. 远端父目录绝对不能被 trash
+        // Verification:
+        // 1. The remote parent directory must not be trash
         #expect(!trashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must NOT be trashed due to descendant barrier")
 
-        // 2. 本地子目录被重新建立，子文件被下载
+        // 2. The local subdirectory is re-created and the sub-file is downloaded
         let downloadedSubDir = localRootDir.appendingPathComponent("sub")
         let downloadedFile = downloadedSubDir.appendingPathComponent("child.txt")
         #expect(FileManager.default.fileExists(atPath: downloadedSubDir.path), "Local parent directory must be recreated on disk")
@@ -209,7 +209,7 @@ struct DirectoryBarrierTests {
         let contentOnDisk = try? String(contentsOf: downloadedFile, encoding: .utf8)
         #expect(contentOnDisk == newRemoteContent)
 
-        // 3. 数据库状态：sub 的 local_status 恢复为 present，child.txt 也为 present
+        // 3. Database status:sub of local_status Revert to present,child.txt also for present
         try await store.read { conn in
             let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
@@ -265,7 +265,7 @@ struct DirectoryBarrierTests {
             return conn.lastInsertRowId
         }
 
-        // sub 目录在远端被置为 trashed，但在本地依然 present
+        // sub The directory on the remote end is set to trashed,But still locally present
         let subDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO items (
@@ -345,16 +345,16 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // 验证：
-        // 1. 本地目录与新文件依然完好存在于磁盘上，绝对未被删除
+        // Verification:
+        // 1. The local directory and new files are still intact on the disk and have never been deleted.
         #expect(FileManager.default.fileExists(atPath: subDir.path), "Local sub directory must NOT be deleted")
         #expect(FileManager.default.fileExists(atPath: localNewFile.path), "Local child file must remain intact")
 
-        // 2. 远端目录被执行 untrash
+        // 2. The remote directory is executed untrash
         #expect(untrashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must be untrashed to protect child upload")
         #expect(uploadedFiles.contains("local_new.txt"), "Local child must be uploaded after its durable ID is allocated")
 
-        // 3. 数据库状态：sub 的 remote_status 恢复为 present，is_tombstone 为 0
+        // 3. Database status:sub of remote_status Revert to present,is_tombstone for 0
         try await store.read { conn in
             let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
@@ -407,7 +407,7 @@ struct DirectoryBarrierTests {
             return conn.lastInsertRowId
         }
 
-        // 构建层级: local_root / level1 / level2 / file.txt
+        // Build hierarchy: local_root / level1 / level2 / file.txt
         let level1ItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO items (
@@ -519,8 +519,8 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // 验证：
-        // 1. 文件先删除，随后按自底向上（level2 深度大于 level1）顺序删除远端目录
+        // Verification:
+        // 1. Delete the file first, then press bottom-up (level2 depth greater than level1)Delete remote directories sequentially
         #expect(trashedRemoteOrder.contains(fileRemoteId))
         #expect(trashedRemoteOrder.contains(childDirRemoteId))
         #expect(trashedRemoteOrder.contains(parentDirRemoteId))
@@ -532,7 +532,7 @@ struct DirectoryBarrierTests {
         #expect(fileIdx < level2Idx, "File must be deleted before its parent directory")
         #expect(level2Idx < level1Idx, "Deeper directory level2 must be deleted before shallower level1")
 
-        // 2. 数据库中各层级全部转为 tombstone
+        // 2. All levels in the database are converted to tombstone
         try await store.read { conn in
             let stmt = try conn.prepare("SELECT is_tombstone, phase FROM items WHERE item_id IN (?, ?, ?);")
             // level1
@@ -591,7 +591,7 @@ struct DirectoryBarrierTests {
             return conn.lastInsertRowId
         }
 
-        // 本地删除了 sub 目录 (local_status = 'absent', remote_status = 'present')
+        // Deleted locally sub Directory (local_status = 'absent', remote_status = 'present')
         let subDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO items (
@@ -685,11 +685,11 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // 验证：
-        // 1. 远端父目录绝不被 trash
+        // Verification:
+        // 1. The remote parent directory is never trash
         #expect(!trashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must NOT be trashed due to descendant barrier")
 
-        // 2. 本地 sub 目录被重建，remote_added.txt 文件被正确下载
+        // 2. local sub The directory is rebuilt,remote_added.txt The file was downloaded correctly
         let subDirURL = localRootDir.appendingPathComponent("sub")
         let downloadedFile = subDirURL.appendingPathComponent("remote_added.txt")
         #expect(FileManager.default.fileExists(atPath: subDirURL.path), "Local sub directory must be recreated")
@@ -710,7 +710,7 @@ struct DirectoryBarrierTests {
             }
         }
 
-        // 3. 数据库中 sub 目录恢复为 present / committed
+        // 3. in database sub The directory is restored to present / committed
         try await store.read { conn in
             let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
@@ -845,13 +845,13 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
 
-        // 验证：
-        // 1. 本地文件已被移除（移至废纸篓）
+        // Verification:
+        // 1. Local file removed (moved to Trash)
         #expect(!FileManager.default.fileExists(atPath: childFile.path))
-        // 2. 本地子目录变为空后也被安全移至废纸篓
+        // 2. Local subdirectories that become empty are also safely moved to the Trash
         #expect(!FileManager.default.fileExists(atPath: subDir.path))
 
-        // 3. 数据库中二者均已 tombstone
+        // 3. Both are in the database tombstone
         try await store.read { conn in
             let stmt = try conn.prepare("SELECT is_tombstone FROM items WHERE item_id IN (?, ?);")
             stmt.bindInt64(subDirItemId, at: 1)

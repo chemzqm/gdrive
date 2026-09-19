@@ -1,6 +1,6 @@
 import Foundation
 
-/// 正在传输中的文件项模型
+/// File item model in transit
 public struct TransferItem: Sendable, Identifiable {
     public var id: String { fileId }
     public let fileId: String
@@ -23,7 +23,7 @@ public struct TransferItem: Sendable, Identifiable {
     }
 }
 
-/// 处于队列中等待传输的文件项模型
+/// File item model in queue for transfer
 public struct QueuedTransferItem: Sendable, Identifiable {
     public var id: String { fileId }
     public let fileId: String
@@ -39,7 +39,7 @@ public struct QueuedTransferItem: Sendable, Identifiable {
     }
 }
 
-/// 内存中的实时传输快照（每 500ms 自动刷新）
+/// Real-time in-memory transfer snapshots (per 500ms Auto Refresh)
 public struct TransferSnapshot: Sendable {
     public let activeUploads: [TransferItem]
     public let activeDownloads: [TransferItem]
@@ -68,7 +68,7 @@ public struct TransferSnapshot: Sendable {
     }
 }
 
-/// 线程安全的实时传输监控与速率采样器
+/// Thread-safe real-time transmission monitoring and rate sampler
 public final class TransferMonitor: @unchecked Sendable {
     private let lock = NSLock()
 
@@ -108,7 +108,7 @@ public final class TransferMonitor: @unchecked Sendable {
         }
     }
 
-    // MARK: - 上传队列与活跃管理
+    // MARK: - Upload Queues & Active Management
 
     public func enqueueUpload(id: String, name: String, totalBytes: Int64) {
         lock.lock()
@@ -141,7 +141,7 @@ public final class TransferMonitor: @unchecked Sendable {
         activeUploads.removeValue(forKey: id)
     }
 
-    // MARK: - 下载队列与活跃管理
+    // MARK: - Download Queues & Active Management
 
     public func enqueueDownload(id: String, name: String, totalBytes: Int64) {
         lock.lock()
@@ -174,9 +174,9 @@ public final class TransferMonitor: @unchecked Sendable {
         activeDownloads.removeValue(forKey: id)
     }
 
-    // MARK: - 快照采样与外部读取
+    // MARK: - Snapshot sampling and external reads
 
-    /// 内部每 500ms 刷新一次最新快照（计算滑动秒级速率）
+    /// Internal every 500ms Refresh the latest snapshot once (calculate the sliding second rate)
     public func refreshSnapshot() {
         lock.lock()
         defer { lock.unlock() }
@@ -222,7 +222,7 @@ public final class TransferMonitor: @unchecked Sendable {
         )
     }
 
-    /// 外部直接同步获取内存快照，无网络/无磁盘 I/O，耗时 0ms
+    /// External direct sync for memory snapshots, no network/No Disks I/O,Time consuming 0ms
     public func getSnapshot() -> TransferSnapshot {
         lock.lock()
         defer { lock.unlock() }

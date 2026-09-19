@@ -4,7 +4,7 @@ import CommonCrypto
 import GDrive
 import DirectoryScanner
 
-/// 线程安全的内存 ID 分发器（保证每轮基准测试使用完全相同的一批真实 Google Drive ID）
+/// thread-safe memory ID Distributor (guarantees that each round of benchmarking uses exactly the same batch of real Google Drive ID)
 final class IDDispenser: @unchecked Sendable {
     private var ids: [String]
     private var index: Int = 0
@@ -32,7 +32,7 @@ final class IDDispenser: @unchecked Sendable {
     }
 }
 
-/// 专用于 SHA256 批次计算的任务队列
+/// Dedicated to SHA256 Task queue for batch calculation
 final class ComputeQueue: @unchecked Sendable {
     private var mutex = pthread_mutex_t()
     private var notEmpty = pthread_cond_t()
@@ -94,7 +94,7 @@ final class ComputeQueue: @unchecked Sendable {
     }
 }
 
-/// 写入流水线门控（限制在途最大任务数，提供反压与优雅收尾）
+/// Write pipeline gating (limit the maximum number of tasks in transit, provide backpressure and graceful ending)
 final class WritePipeline: @unchecked Sendable {
     private let store: StateStore
     private let sema: DispatchSemaphore
@@ -166,7 +166,7 @@ final class WritePipeline: @unchecked Sendable {
     }
 }
 
-/// 基准测试结果记录
+/// Benchmark test results record
 struct BenchResult: Sendable {
     let name: String
     let batchCapacity: Int
@@ -183,7 +183,7 @@ struct BenchResult: Sendable {
     let walSizeBytes: Int64
 }
 
-/// 预先收集并构建目录拓扑树
+/// Pre-collect and build directory topology trees
 func buildDirectoryTopology(rootPath: String) -> [String] {
     let url = URL(fileURLWithPath: rootPath)
     guard let enumerator = FileManager.default.enumerator(
@@ -210,7 +210,7 @@ func buildDirectoryTopology(rootPath: String) -> [String] {
         }
     }
 
-    // 按路径斜杠层级升序排列，保证父目录总在子目录之前创建
+    // Arrange in ascending order by path slash level, ensuring that parent directories are always created before subdirectories.
     return dirs.sorted {
         let c1 = $0.filter { $0 == "/" }.count
         let c2 = $1.filter { $0 == "/" }.count
@@ -225,11 +225,11 @@ struct GDriveBenchMain {
 
         let targetPath = "/Users/chemzqm/lib/vim"
         print("==================================================================")
-        print("🚀 GDrive 同步基线 SQLite Group Commit 性能实测")
-        print("目标目录: \(targetPath)")
+        print("🚀 GDrive sync-baseline SQLite group-commit benchmark")
+        print("Target directory: \(targetPath)")
         print("==================================================================")
 
-        // 1. 获取并补足 Google Drive ID 缓存
+        // 1. Populate the Google Drive ID cache.
         let idDispenser: IDDispenser
         do {
             let auth = try Auth()
@@ -239,48 +239,48 @@ struct GDriveBenchMain {
             let existingCount = await idPool.count
             let requiredCount = 16000
             if existingCount < requiredCount {
-                print("⚡ 正在从 Google Drive 批量并发预取 \(requiredCount - existingCount) 个服务器认可 ID 到内存缓冲池...")
+                print("⚡ Concurrently prefetching \(requiredCount - existingCount) server-issued IDs from Google Drive...")
                 let fetchStart = DispatchTime.now()
                 try await idPool.ensureCapacity(requiredCount)
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - fetchStart.uptimeNanoseconds) / 1_000_000_000
-                print("✅ 预取完成，用时: \(String(format: "%.2f", elapsed)) 秒")
+                print("✅ Prefetching completed, time taken: \(String(format: "%.2f", elapsed)) seconds")
             }
             let ids = await idPool.takeIds(count: requiredCount)
-            print("✅ 内存中已准备好 \(ids.count) 个 Google Drive 真实 ID 供测试使用\n")
+            print("✅ Prepared \(ids.count) Google Drive IDs in memory\n")
             idDispenser = IDDispenser(ids: ids)
         } catch {
-            print("❌ 初始化 Google Drive ID 失败: \(error)")
+            print("❌ Failed to initialize Google Drive IDs: \(error)")
             exit(1)
         }
 
-        // 2. 预先构建目录树拓扑
-        print("📂 正在预先解析目录树结构...")
+        // 2. Pre-built directory tree topology
+        print("📂 Pre-parsing directory tree structure...")
         let relativeDirs = buildDirectoryTopology(rootPath: targetPath)
-        print("✅ 发现 \(relativeDirs.count) 个子目录\n")
+        print("✅ Found \(relativeDirs.count) subdirectories\n")
 
         setbuf(stdout, nil)
 
-        // 3. 测试配置矩阵
+        // 3. Test configuration matrix
         let configs: [(name: String, capacity: Int, timeoutMs: Int)] = [
-            ("模式 1: 累计满 32 条 (5ms 超时兜底)", 32, 5),
-            ("模式 2: 累计满 64 条 (5ms 超时兜底)", 64, 5),
-            ("模式 3: 累计满 128 条 (5ms 超时兜底)", 128, 5),
-            ("模式 4: 累计满 256 条 (5ms 超时兜底)", 256, 5),
-            ("模式 5: 纯 5ms 超时驱动 (容量设为 10000)", 10000, 5),
-            ("模式 6: 纯 10ms 超时驱动 (容量设为 10000)", 10000, 10),
-            ("模式 7: 纯 64 条计数驱动 (无超时兜底)", 64, 10000),
+            ("Mode 1: 32 operations (5 ms timeout)", 32, 5),
+            ("Mode 2: 64 operations (5 ms timeout)", 64, 5),
+            ("Mode 3: 128 operations (5 ms timeout)", 128, 5),
+            ("Mode 4: 256 operations (5 ms timeout)", 256, 5),
+            ("Mode 5: 5 ms timeout only (capacity 10000)", 10000, 5),
+            ("Mode 6: 10 ms timeout only (capacity 10000)", 10000, 10),
+            ("Mode 7: 64 operations only (no practical timeout)", 64, 10000),
         ]
 
         var results: [BenchResult] = []
 
         for config in configs {
             print("------------------------------------------------------------------")
-            print("▶️ 开始运行: [\(config.name)]")
+            print("▶️ Start running: [\(config.name)]")
             print("   batchCapacity = \(config.capacity), batchTimeoutMs = \(config.timeoutMs)ms")
             idDispenser.reset()
 
             let dbPath = "/tmp/gdrive_bench_\(config.capacity)_\(config.timeoutMs).sqlite"
-            // 清理旧库文件
+            // Clean up old library files
             for ext in ["", "-wal", "-shm"] {
                 try? FileManager.default.removeItem(atPath: dbPath + ext)
             }
@@ -297,7 +297,7 @@ struct GDriveBenchMain {
             results.append(result)
 
             print(String(
-                format: "⏱️  用时: %.3f 秒 | 吞吐: %.1f 文件/秒 (%.2f MB/s) | 提交数: %d 次 | 满批触发: %d | 超时触发: %d | 平均批次大小: %.1f",
+                format: "⏱️  Time: %.3f s | Throughput: %.1f files/s (%.2f MB/s) | commits: %d | capacity flushes: %d | timeout flushes: %d | average batch: %.1f",
                 result.elapsedSeconds,
                 result.throughputFilesPerSec,
                 result.throughputMBPerSec,
@@ -306,19 +306,19 @@ struct GDriveBenchMain {
                 result.timeoutCommits,
                 result.averageBatchSize
             ))
-            print("   主库大小: \(result.dbSizeBytes / 1024) KB | WAL 大小: \(result.walSizeBytes / 1024) KB\n")
+            print("   Main library size: \(result.dbSizeBytes / 1024) KB | WAL size: \(result.walSizeBytes / 1024) KB\n")
 
-            // 清理测试库
+            // Clean test library
             for ext in ["", "-wal", "-shm"] {
                 try? FileManager.default.removeItem(atPath: dbPath + ext)
             }
         }
 
-        // 4. 输出最终对照表
+        // 4. Output final comparison table
         print("==========================================================================================================")
-        print("📊 最终对比汇总表格 (目标: \(targetPath))")
+        print("📊 Final comparison summary table (target: \(targetPath))")
         print("==========================================================================================================")
-        print("| 配置方案 | 总耗时 (s) | 吞吐率 (文件/s) | 事务提交总数 | 满批触发 (次) | 超时触发 (次) | 平均每批条数 | WAL 大小 |")
+        print("| Configuration plan | Total time spent (s) | Throughput (File/s) | Total number of transaction commits | Full batch trigger (times) | Timeout trigger (times) | Average number of items per batch | WAL size |")
         print("| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |")
         for r in results {
             let numPart = String(
@@ -353,12 +353,12 @@ struct GDriveBenchMain {
                 batchTimeoutMs: batchTimeoutMs
             )
         } catch {
-            fatalError("创建 StateStore 失败: \(error)")
+            fatalError("Failed to create StateStore: \(error)")
         }
 
         let now = Date().timeIntervalSince1970
 
-        // 1. 创建 Root 与基础目录树拓扑
+        // 1. Create Root with underlying directory tree topology
         let (staticRootId, staticRootItemId, staticDirIdMap): (Int64, Int64, [String: Int64])
         do {
             (staticRootId, staticRootItemId, staticDirIdMap) = try await store.write { conn in
@@ -415,10 +415,10 @@ struct GDriveBenchMain {
                 return (localRootId, localRootItemId, localDirIdMap)
             }
         } catch {
-            fatalError("初始化目录拓扑失败: \(error)")
+            fatalError("Failed to initialize directory topology: \(error)")
         }
 
-        // 2. 准备并行哈希与写入流水线
+        // 2. Preparing parallel hashing and writing pipelines
         let cpuCount = ProcessInfo.processInfo.activeProcessorCount
         let scanWorkers = min(6, max(1, cpuCount / 2))
         let hashWorkers = max(1, cpuCount)
@@ -467,7 +467,7 @@ struct GDriveBenchMain {
                             counter.fileCount += 1
                             counter.byteCount += fileSize
 
-                            // 解析相对路径与父目录
+                            // Resolve relative paths and parent directories
                             let fullPath = String(cString: cPath)
                             let prefix = targetPath.hasSuffix("/") ? targetPath : targetPath + "/"
                             let relPath: String
@@ -508,7 +508,7 @@ struct GDriveBenchMain {
             thread.start()
         }
 
-        // 3. 启动高并发 DirectoryScanner 扫描
+        // 3. Start high concurrency DirectoryScanner scan
         var prefix = targetPath
         if !prefix.hasSuffix("/") { prefix += "/" }
         let prefixBytes = Array(prefix.utf8)
@@ -533,19 +533,19 @@ struct GDriveBenchMain {
                 computeQueue.push(batch)
             }
         } catch {
-            print("扫描发生错误: \(error)")
+            print("Scan error occurred: \(error)")
         }
 
         computeQueue.finish()
 
-        // 4. 等待所有哈希计算线程结束
+        // 4. Wait for all hash calculation threads to end
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             computeGroup.notify(queue: .global(qos: .userInitiated)) {
                 cont.resume()
             }
         }
 
-        // 5. 等待数据库写入流水线排空并强制提交尾批
+        // 5. Wait for the database write pipeline to drain and force the last batch to be committed
         await writePipeline.waitUntilDrained()
         try? await store.flush()
 
@@ -559,11 +559,11 @@ struct GDriveBenchMain {
         let throughputFiles = Double(totalFiles) / elapsed
         let throughputMB = (Double(totalBytes) / (1024.0 * 1024.0)) / elapsed
 
-        // 读取库文件大小
+        // Read library file size
         let dbSize = (try? FileManager.default.attributesOfItem(atPath: dbPath)[.size] as? Int64) ?? 0
         let walSize = (try? FileManager.default.attributesOfItem(atPath: dbPath + "-wal")[.size] as? Int64) ?? 0
 
-        // 校验写入记录数
+        // Verify the number of written records
         let verifyCount: Int64 = (try? await store.read { conn -> Int64 in
             let stmt = try conn.cachedStatement("SELECT count(*) FROM items WHERE entry_kind = 'file';")
             if try stmt.step() {
@@ -572,7 +572,7 @@ struct GDriveBenchMain {
             return 0
         }) ?? 0
         if verifyCount != Int64(totalFiles) {
-            print("⚠️ 警告: 写入文件记录数不一致! 预期 \(totalFiles), 实际库中: \(verifyCount)")
+            print("⚠️ Warning: file record count mismatch; expected \(totalFiles), found \(verifyCount)")
         }
 
         return BenchResult(

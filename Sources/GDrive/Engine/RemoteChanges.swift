@@ -36,7 +36,7 @@ struct RemoteChanges: Sendable {
         // A bootstrap retry must never replace an earlier recovery boundary.
         guard !exists else { return }
         guard !requireExisting else {
-            throw SyncEngineError.general("已有同步根缺少 Changes 游标，请通过 syncIncremental 重建远端观察")
+            throw SyncEngineError.general("The existing sync root has no Changes cursor; run syncIncremental to rebuild remote observations")
         }
         let token: String
         if let initialToken { token = initialToken } else { token = try await client.getStartPageToken() }
@@ -120,7 +120,7 @@ struct RemoteChanges: Sendable {
             }
             guard let next = page.nextPageToken ?? page.newStartPageToken, !next.isEmpty,
                   page.nextPageToken == nil || next != token else {
-                throw DriveError.invalidResponse(message: "Changes 未返回有效续读游标")
+                throw DriveError.invalidResponse(message: "Changes returned no valid refresh cursor")
             }
             let expectedToken = token
             try await store.write { conn in
@@ -143,7 +143,7 @@ struct RemoteChanges: Sendable {
                     UPDATE cursors SET token_value = ?, updated_at = strftime('%s','now')
                     WHERE root_id = ? AND cursor_kind = 'drive_changes' AND is_valid = 1 AND token_value = ?;
                     """, [.text(next), .int(rootID), .text(expectedToken)])
-                guard conn.changes == 1 else { throw SyncEngineError.general("Changes 游标已被另一轮更新") }
+                guard conn.changes == 1 else { throw SyncEngineError.general("The Changes cursor was updated by another sync round") }
             }
             token = next
             if page.nextPageToken == nil { break }
@@ -321,7 +321,7 @@ struct RemoteChanges: Sendable {
             ) SELECT path FROM ancestry WHERE parent_id IS NULL;
             """, [.int(itemID)])
         defer { q.reset() }
-        guard try q.step(), let path = q.columnText(at: 0) else { throw SyncEngineError.general("无法解析远端观察的本地路径") }
+        guard try q.step(), let path = q.columnText(at: 0) else { throw SyncEngineError.general("Unable to resolve local path for remote observation") }
         return path
     }
     private func exclude(_ conn: SQLiteConnection, itemID: Int64) throws {
@@ -555,7 +555,7 @@ struct RemoteChanges: Sendable {
                         throw error
                     }
                     guard page.nextPageToken == nil || page.nextPageToken != job.token else {
-                        throw DriveError.invalidResponse(message: "目录分页游标没有前进")
+                        throw DriveError.invalidResponse(message: "Catalog pagination cursor does not advance")
                     }
                     try await store.batchWrite { conn in
                         for file in page.files {
@@ -566,7 +566,7 @@ struct RemoteChanges: Sendable {
                             WHERE root_id = ? AND remote_id = ? AND scan_id = ? AND page_token IS ? AND state = 'pending';
                             """, [.text(page.nextPageToken), .text(page.nextPageToken == nil ? "complete" : "pending"),
                                     .int(rootID), .text(job.id), .text(job.scanID), .text(job.token)])
-                        guard conn.changes == 1 else { throw SyncEngineError.general("目录补列任务已过期") }
+                        guard conn.changes == 1 else { throw SyncEngineError.general("The catalog patch task is stale") }
                     }
                 }
             }

@@ -1,7 +1,7 @@
 import Foundation
 import CryptoKit
 
-/// 共同基线 (B: Baseline)
+/// Common baseline (B: Baseline)
 public struct ItemBaseline: Sendable, Equatable {
     public let sha256: String?
     public let size: Int64?
@@ -14,7 +14,7 @@ public struct ItemBaseline: Sendable, Equatable {
     }
 }
 
-/// 本地观察 (L: Local Observation)
+/// Local Observation (L: Local Observation)
 public struct LocalObservation: Sendable, Equatable {
     public enum Status: String, Sendable {
         case present
@@ -36,7 +36,7 @@ public struct LocalObservation: Sendable, Equatable {
     }
 }
 
-/// 远端观察 (R: Remote Observation)
+/// Remote Observation (R: Remote Observation)
 public struct RemoteObservation: Sendable, Equatable {
     public enum Status: String, Sendable {
         case present
@@ -58,38 +58,38 @@ public struct RemoteObservation: Sendable, Equatable {
     }
 }
 
-/// 冲突保留胜者
+/// Conflict Reservation Winner
 public enum ConflictWinner: String, Sendable {
     case local
     case remote
 }
 
-/// Reconciler 协调决策动作
+/// Reconciler Coordinate Decision Actions
 public enum ReconcileDecision: Sendable, Equatable {
-    /// 仅本地修改或新增 -> 上传至远端
+    /// Modify or add locally only -> Upload to remote
     case upload(reason: String)
-    /// 仅远端修改或新增 -> 下载至本地
+    /// Modify or add remotely only -> Download locally
     case download(reason: String)
-    /// 双方皆有修改但 SHA-256 摘要相同 -> 零传输推进共同基线
+    /// Modified by both parties but SHA-256 Same digest -> Zero Transmission Propulsion Common Baseline
     case matchUpdateBaseline(sha256: String, size: Int64)
-    /// 双方皆有修改且 SHA-256 不一致 -> 保留双方版本产生冲突副本
+    /// Modified by both parties and SHA-256 Inconsistent -> Keep conflicting copies of both versions
     case conflict(winner: ConflictWinner, conflictId: String)
-    /// 本地已删除且远端未修改 -> 将远端移入回收站
+    /// Local deleted and not modified remotely -> Move Remote to Trash
     case trashRemote
-    /// 远端已删除且本地未修改 -> 安全可恢复删除本地文件
+    /// Remote deleted and not modified locally -> Secure Recoverable Delete Local Files
     case deleteLocal
-    /// 一侧删除另一侧修改 -> 保留修改版本，杜绝误删数据
+    /// Delete on one side Modify on the other side -> Keep the modified version to prevent erroneous deletion of data
     case keepModified(preferLocal: Bool)
-    /// 两端完全一致 -> 无需操作
+    /// Exactly the same on both ends -> No action required
     case unchanged
-    /// 证据不足或等待输入稳定
+    /// Insufficient evidence or waiting for stable input
     case waitingEvidence(reason: String)
 }
 
-/// 三方状态协调决策引擎（Reconciler）
-/// 遵循 v1.md §9.1 核心状态决策规范及 A02 审计规范：
-/// 以共同基线 B、本地观察 L、远端观察 R 进行无偏逐项比对，mtime 不决定谁覆盖谁。
-/// 严格保证“存在性证据”与“内容证据”完备性：拒绝任何单侧 unknown 或缺少 SHA-256 摘要的无证据删除、覆盖决策。
+/// Tripartite state coordination decision engine (Reconciler)
+/// Follow the v1.md §9.1 Core State Decision Specification and A02 Audit Specification:
+/// with a common baseline B,Local Observation L,Remote Observation R unbiased item-by-item comparison,mtime Doesn't decide who covers who.
+/// Strictly guaranteed“Existence Evidence”And“Content Evidence”Completeness: Reject any one-sided unknown or missing SHA-256 No evidence of summary deletion, override decision.
 public struct Reconciler: Sendable {
     // Content identity is deterministic; execution scopes it to the persisted item ID.
     private static func conflictIdentity(base: String?, local: String?, remote: String?) -> String {
@@ -105,45 +105,45 @@ public struct Reconciler: Sendable {
         let localStatus = local?.status ?? .unknown
         let remoteStatus = remote?.status ?? .unknown
 
-        // 1. 本地状态处于写入不稳定中，等待写入稳定
+        // 1. Local state is in write instability, waiting for write stability
         if localStatus == .unstable {
-            return .waitingEvidence(reason: "本地文件正文不稳定，正在写入")
+            return .waitingEvidence(reason: "Local file body is unstable, writing")
         }
 
-        // 2. 任一侧状态未知 (unknown)：绝不把 unknown 当作未变化
+        // 2. Unknown status on either side (unknown):Never put unknown as unchanged
         if localStatus == .unknown && remoteStatus == .unknown {
-            return .waitingEvidence(reason: "两端观察状态未知")
+            return .waitingEvidence(reason: "Observation status unknown at both ends")
         }
         if localStatus == .unknown {
-            return .waitingEvidence(reason: "本地观察状态未知，拒绝无证据决策")
+            return .waitingEvidence(reason: "Local observation status is unknown, no evidence decision is rejected")
         }
         if remoteStatus == .unknown {
-            return .waitingEvidence(reason: "远端观察状态未知，拒绝无证据决策")
+            return .waitingEvidence(reason: "The remote observation status is unknown, refuse to make an unsubstantiated decision")
         }
 
-        // 3. 内容证据完备性检查：只要一侧状态为 present，必须具备有效 SHA-256 摘要证据
+        // 3. Content Evidence Completeness Check: As long as one side status is present,Must have valid SHA-256 Summary Evidence
         if localStatus == .present && (local?.sha256 == nil || local?.sha256?.isEmpty == true) {
-            return .waitingEvidence(reason: "本地文件正文 SHA-256 待获取")
+            return .waitingEvidence(reason: "Local file body SHA-256 To be acquired")
         }
         if remoteStatus == .present && (remote?.sha256 == nil || remote?.sha256?.isEmpty == true) {
-            return .waitingEvidence(reason: "远端文件正文 SHA-256 待获取")
+            return .waitingEvidence(reason: "Remote file body SHA-256 To be acquired")
         }
 
         let baseSha = baseline?.sha256?.lowercased()
         let localSha = local?.sha256?.lowercased()
         let remoteSha = remote?.sha256?.lowercased()
 
-        // 4. 无共同基线 B（初次同步或新创文件）
+        // 4. No common baseline B(Initial sync or startup file)
         guard let baseSha else {
-            // 本地存在，且远端已明确确认不存在 (absent)
+            // Locally present and remotely explicitly confirmed not to exist (absent)
             if localStatus == .present && remoteStatus == .absent {
-                return .upload(reason: "本地新文件")
+                return .upload(reason: "New local file")
             }
-            // 远端存在，且本地已明确确认不存在 (absent)
+            // Remotely present and locally explicitly confirmed not to exist (absent)
             if remoteStatus == .present && localStatus == .absent {
-                return .download(reason: "远端新文件")
+                return .download(reason: "New remote file")
             }
-            // 双方皆存在但未有基线
+            // Both present but no baseline
             if localStatus == .present && remoteStatus == .present {
                 if let localSha, let remoteSha, localSha == remoteSha {
                     return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
@@ -152,23 +152,23 @@ public struct Reconciler: Sendable {
                     return .conflict(winner: .remote, conflictId: String(conflictId))
                 }
             }
-            // 本地与远端皆不存在
+            // Neither local nor remote
             if localStatus == .absent && remoteStatus == .absent {
                 return .unchanged
             }
-            // 远端在回收站，本地不存在
+            // Remote end in trash, local does not exist
             if localStatus == .absent && remoteStatus == .trashed {
                 return .unchanged
             }
-            // 远端在回收站，本地有新文件
+            // Remote end in Trash, new file locally
             if localStatus == .present && remoteStatus == .trashed {
                 return .keepModified(preferLocal: true)
             }
-            return .waitingEvidence(reason: "无基线且状态未满足明确创建条件")
+            return .waitingEvidence(reason: "No baseline and status does not meet explicit creation criteria")
         }
 
-        // 5. 有共同基线 B：计算两端相对基线的变更状态
-        // 此时由于前置完备性检查，present 状态下的 localSha 和 remoteSha 必然非空
+        // 5. Has common baseline B:Calculate the change status of both ends from baseline
+        // At this time, due to the pre-completeness check,present in the state of localSha and remoteSha Definitely not empty
         let localChanged = (localStatus == .present && localSha != baseSha)
         let remoteChanged = (remoteStatus == .present && remoteSha != baseSha)
         let localUnchanged = (localStatus == .present && localSha == baseSha)
@@ -177,40 +177,40 @@ public struct Reconciler: Sendable {
         let localDeleted = (localStatus == .absent)
         let remoteDeleted = (remoteStatus == .absent || remoteStatus == .trashed)
 
-        // 5.1 双端皆删除
+        // 5.1 Delete on both ends
         if localDeleted && remoteDeleted {
             return .unchanged
         }
 
-        // 5.2 本地已删除，远端未删除
+        // 5.2 Local deleted, remote not deleted
         if localDeleted && !remoteDeleted {
             if remoteChanged {
-                // 本地删除了，但远端又有新修改 -> 保留修改版本
+                // Deleted locally, but changed remotely -> Keep Modified Version
                 return .keepModified(preferLocal: false)
             } else if remoteUnchanged {
-                // 本地删除，远端确认未变 -> 安全移入远端回收站
+                // Local deletion, remote confirmation unchanged -> Safely move to Remote Recycle Bin
                 return .trashRemote
             }
         }
 
-        // 5.3 远端已删除，本地未删除
+        // 5.3 Remote deleted, local not deleted
         if remoteDeleted && !localDeleted {
             if localChanged {
-                // 远端删除了，但本地又有新修改 -> 保留修改版本
+                // Remotely deleted, but new local modifications -> Keep Modified Version
                 return .keepModified(preferLocal: true)
             } else if localUnchanged {
-                // 远端删除，本地确认未变 -> 安全删除本地文件
+                // Remotely deleted, local confirmation unchanged -> Safely delete local files
                 return .deleteLocal
             }
         }
 
-        // 5.4 内容变更场景
+        // 5.4 Content Change Scenario
         if localChanged && remoteUnchanged {
-            return .upload(reason: "仅本地内容更新")
+            return .upload(reason: "Only local content changed")
         }
 
         if remoteChanged && localUnchanged {
-            return .download(reason: "仅远端内容更新")
+            return .download(reason: "Only remote content changed")
         }
 
         if localUnchanged && remoteUnchanged {
@@ -226,6 +226,6 @@ public struct Reconciler: Sendable {
             }
         }
 
-        return .waitingEvidence(reason: "状态证据不满足任何明确决策路径")
+        return .waitingEvidence(reason: "Status evidence does not satisfy any explicit decision path")
     }
 }

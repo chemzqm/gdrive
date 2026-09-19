@@ -5,7 +5,7 @@ import Logging
 import DirectoryScanner
 import os
 
-/// 同步进度统计指标
+/// Synchronization progress statistics indicators
 public struct SyncStats: Sendable {
     public var filesScanned: Int = 0
     public var filesSkipped: Int = 0
@@ -24,7 +24,7 @@ public struct SyncStats: Sendable {
     public var elapsedSeconds: Double = 0
 }
 
-/// SyncEngine 异常类型定义
+/// SyncEngine Exception type definition
 public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     case localRootNotFound(path: String)
     case remoteRootLost(remoteId: String, reason: String)
@@ -39,26 +39,26 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
     public var description: String {
         switch self {
         case .localRootNotFound(let path):
-            return "本地同步根目录已不存在或不是有效目录: \(path)，已终止同步以保护云端文件不被扩散删除"
+            return "The local sync root no longer exists or is not a valid directory: \(path). Sync stopped to prevent remote deletion propagation."
         case .remoteRootLost(let remoteId, let reason):
-            return "远端同步根目录已被移除或移入回收站 (\(reason)): \(remoteId)，已终止同步以保护本地文件不被扩散删除"
+            return "The remote sync root was removed or trashed (\(reason)): \(remoteId). Sync stopped to prevent local deletion propagation."
         case .rootNotConfigured(let remoteId):
-            return "未找到对应的同步根，请先执行初始化同步: \(remoteId)"
+            return "No matching sync root was found. Run initial sync first: \(remoteId)"
         case .invalidDirectory(let path):
-            return "路径不是有效目录: \(path)"
+            return "Path is not a valid directory: \(path)"
         case .general(let msg):
             return msg
         }
     }
 }
 
-/// GDrive 核心同步引擎
-/// 遵循 v1.md 与 AGENTS.md 规范：
-/// - 仅支持本地目录到远程空目录同步 (localToRemoteEmpty) 和远程目录到本地空目录同步 (remoteToLocalEmpty)
-/// - 以 SQLite 为唯一同步基线，以文件 SHA-256 为唯一判定依据
-/// - 边扫描、边建目录、边上传的流式极速管道，首文件零延迟发出
-/// - 大于 8MB 文件分块断点续传，≤ 8MB 文件 Multipart 一步上传
-/// - 预分配 ID 内存池，0 网络延迟出 ID
+/// GDrive core sync engine
+/// follow v1.md with AGENTS.md Specifications:
+/// - Only supports local directory to remote empty directory synchronization (localToRemoteEmpty) Synchronize the remote directory to the local empty directory (remoteToLocalEmpty)
+/// - to SQLite is the only synchronization baseline to file SHA-256 as the only basis for judgment
+/// - Extremely fast streaming pipeline that scans, creates directories, and uploads while uploading. The first file is sent out with zero delay.
+/// - greater than 8MB Files are broken into chunks and resumed at breakpoints.≤ 8MB File Multipart Upload in one step
+/// - pre-allocated ID memory pool,0 Network delay ID
 public final class SyncEngine: Sendable {
     public let auth: Auth
     public let store: StateStore
@@ -71,7 +71,7 @@ public final class SyncEngine: Sendable {
 
     /// Applies to subsequent sync runs. Existing runs keep their selected directory.
     public func setDownloadTemporaryDirectory(_ directory: URL) throws {
-        guard directory.isFileURL else { throw SyncEngineError.general("下载临时目录必须是本地文件路径") }
+        guard directory.isFileURL else { throw SyncEngineError.general("The temporary download directory must be a local file path") }
         downloadTemporaryDirectoryStorage.withLock { $0 = directory }
     }
     private let logger = Logger(label: "gdrive.engine")
@@ -96,7 +96,7 @@ public final class SyncEngine: Sendable {
          downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
          incrementalScan: @escaping IncrementalScan) async throws {
         guard downloadTemporaryDirectory.isFileURL else {
-            throw SyncEngineError.general("下载临时目录必须是本地文件路径")
+            throw SyncEngineError.general("The temporary download directory must be a local file path")
         }
         self.downloadTemporaryDirectoryStorage = OSAllocatedUnfairLock(initialState: downloadTemporaryDirectory)
         self.incrementalScan = incrementalScan
@@ -111,29 +111,29 @@ public final class SyncEngine: Sendable {
         self.idPool = idPool ?? IDPool(api: effectiveClient)
     }
 
-    /// 实时传输与速率监控器
+    /// Real-time transfer and rate monitor
     public let monitor = TransferMonitor()
 
-    /// 获取当前正在传输、队列中等待以及实时滑动速度（每秒字节）的内存快照（每 500ms 自动刷新）
+    /// Get a memory snapshot of what's currently being transferred, what's waiting in the queue, and the real-time sliding speed in bytes per second (per 500ms automatic refresh)
     public var transferStatus: TransferSnapshot {
         monitor.getSnapshot()
     }
 
-    /// 外部直接调用获取当前传输状态快照
+    /// External direct call to obtain current transmission status snapshot
     public func getTransferStatus() -> TransferSnapshot {
         monitor.getSnapshot()
     }
 
-    // MARK: - 统一同步入口 (自动状态探测与方向分流)
+    // MARK: - Unified synchronization portal (Automatic status detection and direction diversion)
 
-    /// 统一双向同步入口：
-    /// - 自动检测该目录对在本地 SQLite 中是否已有同步基线
-    /// - 若已有基线：自动执行极速双向增量同步 (syncIncremental)
-    /// - 若首次同步：自动向云端与本地发起状态探测：
-    ///   - 本地有内容且云端为空：自动执行 localToRemoteEmpty 流式全量上传
-    ///   - 云端有内容且本地为空：自动执行 remoteToLocalEmpty 流式全量下载
-    ///   - 双端均为空：注册初始空基线
-    ///   - 双端均非空：抛出明确异常保护，杜绝无基线盲合并导致的数据覆盖
+    /// Unified two-way synchronization entrance:
+    /// - Automatically detect that the directory pair is in the local SQLite Whether there is already a synchronization baseline in
+    /// - If there is a baseline: automatically perform extremely fast bidirectional incremental synchronization (syncIncremental)
+    /// - If synchronizing for the first time: automatically initiate status detection to the cloud and local:
+    ///   - There is content locally and the cloud is empty: execute automatically localToRemoteEmpty Full streaming upload
+    ///   - There is content in the cloud but empty locally: execute automatically remoteToLocalEmpty Full streaming download
+    ///   - Both ends are empty: Register an initial empty baseline
+    ///   - Both ends are not empty: clear exception protection is thrown to prevent data overwriting caused by blind merge without baseline
     @discardableResult
     public func sync(
         localPath: String,
@@ -143,7 +143,7 @@ public final class SyncEngine: Sendable {
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
-        // 1. 检查 SQLite 是否已存在处于激活状态的同步根
+        // 1. Check SQLite Whether there is already an active synchronization root
         let existingRoot: (rootId: Int64, bootstrapState: String, initialDir: String)? = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
             SELECT root_id, bootstrap_state, initial_sync_direction FROM roots
@@ -164,10 +164,10 @@ public final class SyncEngine: Sendable {
 
         if let existing = existingRoot {
             if existing.bootstrapState == "existingKnown" {
-                logger.info("[Sync] 已有共同同步基线，自动执行增量双向同步: \(resolvedLocalPath) <-> \(remoteFolderId)")
+                logger.info("[Sync] Found a shared baseline; starting incremental bidirectional sync: \(resolvedLocalPath) <-> \(remoteFolderId)")
                 return try await syncIncremental(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
             } else {
-                logger.info("[Sync] 存在未完成的初始化基线 (bootstrapState: \(existing.bootstrapState))，恢复初始化流程...")
+                logger.info("[Sync] Found an unfinished initialization baseline (bootstrapState: \(existing.bootstrapState)); resuming initialization...")
                 if existing.initialDir == "remoteToLocalEmpty" {
                     return try await syncRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress)
                 } else {
@@ -176,16 +176,16 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 2. 首次同步：自动探测本地与远端目录真实状态
-        logger.info("[Sync] 未建立基线，开始探测本地与云端目录状态...")
+        // 2. First synchronization: automatically detect the true status of local and remote directories
+        logger.info("[Sync] No baseline exists; checking local and remote directory state...")
 
-        // 探测远端目录：验证存在、是否为目录、是否包含非回收站子项
+        // Detect remote directories: verify existence, whether it is a directory, and whether it contains non-recycle bin subkeys
         let remoteFile = try await client.getFile(remoteId: remoteFolderId)
         guard remoteFile.trashed != true else {
             throw SyncEngineError.remoteRootLost(remoteId: remoteFolderId, reason: "trashed")
         }
         guard remoteFile.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteFolderId)"])
+            throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a valid directory: \(remoteFolderId)"])
         }
         // Probe only the top level; hidden entries are included, only .git directories are pruned.
         let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
@@ -194,15 +194,15 @@ public final class SyncEngine: Sendable {
         let remoteChildren = try await client.listChildren(parentId: remoteFolderId)
         let isRemoteEmpty = remoteChildren.isEmpty
 
-        // 3. 根据探测结果安全分流
+        // 3. Safe diversion based on detection results
         if !isLocalEmpty && isRemoteEmpty {
-            logger.info("[Sync] 检测到【本地包含文件，云端为空目录】，自动启动 localToRemoteEmpty 初始化上传")
+            logger.info("[Sync] Local content and an empty remote directory detected; starting localToRemoteEmpty initialization")
             return try await syncLocalToRemoteEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxUploadConcurrency: concurrency, onProgress: onProgress)
         } else if isLocalEmpty && !isRemoteEmpty {
-            logger.info("[Sync] 检测到【云端包含文件，本地为空目录】，自动启动 remoteToLocalEmpty 初始化下载")
+            logger.info("[Sync] Remote content and an empty local directory detected; starting remoteToLocalEmpty initialization")
             return try await initializeRemoteToLocalEmpty(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxDownloadConcurrency: concurrency, onProgress: onProgress, initialCursor: emptyRootCursor)
         } else if isLocalEmpty && isRemoteEmpty {
-            logger.info("[Sync] 检测到【本地与云端均为空目录】，建立初始空基线")
+            logger.info("[Sync] Both directories are empty; creating an empty baseline")
             try FileManager.default.createDirectory(atPath: resolvedLocalPath, withIntermediateDirectories: true)
             var metadata = stat()
             guard stat(resolvedLocalPath, &metadata) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
@@ -252,9 +252,9 @@ public final class SyncEngine: Sendable {
             }
             return SyncStats()
         } else {
-            // 双端皆非空
+            // Both ends are not empty
             throw NSError(domain: "SyncEngine", code: 103, userInfo: [
-                NSLocalizedDescriptionKey: "双向同步初始基线要求其中一端必须为空目录。当前检测到本地路径(\(resolvedLocalPath))与远端文件夹(\(remoteFolderId))均包含已有文件。为避免盲合并导致数据覆盖或大规模冲突，请指定空目录进行首次初始化。"
+                NSLocalizedDescriptionKey: "Initial bidirectional sync requires one side to be empty. Both the local path (\(resolvedLocalPath)) and remote folder (\(remoteFolderId)) contain files. Use an empty directory for initialization to avoid overwrites or widespread conflicts."
             ])
         }
     }
@@ -291,9 +291,9 @@ public final class SyncEngine: Sendable {
         }
     }
 
-    // MARK: - 模式 1：本地目录 -> 远端空目录极速上传 (localToRemoteEmpty)
+    // MARK: - mode 1:local directory -> Extremely fast upload of remote empty directories (localToRemoteEmpty)
 
-    /// 将本地非空目录流式全量同步至远端空目录
+    /// Full streaming synchronization of local non-empty directories to remote empty directories
     @discardableResult
     public func syncLocalToRemoteEmpty(
         localPath: String,
@@ -308,19 +308,19 @@ public final class SyncEngine: Sendable {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
 
-        // 验证本地根目录
+        // Verify local root directory
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir), isDir.boolValue else {
-            throw NSError(domain: "SyncEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "本地路径不存在或不是目录: \(resolvedLocalPath)"])
+            throw NSError(domain: "SyncEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "The local path does not exist or is not a directory: \(resolvedLocalPath)"])
         }
 
-        // 验证远端根目录存在
+        // Verify that the remote root directory exists
         let remoteRoot = try await client.getFile(remoteId: remoteRootId)
         guard remoteRoot.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 2, userInfo: [NSLocalizedDescriptionKey: "远端目标不是目录: \(remoteRootId)"])
+            throw NSError(domain: "SyncEngine", code: 2, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a directory: \(remoteRootId)"])
         }
 
-        // 仅在首次初始化未建立根基线时校验远端是否为空目录
+        // Only verify whether the remote end is an empty directory when the root baseline is not established for the first time.
         let rootExists: Bool = try await store.read { conn in
             let stmt = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
             stmt.bindText(remoteRootId, at: 1)
@@ -330,13 +330,13 @@ public final class SyncEngine: Sendable {
         if !rootExists {
             let existingChildren = try await client.listChildren(parentId: remoteRootId)
             guard existingChildren.isEmpty else {
-                throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "远端目标不是空目录，无法执行 localToRemoteEmpty: \(remoteRootId)"])
+                throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "The remote target is not empty; localToRemoteEmpty cannot run: \(remoteRootId)"])
             }
         }
 
         let now = Date().timeIntervalSince1970
 
-        // 1. 注册或获取 Root 记录与根目录项
+        // 1. Register or get Root Records and root entries
         let (rootId, rootItemId): (Int64, Int64) = try await store.write { conn in
             let rootStmt = try conn.cachedStatement("""
             INSERT INTO roots (
@@ -355,7 +355,7 @@ public final class SyncEngine: Sendable {
             let rootQuery = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
             rootQuery.bindText(remoteRootId, at: 1)
             guard try rootQuery.step(), let rId = rootQuery.columnInt64(at: 0) else {
-                throw NSError(domain: "SyncEngine", code: 3, userInfo: [NSLocalizedDescriptionKey: "无法获取 root_id"])
+                throw NSError(domain: "SyncEngine", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root_id"])
             }
             rootQuery.reset()
 
@@ -376,7 +376,7 @@ public final class SyncEngine: Sendable {
             let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
             itemQuery.bindInt64(rId, at: 1)
             guard try itemQuery.step(), let rItemId = itemQuery.columnInt64(at: 0) else {
-                throw NSError(domain: "SyncEngine", code: 4, userInfo: [NSLocalizedDescriptionKey: "无法获取 root item_id"])
+                throw NSError(domain: "SyncEngine", code: 4, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root item_id"])
             }
             itemQuery.reset()
 
@@ -385,10 +385,10 @@ public final class SyncEngine: Sendable {
 
         try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
 
-        // 2. 初始化目录异步唤醒调度器（根目录预设为已就绪）
+        // 2. Initialize the directory asynchronous wake-up scheduler (the root directory is defaulted to ready)
         let directoryTracker = DirectoryTracker(remoteRootId: remoteRootId)
 
-        // 记录本地目录相对路径与其数据库 itemId
+        // Record the relative path of the local directory and its database itemId
         final class LocalDirMap: @unchecked Sendable {
             private var map: [String: Int64] = [:]
             private var lock = os_unfair_lock()
@@ -411,7 +411,7 @@ public final class SyncEngine: Sendable {
         }
         let localDirMap = LocalDirMap(rootItemId: rootItemId)
 
-        // 预先从 SQLite 加载已知的所有子目录映射，恢复 bootstrap 或重跑时坚决复用，避免盲目重复创建
+        // in advance from SQLite Load all known subdirectory mappings, restore bootstrap Or reuse it resolutely when re-running to avoid blindly re-creating
         let existingDirs: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
             SELECT item_id, parent_id, name, remote_file_id
@@ -457,7 +457,7 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 3. 设置有界并发上传流水线（严格上限 64 并发）
+        // 3. Set up a bounded concurrent upload pipeline (strict upper limit 64 Concurrency)
         let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
         let uploadSemaphore = AsyncSemaphore(count: effectiveConcurrency)
         // Bound all bootstrap work admitted beyond the scanner. This window is
@@ -469,7 +469,7 @@ public final class SyncEngine: Sendable {
         let directorySemaphore = AsyncSemaphore(count: max(1, min(8, effectiveConcurrency)))
         let uploadGroup = DispatchGroup()
 
-        // 加载快速变更比对基线缓存 (§6.2)
+        // Load fast change comparison baseline cache (§6.2)
         let baselineCache = try await LocalBaselineCache.load(store: store, rootId: rootId)
 
         final class ProgressTracker: @unchecked Sendable {
@@ -537,7 +537,7 @@ public final class SyncEngine: Sendable {
         }
         let progress = ProgressTracker()
 
-        // 4. 启动 DirectoryScanner 并发扫描
+        // 4. start DirectoryScanner concurrent scan
         let staticPrefix = resolvedLocalPath.hasSuffix("/") ? resolvedLocalPath : resolvedLocalPath + "/"
         let prefixBytes = Array(staticPrefix.utf8)
 
@@ -593,7 +593,7 @@ public final class SyncEngine: Sendable {
                     let name = (relPath as NSString).lastPathComponent
 
                     if record.type == .directory {
-                        // 目录处理：若目录已存在且已登记远端 ID，直接跳过远端创建，严防重复创建
+                        // Directory processing: If the directory already exists and the remote end has been registered ID,Skip remote creation directly to prevent repeated creation
                         if localDirMap.get(relPath) != nil {
                             continue
                         }
@@ -623,7 +623,7 @@ public final class SyncEngine: Sendable {
                                 )
                                 createIntent = intent
 
-                                // Intent 的 group-commit 已确认后，才允许发出远端创建请求。
+                                // Intent of group-commit Only after confirmation can the remote creation request be issued.
                                 _ = try await self.client.createDirectory(
                                     name: name,
                                     parentId: intent.targetParentRemoteID,
@@ -645,7 +645,7 @@ public final class SyncEngine: Sendable {
                                 }
                                 localDirMap.set(relPath, id: intent.itemID)
 
-                                // 广播唤醒等待该目录的全部子项
+                                // Broadcast wake-up waiting for all children of the directory
                                 await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
                                 progress.recordDirCreated()
                             } catch {
@@ -657,7 +657,7 @@ public final class SyncEngine: Sendable {
                                         error: error
                                     )
                                 }
-                                self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
+                                self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
                             }
                         }
                     } else if record.type == .file {
@@ -666,14 +666,14 @@ public final class SyncEngine: Sendable {
                         let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
                         let fileSize = record.metadata?.fileSize ?? 0
 
-                        // 快速变更检测 (§6.2)：dev + inode + mtime + size 匹配即跳过内容读取和哈希计算
+                        // Rapid change detection (§6.2):dev + inode + mtime + size Matching skips content reading and hash calculations
                         if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
                             progress.recordSkipped()
                             continue
                         }
 
                         await bootstrapTaskWindow.wait()
-                        // 文件处理：等待其直接父目录就绪后立即上传
+                        // File handling: wait for its immediate parent directory to be ready and upload immediately
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
@@ -694,7 +694,7 @@ public final class SyncEngine: Sendable {
                             }
 
                             do {
-                                // 先等待直接父目录在 Google Drive 远端就绪，避免空占并发上传槽位
+                                // First wait for the direct parent directory to be in Google Drive The remote end is ready to avoid occupying concurrent upload slots.
                                 let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
 
                                 await uploadSemaphore.wait()
@@ -716,7 +716,7 @@ public final class SyncEngine: Sendable {
 
                                 let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
 
-                                // 查询该文件是否已在 SQLite 中记录（无论是已 committed 还是未完成的 inFlight）
+                                // Check whether the file is already in SQLite recorded (whether it has been committed Still unfinished inFlight)
                                 struct ExistingFileTarget {
                                     let itemID: Int64
                                     let remoteID: String?
@@ -754,7 +754,7 @@ public final class SyncEngine: Sendable {
                                     return nil
                                 }
 
-                                // 根据文件大小执行上传：≤ 8MB 走 Multipart，> 8MB 走 Resumable
+                                // Perform upload based on file size:≤ 8MB go Multipart,> 8MB go Resumable
                                 if let existingTarget, existingTarget.hasBaseline, let remoteID = existingTarget.remoteID {
                                     throw DriveError.unsafeOverwrite(fileId: remoteID)
                                 }
@@ -766,7 +766,7 @@ public final class SyncEngine: Sendable {
                                     let committedItemID: Int64
                                     if let existing = existingTarget, let existingRemoteId = existing.remoteID,
                                        existing.phase == "committed" && existing.remoteStatus == "present" {
-                                        // 已在云端提交的文件发生内容变更：直接调用 updateMultipart 更新远端现有对象，绝对不新建 Drive 对象！
+                                        // The content of the file submitted in the cloud has changed: call directly updateMultipart Update existing remote objects, never create new ones Drive Object!
                                         uploadedFile = try await self.client.updateMultipart(
                                             remoteId: existingRemoteId,
                                             content: content,
@@ -774,7 +774,7 @@ public final class SyncEngine: Sendable {
                                         )
                                         committedItemID = existing.itemID
                                     } else {
-                                        // 新建文件或重跑未竟文件：优先复用既有 remote_file_id，避免重新生成
+                                        // Create new files or rerun unfinished files: Prioritize reusing existing files remote_file_id,avoid regeneration
                                         let targetRemoteId: String
                                         if let existingRemoteId = existingTarget?.remoteID {
                                             targetRemoteId = existingRemoteId
@@ -809,7 +809,7 @@ public final class SyncEngine: Sendable {
                                         } catch let error as DriveError {
                                             switch error {
                                             case .conflict:
-                                                // 远端可能在上次上传尝试中已成功写入该 ID 的元数据，转为更新正文
+                                                // The remote end may have successfully written the ID metadata, converted to update text
                                                 uploadedFile = try await self.client.updateMultipart(
                                                     remoteId: intent.targetRemoteID,
                                                     content: content,
@@ -829,7 +829,7 @@ public final class SyncEngine: Sendable {
                                     }
                                     self.monitor.reportUploadProgress(id: fullPath, additionalBytes: fileSize)
 
-                                    // 上传成功后，通过 batchWrite（Group Commit，合并 256 项或 5ms 刷盘）写入基线
+                                    // After the upload is successful, pass batchWrite(Group Commit,merge 256 item or 5ms Flush the disk) and write the baseline
                                     try input.version.validate(at: fileURL)
                                     let completedCreateIntent = createIntent
                                     let expectedLocalGeneration = completedCreateIntent?.expectedLocalGeneration ?? existingTarget?.localGeneration ?? 1
@@ -876,7 +876,7 @@ public final class SyncEngine: Sendable {
                                         }
                                     }
                                 } else {
-                                    // 大文件 (> 8MB)：复用既有 remote_file_id 与断点，不盲目更换 ID！
+                                    // large files (> 8MB):Reuse existing remote_file_id with breakpoints, no blind replacement ID!
                                     let remoteFileId: String
                                     if let existingRemoteId = existingTarget?.remoteID {
                                         remoteFileId = existingRemoteId
@@ -940,7 +940,7 @@ public final class SyncEngine: Sendable {
                                         return 0
                                     }
 
-                                    // 大文件 (> 8MB) Resumable 8MB 流式分块断点续传（每块落盘 offset）
+                                    // large files (> 8MB) Resumable 8MB Streaming block-based breakpoint resumption (each block is placed on the disk) offset)
                                     _ = try await self.performResumableUpload(
                                         rootId: rootId,
                                         itemId: currentItemId,
@@ -953,7 +953,7 @@ public final class SyncEngine: Sendable {
                                         isUpdate: isUpdate
                                     )
 
-                                    // 提交共同基线 B
+                                    // Submit a common baseline B
                                     try input.version.validate(at: fileURL)
                                     let expectedLocalGeneration = existingTarget?.localGeneration ?? 1
                                     try await self.store.batchWrite { conn in
@@ -988,7 +988,7 @@ public final class SyncEngine: Sendable {
                                 }
 
                                 guard receiptApplied.withLock({ $0 }) else {
-                                    throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(name)")
+                                    throw SyncEngineError.general("The upload receipt is stale; the newer generation remains pending: \(name)")
                                 }
                                 progress.recordSuccess(bytes: fileSize)
                             } catch {
@@ -1014,14 +1014,14 @@ public final class SyncEngine: Sendable {
                                         stmt.reset()
                                     }
                                 }
-                                self.logger.error("上传文件失败 [\(relPath)]: \(error)")
+                                self.logger.error("Failed to upload file [\(relPath)]: \(error)")
                             }
                         }
                     }
             }
         }
 
-        // 5. 等待所有并发目录创建与上传完成
+        // 5. Wait for all concurrent directory creation and uploads to complete
         await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
                 uploadGroup.notify(queue: .global(qos: .userInitiated)) {
@@ -1034,7 +1034,7 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 6. 强制将缓冲区写入磁盘并执行 WAL checkpoint
+        // 6. Force the buffer to be written to disk and execute WAL checkpoint
         try await store.flush()
         try await store.checkpoint()
 
@@ -1062,9 +1062,9 @@ public final class SyncEngine: Sendable {
         return stats
     }
 
-    // MARK: - 模式 2：远端目录 -> 本地空目录极速下载 (remoteToLocalEmpty)
+    // MARK: - mode 2:remote directory -> Fast download of local empty directory (remoteToLocalEmpty)
 
-    /// 将远端非空目录流式全量下载同步至本地空目录
+    /// Synchronize full streaming download of remote non-empty directory to local empty directory
     @discardableResult
     public func syncRemoteToLocalEmpty(
         localPath: String,
@@ -1090,23 +1090,23 @@ public final class SyncEngine: Sendable {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
 
-        // 验证远端根目录存在
+        // Verify that the remote root directory exists
         let remoteRoot = try await client.getFile(remoteId: remoteRootId)
         guard remoteRoot.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 10, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteRootId)"])
+            throw NSError(domain: "SyncEngine", code: 10, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a valid directory: \(remoteRootId)"])
         }
 
         let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
 
-        // 确保本地目录存在且为空
+        // Make sure the local directory exists and is empty
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir) {
             guard isDir.boolValue else {
-                throw NSError(domain: "SyncEngine", code: 11, userInfo: [NSLocalizedDescriptionKey: "本地路径已存在且不是目录: \(resolvedLocalPath)"])
+                throw NSError(domain: "SyncEngine", code: 11, userInfo: [NSLocalizedDescriptionKey: "The local path already exists and is not a directory: \(resolvedLocalPath)"])
             }
             let contents = try FileManager.default.contentsOfDirectory(atPath: resolvedLocalPath)
             guard contents.isEmpty else {
-                throw NSError(domain: "SyncEngine", code: 12, userInfo: [NSLocalizedDescriptionKey: "本地目标目录必须为空: \(resolvedLocalPath)"])
+                throw NSError(domain: "SyncEngine", code: 12, userInfo: [NSLocalizedDescriptionKey: "The local target directory must be empty: \(resolvedLocalPath)"])
             }
         } else {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
@@ -1121,7 +1121,7 @@ public final class SyncEngine: Sendable {
 
         let now = Date().timeIntervalSince1970
 
-        // 1. 注册或获取 Root 记录与根目录项
+        // 1. Register or get Root Records and root entries
         let (rootId, rootItemId): (Int64, Int64) = try await store.write { conn in
             let rootStmt = try conn.cachedStatement("""
             INSERT INTO roots (
@@ -1140,7 +1140,7 @@ public final class SyncEngine: Sendable {
             let rootQuery = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
             rootQuery.bindText(remoteRootId, at: 1)
             guard try rootQuery.step(), let rId = rootQuery.columnInt64(at: 0) else {
-                throw NSError(domain: "SyncEngine", code: 13, userInfo: [NSLocalizedDescriptionKey: "无法获取 root_id"])
+                throw NSError(domain: "SyncEngine", code: 13, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root_id"])
             }
             rootQuery.reset()
 
@@ -1161,7 +1161,7 @@ public final class SyncEngine: Sendable {
             let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
             itemQuery.bindInt64(rId, at: 1)
             guard try itemQuery.step(), let rItemId = itemQuery.columnInt64(at: 0) else {
-                throw NSError(domain: "SyncEngine", code: 14, userInfo: [NSLocalizedDescriptionKey: "无法获取 root item_id"])
+                throw NSError(domain: "SyncEngine", code: 14, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root item_id"])
             }
             itemQuery.reset()
 
@@ -1181,7 +1181,7 @@ public final class SyncEngine: Sendable {
         }
         let progress = DownloadTracker()
 
-        // 2. 递归枚举远端文件与流式下载
+        // 2. Recursive enumeration of remote files and streaming download
         func traverseRemote(parentRemoteId: String, currentLocalURL: URL, parentItemId: Int64) async throws {
             let children = try await self.client.listChildren(parentId: parentRemoteId)
             try RemoteNameMapping.validateSiblings(children)
@@ -1191,11 +1191,11 @@ public final class SyncEngine: Sendable {
                 try RemoteNameMapping.validateDestination(itemLocalURL, root: rootURL)
 
                 if item.isDirectory {
-                    // 创建本地目录
+                    // Create local directory
                     try FileManager.default.createDirectory(at: itemLocalURL, withIntermediateDirectories: true)
                     progress.dirsCreated += 1
 
-                    // 写入 SQLite
+                    // write SQLite
                     let dirItemId: Int64 = try await self.store.write { conn in
                         let stmt = try conn.cachedStatement("""
                         INSERT INTO items (
@@ -1215,7 +1215,7 @@ public final class SyncEngine: Sendable {
                         _ = try stmt.step()
                         stmt.reset()
                         guard conn.changes == 1 else {
-                            throw SyncEngineError.general("远端目录名称已属于另一个 fileId：\(item.name)")
+                            throw SyncEngineError.general("The remote directory name belongs to another file ID: \(item.name)")
                         }
 
                         let qStmt = try conn.cachedStatement("""
@@ -1225,16 +1225,16 @@ public final class SyncEngine: Sendable {
                         qStmt.bindInt64(parentItemId, at: 2)
                         qStmt.bindText(item.name, at: 3)
                         guard try qStmt.step(), let dId = qStmt.columnInt64(at: 0) else {
-                            throw NSError(domain: "SyncEngine", code: 15, userInfo: [NSLocalizedDescriptionKey: "无法获取 dir item_id"])
+                            throw NSError(domain: "SyncEngine", code: 15, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain dir item_id"])
                         }
                         qStmt.reset()
                         return dId
                     }
 
-                    // 递归下一层
+                    // Recurse to the next level
                     try await traverseRemote(parentRemoteId: item.id, currentLocalURL: itemLocalURL, parentItemId: dirItemId)
                 } else {
-                    // 文件：加入并发下载队列
+                    // File: join concurrent download queue
                     let downloadBytes = item.sizeBytes ?? 0
                     notifier.addDiscovered(files: 1, bytes: downloadBytes)
                     self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
@@ -1250,7 +1250,7 @@ public final class SyncEngine: Sendable {
 
                         do {
                             self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
-                            // 流式下载并核验 SHA-256
+                            // Streaming download and verification SHA-256
                             let published = try await self.client.downloadFileSafely(
                                 remoteId: item.id,
                                 destinationURL: itemLocalURL,
@@ -1262,11 +1262,11 @@ public final class SyncEngine: Sendable {
                                 }
                             )
 
-                            // 获取本地落盘后的元数据
+                            // Get metadata after local placement
                             let fileSize = published.size
                             let mtime = published.mtime
 
-                            // 写入 SQLite 基线 B
+                            // write SQLite baseline B
                             let receiptApplied = OSAllocatedUnfairLock(initialState: false)
                             try await self.store.batchWrite { conn in
                                 // A failed check leaves the file to the next scan; it
@@ -1314,26 +1314,26 @@ public final class SyncEngine: Sendable {
                                 if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
                             }
                             guard receiptApplied.withLock({ $0 }) else {
-                                throw SyncEngineError.general("初始化下载回执已过期，保留现有状态: \(item.name)")
+                                throw SyncEngineError.general("The initial download receipt has expired, retain the existing status: \(item.name)")
                             }
 
                             progress.filesDownloaded += 1
                             progress.bytesDownloaded += fileSize
                         } catch {
-                            self.logger.error("下载文件失败 [\(item.name)]: \(error)")
+                            self.logger.error("Failed to download file [\(item.name)]: \(error)")
                         }
                     }
                 }
             }
         }
 
-        // 开始递归列举与下载
+        // Start recursive enumeration and downloading
         var traversalError: Error?
         do {
             try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
         } catch { traversalError = error }
 
-        // 等待所有在途下载任务完成
+        // Wait for all in-flight download tasks to complete
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             downloadGroup.notify(queue: .global(qos: .userInitiated)) {
                 cont.resume()
@@ -1375,14 +1375,14 @@ public final class SyncEngine: Sendable {
         return stats
     }
 
-    /// 采用 1MB 恒定内存流式计算文件的 SHA-256 与字节长度
+    /// adopt 1MB Constant memory streaming file SHA-256 and byte length
     static func computeFileSha256(at url: URL) throws -> (sha256Hex: String, fileSize: Int64) {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         var ctx = CC_SHA256_CTX()
         CC_SHA256_Init(&ctx)
         var totalSize: Int64 = 0
-        let bufferSize = 1024 * 1024 // 1MB 流式分片，避免大文件占用内存
+        let bufferSize = 1024 * 1024 // 1MB Streaming sharding to avoid large files occupying memory
         while let chunk = try handle.read(upToCount: bufferSize), !chunk.isEmpty {
             totalSize += Int64(chunk.count)
             _ = chunk.withUnsafeBytes { ptr in
@@ -1395,7 +1395,7 @@ public final class SyncEngine: Sendable {
         return (hex, totalSize)
     }
 
-    /// 在内存中极速计算 Data 的 SHA-256 字符串（小文件专用，单次耗时 ~10us）
+    /// Extremely fast calculations in memory Data of SHA-256 String (only for small files, time-consuming for a single time) ~10us)
     static func computeSha256(of data: Data) -> String {
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
         data.withUnsafeBytes { ptr in
@@ -1404,11 +1404,11 @@ public final class SyncEngine: Sendable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// 执行大文件 (> 8MB) 分块断点续传：
-    /// - 自动检查 operations 表中是否存在未完成的会话与断点
-    /// - 向 Google Drive 服务端探测已确认接收的 offset (queryResumableOffset)
-    /// - 采用恒定内存的 FileHandle 流式切片读取 (默认 8MB，必须是 256KB 的整数倍)
-    /// - 每完成一个分块，立即将新 offset 持久化至 SQLite operations 表，断电/换线程后可无缝续传
+    /// Execute large files (> 8MB) Resume upload in chunks:
+    /// - automatic check operations Whether there are unfinished sessions and breakpoints in the table
+    /// - towards Google Drive The server detects the confirmed receipt offset (queryResumableOffset)
+    /// - Using constant memory FileHandle Streaming slice reading (Default 8MB,must be 256KB an integer multiple of)
+    /// - Each time a chunk is completed, the new offset persist to SQLite operations meter, power outage/Seamless transmission can be resumed after changing threads
     @discardableResult
     func performResumableUpload(
         rootId: Int64,
@@ -1420,7 +1420,7 @@ public final class SyncEngine: Sendable {
         parentId: String,
         name: String,
         isUpdate: Bool,
-        chunkSize: Int64 = 8 * 1024 * 1024 // 8MB 分块，256KB 整数倍
+        chunkSize: Int64 = 8 * 1024 * 1024 // 8MB chunked,256KB Integer multiple
     ) async throws -> DriveFile {
         if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteId) }
         let opId = "resumable_\(remoteId)"
@@ -1435,7 +1435,7 @@ public final class SyncEngine: Sendable {
             let totalBytes: Int64
         }
 
-        // 1. 查询是否存在未完成的断点会话
+        // 1. Query whether there are outstanding breakpoint sessions
         let existingOp: ExistingResumableOp? = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
             SELECT session_uri, confirmed_offset, expected_sha256, total_bytes
@@ -1454,12 +1454,12 @@ public final class SyncEngine: Sendable {
         }
 
         if let existing = existingOp {
-            // 关键：核验断点会话的预期 sha256 与文件大小是否与当前文件严格一致！
-            // 若文件在中途已被修改，旧会话立即作废并重置，防止错误续传导致云端拼接脏数据
+            // Key: Verify Breakpoint Session Expectations sha256 Whether the file size is strictly consistent with the current file!
+            // If the file has been modified in the middle, the old session will be immediately invalidated and reset to prevent incorrect resumption of data from splicing dirty data in the cloud.
             let isSameFile = (existing.totalBytes == fileSize &&
                               existing.expectedSha256.caseInsensitiveCompare(expectedSha256) == .orderedSame)
             if isSameFile {
-                // 向云端探测服务端实际已接收的有效 offset
+                // Detect the valid data actually received by the server from the cloud. offset
                 do {
                     switch try await client.queryResumableOffset(sessionURL: existing.sessionURL, totalBytes: fileSize) {
                     case .complete(let file):
@@ -1468,7 +1468,7 @@ public final class SyncEngine: Sendable {
                         currentOffset = fileSize
                     case .incomplete(let serverOffset):
                         guard serverOffset >= 0, serverOffset < fileSize else {
-                            throw DriveError.invalidResponse(message: "Resumable 探测偏移越界: \(serverOffset)/\(fileSize)")
+                            throw DriveError.invalidResponse(message: "Resumable upload offset is out of bounds: \(serverOffset)/\(fileSize)")
                         }
                         sessionURL = existing.sessionURL
                         currentOffset = serverOffset
@@ -1477,17 +1477,17 @@ public final class SyncEngine: Sendable {
                         currentOffset = 0
                     }
                 } catch {
-                    // 临时网络/服务端故障不得废弃仍可能有效的会话。
+                    // Ad hoc network/Server-side failures must not discard sessions that may still be valid.
                     throw error
                 }
             } else {
-                // 文件内容或大小已发生变化，断点作废，重新发起全新上传
+                // The file content or size has changed, the breakpoint will be invalidated, and a new upload will be initiated again.
                 sessionURL = nil
                 currentOffset = 0
             }
         }
 
-        // 2. 若无有效会话，发起新 Resumable 上传会话并持久化操作意图
+        // 2. If there is no valid session, initiate a new Resumable Upload session and persist operation intent
         var activeSessionURL: URL
         if let sURL = sessionURL {
             activeSessionURL = sURL
@@ -1535,11 +1535,11 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 3. 流式分块读取与上传循环
+        // 3. Streaming chunked read and upload loop
         let fileHandle = try FileHandle(forReadingFrom: fileURL)
         defer { try? fileHandle.close() }
 
-        // 获取初始文件时间戳与大小，用于在分块传输循环中检测并发修改
+        // Get the initial file timestamp and size for detecting concurrent modifications in a chunked transfer loop
         let initialAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
         let initialMtime = initialAttrs?[.modificationDate] as? Date
 
@@ -1547,12 +1547,12 @@ public final class SyncEngine: Sendable {
         var repeatedNoProgress = false
 
         while currentOffset < fileSize {
-            // 检测文件是否在上传分块中途被并发修改
+            // Detect whether the file is modified concurrently in the middle of uploading chunks
             if let currentAttrs = try? FileManager.default.attributesOfItem(atPath: fileURL.path) {
                 let currentDiskSize = (currentAttrs[.size] as? NSNumber)?.int64Value ?? fileSize
                 let currentMtime = currentAttrs[.modificationDate] as? Date
                 if currentDiskSize != fileSize || (initialMtime != nil && currentMtime != initialMtime) {
-                    // 文件在中途被修改，立即终止上传并标记 operation 为 failed，防止将损坏数据拼接发往云端
+                    // If the file is modified midway, the upload will be terminated immediately and marked operation for failed,Prevent corrupted data from being spliced and sent to the cloud
                     let now = Date().timeIntervalSince1970
                     try? await store.write { conn in
                         let stmt = try conn.cachedStatement("""
@@ -1586,11 +1586,11 @@ public final class SyncEngine: Sendable {
                 guard confirmedOffset >= previousOffset,
                       confirmedOffset <= previousOffset + Int64(chunkData.count),
                       confirmedOffset < fileSize else {
-                    throw DriveError.invalidResponse(message: "Resumable 确认偏移非法: \(confirmedOffset)，发送区间 \(previousOffset)-\(previousOffset + Int64(chunkData.count) - 1)")
+                    throw DriveError.invalidResponse(message: "Resumable upload confirmed an invalid offset: \(confirmedOffset); sent range \(previousOffset)-\(previousOffset + Int64(chunkData.count) - 1)")
                 }
                 if confirmedOffset == previousOffset {
                     guard !repeatedNoProgress else {
-                        throw DriveError.invalidResponse(message: "Resumable 会话连续未确认任何新字节")
+                        throw DriveError.invalidResponse(message: "Resumable upload repeatedly acknowledged no new bytes")
                     }
                     repeatedNoProgress = true
                 } else {
@@ -1612,7 +1612,7 @@ public final class SyncEngine: Sendable {
                 self.monitor.reportUploadProgress(id: fileURL.path, additionalBytes: confirmedBytes)
             }
 
-            // 每完成一个块，立即在数据库记录已确认 offset 与状态
+            // Each time a block is completed, it is immediately recorded in the database as confirmed offset with status
             let recordedOffset = currentOffset
             let now = Date().timeIntervalSince1970
             let activeSessionURI = activeSessionURL.absoluteString
@@ -1652,7 +1652,7 @@ public final class SyncEngine: Sendable {
         }
         guard let checksum = file.sha256Checksum,
               checksum.caseInsensitiveCompare(expectedSha256) == .orderedSame else {
-            // 云端最终拼接计算的哈希与预期不匹配（说明在传输过程中发生篡改或数据损坏）
+            // The hash calculated by the final stitching in the cloud does not match the expected one (indicating tampering or data corruption during transmission)
             let now = Date().timeIntervalSince1970
             try? await store.write { conn in
                 let stmt = try conn.cachedStatement("""
@@ -1679,10 +1679,10 @@ public final class SyncEngine: Sendable {
         return file
     }
 
-    // MARK: - 模式 3：已有根目录增量双向同步 (syncIncremental)
+    // MARK: - mode 3:Existing root directory incremental bidirectional synchronization (syncIncremental)
 
-    /// 对已有同步根执行双向增量同步
-    /// 结合本地 DirectoryScanner 快速扫描与 Google Drive Changes 增量变更，由 Reconciler 驱动三方决策
+    /// Perform a two-way incremental synchronization on an existing sync root
+    /// Combined with local DirectoryScanner Quick scan with Google Drive Changes Incremental changes, consisting of Reconciler Drive tripartite decision-making
     @discardableResult
     public func syncIncremental(
         localPath: String,
@@ -1692,7 +1692,7 @@ public final class SyncEngine: Sendable {
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
 
-        // 查找 rootId 与 rootItemId
+        // Find rootId with rootItemId
         let rootInfo: (rootId: Int64, rootItemId: Int64)? = try await store.read { conn in
             let stmt = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
             stmt.bindText(remoteRootId, at: 1)
@@ -1713,7 +1713,7 @@ public final class SyncEngine: Sendable {
         }
 
         guard let rootInfo else {
-            throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "未找到对应的同步根，请先执行初始化同步: \(remoteRootId)"])
+            throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "No matching sync root was found. Run initial sync first: \(remoteRootId)"])
         }
 
         return try await syncIncremental(
@@ -1726,7 +1726,7 @@ public final class SyncEngine: Sendable {
         )
     }
 
-    /// 执行双向增量同步
+    /// Perform bidirectional incremental synchronization
     @discardableResult
     public func syncIncremental(
         rootId: Int64,
@@ -1744,24 +1744,24 @@ public final class SyncEngine: Sendable {
         let now = Date().timeIntervalSince1970
 
         // -------------------------------------------------------------
-        // 0. 根目录防扩散安全校验 (§7.2, §9.1)
+        // 0. Root directory anti-proliferation security check (§7.2, §9.1)
         // -------------------------------------------------------------
-        // A. 本地根目录校验：若本地根目录消失，严禁做删除扩散，立即报错终止
+        // A. Local root directory verification: If the local root directory disappears, deletion and diffusion are strictly prohibited, and an error will be reported and terminated immediately.
         var isDir: ObjCBool = false
         let localExists = FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir)
         guard localExists && isDir.boolValue else {
-            logger.error("[Sync] 本地同步根目录已不存在或不是有效目录: \(resolvedLocalPath)，终止同步以保护云端文件")
+            logger.error("[Sync] The local sync root is missing or invalid: \(resolvedLocalPath). Stopping sync to protect remote files.")
             throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
         }
 
-        // B. 远端根目录校验：若远端根目录被移入回收站或彻底删除，严禁做删除扩散，立即报错终止
+        // B. Remote root directory verification: If the remote root directory is moved to the recycle bin or completely deleted, deletion diffusion is strictly prohibited and an error will be reported and terminated immediately.
         let remoteRoot: DriveFile
         do {
             remoteRoot = try await client.getFile(remoteId: remoteRootId)
         } catch let error as DriveError {
             switch error {
             case .notFound:
-                logger.error("[Sync] 远端同步根目录不存在 (404): \(remoteRootId)，终止同步以保护本地文件")
+                logger.error("[Sync] The remote sync root does not exist (404): \(remoteRootId). Stopping sync to protect local files.")
                 throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notFound")
             default:
                 throw error
@@ -1769,18 +1769,18 @@ public final class SyncEngine: Sendable {
         } catch {
             let nsError = error as NSError
             if (nsError.domain == "SyncEngine" || nsError.domain == "DriveError") && nsError.code == 404 {
-                logger.error("[Sync] 远端同步根目录不存在 (404): \(remoteRootId)，终止同步以保护本地文件")
+                logger.error("[Sync] The remote sync root does not exist (404): \(remoteRootId). Stopping sync to protect local files.")
                 throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notFound")
             }
             throw error
         }
 
         if remoteRoot.trashed == true {
-            logger.error("[Sync] 远端同步根目录已被移入回收站 (trashed): \(remoteRootId)，终止同步以保护本地文件")
+            logger.error("[Sync] The remote sync root is trashed: \(remoteRootId). Stopping sync to protect local files.")
             throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "trashed")
         }
         guard remoteRoot.isDirectory else {
-            logger.error("[Sync] 远端同步根目录不是有效目录: \(remoteRootId)，终止同步以保护本地文件")
+            logger.error("[Sync] The remote sync root is not a valid directory: \(remoteRootId). Stopping sync to protect local files.")
             throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notDirectory")
         }
 
@@ -1806,7 +1806,7 @@ public final class SyncEngine: Sendable {
         let remoteGate = try await remoteChanges.gate()
 
         // -------------------------------------------------------------
-        // 1. 构建目录拓扑映射 (在内存中快速维护，O(1) 路径与父项解析)
+        // 1. Build directory topology mapping (Fast maintenance in memory,O(1) Path and parent resolution)
         // -------------------------------------------------------------
         final class DirectoryContext: @unchecked Sendable {
             private var dirPaths: [Int64: String] = [:]         // item_id -> relPath
@@ -1871,7 +1871,7 @@ public final class SyncEngine: Sendable {
 
         let dirContext = DirectoryContext(rootItemId: rootItemId, remoteRootId: remoteRootId)
 
-        // 从 SQLite 加载已知的所有目录
+        // from SQLite Load all known directories
         try await store.read { conn in
             let stmt = try conn.cachedStatement("""
             SELECT item_id, parent_id, name, remote_file_id, remote_status
@@ -1890,7 +1890,7 @@ public final class SyncEngine: Sendable {
             }
             stmt.reset()
 
-            // 按照拓扑顺序注册进 dirContext
+            // Register in topological order dirContext
             var registered = Set<Int64>([rootItemId])
             var remaining = rawDirs
             while !remaining.isEmpty {
@@ -1904,7 +1904,7 @@ public final class SyncEngine: Sendable {
                     return false
                 }
                 if remaining.count == countBefore {
-                    // 若存在孤立项则按根目录兜底
+                    // If there are orphan items, search according to the root directory.
                     for dir in remaining {
                         dirContext.register(itemId: dir.id, parentItemId: rootItemId, name: dir.name, remoteId: dir.remoteId, remotePresent: false)
                     }
@@ -2072,7 +2072,7 @@ public final class SyncEngine: Sendable {
                 if duringScan && !dirContext.isReady(item.parentId) { continue }
                 let decision: ReconcileDecision
                 if item.pendingCreate != nil {
-                    decision = .upload(reason: "恢复已持久化的小文件创建意图")
+                    decision = .upload(reason: "Restore persistent small file creation intent")
                 } else {
                     decision = Reconciler.decide(baseline: item.baseline, local: item.local, remote: item.remote)
                 }
@@ -2119,7 +2119,7 @@ public final class SyncEngine: Sendable {
                                 throw DriveError.unsafeOverwrite(fileId: remoteID)
                             }
 
-                            // 若远端父目录此前被移入回收站，在上传子文件前自动恢复父目录
+                            // If the remote parent directory has been moved to the recycle bin before, the parent directory will be automatically restored before uploading the child files.
                             if let parentRId = dirContext.getRemoteId(for: item.parentId) {
                                 let isParentTrashed: Bool = (try? await self.store.read { conn in
                                     let stmt = try conn.cachedStatement("SELECT remote_status FROM items WHERE item_id = ?;")
@@ -2141,7 +2141,7 @@ public final class SyncEngine: Sendable {
                                             _ = try stmt.step()
                                         }
                                     } catch {
-                                        self.logger.error("恢复远端父目录失败 [\(parentRId)]: \(error)")
+                                        self.logger.error("Failed to restore remote parent directory [\(parentRId)]: \(error)")
                                     }
                                 }
                             }
@@ -2172,7 +2172,7 @@ public final class SyncEngine: Sendable {
                                     guard let expectedSHA256 = pending.expectedSHA256,
                                           expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
                                           pending.totalBytes == fSize else {
-                                        throw SyncEngineError.general("未完成的大文件创建意图输入已变化: \(item.name)")
+                                        throw SyncEngineError.general("Unfinished large file creation intent input changed: \(item.name)")
                                     }
                                     target = pending
                                 } else {
@@ -2209,10 +2209,10 @@ public final class SyncEngine: Sendable {
                                 guard let expectedSHA256 = pending.expectedSHA256,
                                       expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
                                       pending.totalBytes == fSize else {
-                                    throw SyncEngineError.general("未完成的小文件创建意图输入已变化: \(item.name)")
+                                    throw SyncEngineError.general("Unfinished small file creation intent input has changed: \(item.name)")
                                 }
                                 guard let fileData = input.data else {
-                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
+                                    throw SyncEngineError.general("Stable small-file input is missing its in-memory body: \(item.name)")
                                 }
                                 uploadedFile = try await self.client.uploadMultipart(
                                     name: item.name,
@@ -2223,7 +2223,7 @@ public final class SyncEngine: Sendable {
                                 )
                             } else if let existingRemoteId = item.remoteFileId {
                                 guard let fileData = input.data else {
-                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
+                                    throw SyncEngineError.general("Stable small-file input is missing its in-memory body: \(item.name)")
                                 }
                                 uploadedFile = try await self.client.updateMultipart(
                                     remoteId: existingRemoteId,
@@ -2232,7 +2232,7 @@ public final class SyncEngine: Sendable {
                                 )
                             } else {
                                 guard let fileData = input.data else {
-                                    throw SyncEngineError.general("小文件稳定输入缺少内存正文: \(item.name)")
+                                    throw SyncEngineError.general("Stable small-file input is missing its in-memory body: \(item.name)")
                                 }
                                 let newRemoteId = try await self.idPool.nextId()
                                 let prepared = try await DurableCreateIntentStore.prepareFileUpload(
@@ -2311,7 +2311,7 @@ public final class SyncEngine: Sendable {
                             }
 
                             guard receiptApplied.withLock({ $0 }) else {
-                                throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(item.name)")
+                                throw SyncEngineError.general("The upload receipt is stale; the newer generation remains pending: \(item.name)")
                             }
 
                             scheduled.withLock { _ = $0.remove(item.itemId) }
@@ -2339,7 +2339,7 @@ public final class SyncEngine: Sendable {
                                     stmt.reset()
                                 }
                             }
-                            self.logger.error("增量上传失败 [\(item.name)]: \(error)")
+                            self.logger.error("Incremental upload failed [\(item.name)]: \(error)")
                         }
                     }
 
@@ -2364,7 +2364,7 @@ public final class SyncEngine: Sendable {
                             let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                             let localFileURL = rootURL.appendingPathComponent(relPath)
 
-                            // 确保本地目标父目录存在
+                            // Make sure the local target parent directory exists
                             try? FileManager.default.createDirectory(at: localFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
 
                             let expectedDestination = try LocalFileVersion.read(at: localFileURL)
@@ -2400,7 +2400,7 @@ public final class SyncEngine: Sendable {
                                         return try stmt.step()
                                     }
                                     guard current else {
-                                        throw SyncEngineError.general("下载计划已过期，保留本地文件: \(item.name)")
+                                        throw SyncEngineError.general("Download plan has expired, keep local files: \(item.name)")
                                     }
                                 },
                                 onProgress: { delta in
@@ -2445,14 +2445,14 @@ public final class SyncEngine: Sendable {
                                 receiptApplied.withLock { $0 = true }
                             }
                             guard receiptApplied.withLock({ $0 }) else {
-                                throw SyncEngineError.general("下载回执已过期，保留新一代待同步状态: \(item.name)")
+                                throw SyncEngineError.general("The download receipt is stale; the newer generation remains pending: \(item.name)")
                             }
 
                             scheduled.withLock { _ = $0.remove(item.itemId) }
                             actionTracker.counts.withLock { $0.downloaded += 1; $0.bytesDown += fSize }
                         } catch {
                             actionTracker.failures.withLock { $0 += 1 }
-                            self.logger.error("增量下载失败 [\(item.name)]: \(error)")
+                            self.logger.error("Incremental download failed [\(item.name)]: \(error)")
                         }
                     }
 
@@ -2503,7 +2503,7 @@ public final class SyncEngine: Sendable {
                             }
                             actionTracker.counts.withLock { $0.deleted += 1 }
                         } catch {
-                            self.logger.error("远端文件删除失败 [\(item.name)]: \(error)")
+                            self.logger.error("Remote file deletion failed [\(item.name)]: \(error)")
                         }
                     }
 
@@ -2519,7 +2519,7 @@ public final class SyncEngine: Sendable {
                             try FileManager.default.trashItem(at: localFileURL, resultingItemURL: &trashURL)
                         } catch {
                             trashSucceeded = false
-                            self.logger.warning("无法将本地文件移入废纸篓 [\(relPath)]: \(error)，保留本地文件并标记为 blocked，绝不执行永久删除")
+                            self.logger.warning("Unable to move local file to Trash [\(relPath)]: \(error). Keeping it locally and marking the operation blocked; permanent deletion is disabled.")
                         }
                     }
 
@@ -2555,7 +2555,7 @@ public final class SyncEngine: Sendable {
                             guard winner == .remote, let remoteID = item.remoteFileId,
                                   let localSHA = item.local?.sha256?.lowercased(),
                                   let remoteSHA = item.remote?.sha256?.lowercased() else {
-                                throw SyncEngineError.general("冲突缺少有效的双方内容证据")
+                                throw SyncEngineError.general("The conflict lacks valid evidence of the content of both parties")
                             }
                             let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
                             let original = rootURL.appendingPathComponent(parentRel).appendingPathComponent(item.name)
@@ -2571,7 +2571,7 @@ public final class SyncEngine: Sendable {
                             actionTracker.conflicts.withLock { $0 += 1 }
                         } catch {
                             actionTracker.failures.withLock { $0 += 1 }
-                            self.logger.error("处理文件冲突失败 [\(item.name)]: \(error)")
+                            self.logger.error("Failed to handle file conflicts [\(item.name)]: \(error)")
                         }
                     }
 
@@ -2607,7 +2607,7 @@ public final class SyncEngine: Sendable {
         }
 
         // -------------------------------------------------------------
-        // 3. 本地 DirectoryScanner 扫描与快速变更检测 (§6.2)
+        // 3. local DirectoryScanner Scanning and rapid change detection (§6.2)
         // -------------------------------------------------------------
         let baselineCache = try await LocalBaselineCache.load(store: store, rootId: rootId)
         final class SeenItemsTracker: @unchecked Sendable {
@@ -2700,7 +2700,7 @@ public final class SyncEngine: Sendable {
                 case .failed(let failure):
                     failures.append(failure)
                     scanProgress.incFailed()
-                    self.logger.error("本地文件读取或哈希失败，保留既有状态并继续同步 [\(failure.observation.url.path)]: \(failure.message)")
+                    self.logger.error("Local file reading or hashing failed, retain the existing state and continue synchronization [\(failure.observation.url.path)]: \(failure.message)")
                 }
             }
             let successfulObservations = observations
@@ -2860,7 +2860,7 @@ public final class SyncEngine: Sendable {
                         let dev = record.dev
                         let ino = record.ino
 
-                        // 检查本地目录是否发生重命名或移动 (按 dev + ino 查找)
+                        // Check whether the local directory has been renamed or moved (press dev + ino Find)
                         let existingDir: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
                             let stmt = try conn.cachedStatement("""
                             SELECT item_id, parent_id, name, remote_file_id
@@ -2887,7 +2887,7 @@ public final class SyncEngine: Sendable {
                             continue
                         }
                         if let existing = existingDir, (existing.name != name || existing.parentId != parentItemId) {
-                            // 本地目录发生重命名或移动
+                            // The local directory is renamed or moved
                             seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
                             do {
                                 if let rId = existing.remoteId {
@@ -2911,10 +2911,10 @@ public final class SyncEngine: Sendable {
                                 seenDirTracker.markSeen(parentId: parentItemId, name: name)
                                 dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: name, remoteId: existing.remoteId ?? "")
                             } catch {
-                                self.logger.error("重命名/移动远端目录失败 [\(existing.name) -> \(name)]: \(error)")
+                                self.logger.error("Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
                             }
                         } else if dirContext.getItemId(byRelPath: relPath) == nil {
-                            // 新建本地目录
+                            // Create a new local directory
                             let remoteParentId = dirContext.getRemoteId(for: parentItemId) ?? remoteRootId
                             var intent: DurableCreateIntent?
                             do {
@@ -2964,7 +2964,7 @@ public final class SyncEngine: Sendable {
                                         error: error
                                     )
                                 }
-                                self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
+                                self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
                             }
                         } else {
                             seenDirTracker.markSeen(parentId: parentItemId, name: name)
@@ -2987,7 +2987,7 @@ public final class SyncEngine: Sendable {
                             continue
                         }
 
-                        // 检查本地文件是否发生重命名或移动 (按 dev + ino 查找)
+                        // Check if local files have been renamed or moved (press dev + ino Find)
                         let existingFile: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
                             let stmt = try conn.cachedStatement("""
                             SELECT item_id, parent_id, name, remote_file_id
@@ -3014,7 +3014,7 @@ public final class SyncEngine: Sendable {
                             if remoteGate.blocks(oldPath) { continue }
                         }
                         if let existing = existingFile, (existing.name != name || existing.parentId != parentItemId) {
-                            // 本地文件发生重命名或移动
+                            // Local files are renamed or moved
                             seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
                             do {
                                 if let rId = existing.remoteId {
@@ -3042,16 +3042,16 @@ public final class SyncEngine: Sendable {
                                 }
                                 seenTracker.markSeen(parentId: parentItemId, name: name)
                             } catch {
-                                self.logger.error("重命名/移动远端文件失败 [\(existing.name) -> \(name)]: \(error)")
+                                self.logger.error("Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)")
                                 continue
                             }
-                            // 路径更新不代表正文已验证；保留旧元数据并继续内容比对。
-                            // 纯改名仍命中下方缓存，正文变化则复用既有摘要与裁决流程。
+                            // Path updates do not mean that the text has been verified; retain the old metadata and continue content comparison.
+                            // A pure name change will still hit the cache below, while a text change will reuse the existing summary and decision process.
                         }
 
                         seenTracker.markSeen(parentId: parentItemId, name: name)
 
-                        // 快速变更比对 (§6.2)
+                        // Quick change comparison (§6.2)
                         if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
                             scanProgress.incSkipped()
                             continue
@@ -3079,16 +3079,16 @@ public final class SyncEngine: Sendable {
         }
         await drainTransfers()
 
-        // 识别本地已删除的文件与目录 (§9.1)
-        // 再次核验本地根目录是否存在，避免在扫描期间本地目录被移除导致全部误判 absent 扩散删除
+        // Identify local deleted files and directories (§9.1)
+        // Verify again whether the local root directory exists to avoid all misjudgments caused by the local directory being removed during the scan. absent diffuse deletion
         var isStillDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isStillDir), isStillDir.boolValue else {
-            logger.error("[Sync] 本地同步根目录在扫描期间消失: \(resolvedLocalPath)，终止同步以保护云端文件")
+            logger.error("[Sync] The local sync root disappeared during scanning: \(resolvedLocalPath). Stopping sync to protect remote files.")
             throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
         }
 
         try await store.write { conn in
-            // 1. 文件删除检测
+            // 1. File deletion detection
             let stmt = try conn.cachedStatement("""
             SELECT item_id, parent_id, name
             FROM items
@@ -3109,7 +3109,7 @@ public final class SyncEngine: Sendable {
             }
             stmt.reset()
 
-            // 2. 目录删除检测（排除根目录项）
+            // 2. Directory deletion detection (excluding root directory entries)
             let dirStmt = try conn.cachedStatement("""
             SELECT item_id, parent_id, name
             FROM items
@@ -3146,17 +3146,17 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 刷新所有未提交的 Changes 及扫描批次至磁盘，确保对后续查询立即可见
+        // Refresh all uncommitted Changes and scan the batch to disk, ensuring immediate visibility for subsequent queries
         try await store.flush()
 
         // -------------------------------------------------------------
-        // 4. Reconciler 决策与执行 (§9.1)
+        // 4. Reconciler decision making and execution (§9.1)
         // -------------------------------------------------------------
         let dirtyItems = try await loadDirtyItems()
 
         // -------------------------------------------------------------
-        // 5A. 阶段一：先对所有文件项执行 Reconciler 裁决与调度执行 (§9.1, A04)
-        // 确保所有文件级上传、下载、修改保留与删除动作彻底完成，作为目录删除的屏障
+        // 5A. Phase 1: Execute on all file items first Reconciler Adjudication and Scheduling Execution (§9.1, A04)
+        // Ensure that all file-level uploads, downloads, modification retention, and deletions are completely completed as a barrier to directory deletion
         // -------------------------------------------------------------
         let eligibleItems = dirtyItems.filter { item in
             let parent = dirContext.getRelPath(for: item.parentId) ?? ""
@@ -3166,8 +3166,8 @@ public final class SyncEngine: Sendable {
         let fileItems = eligibleItems.filter { $0.entryKind == "file" }
         let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
 
-        // 恢复上次在请求前已持久化、但尚未提交完成回执的目录创建。
-        // createDirectory 使用相同预生成 ID 重试；若服务端上次已成功，DriveClient 会在 409 后核验同一对象。
+        // Resumes the last creation of a directory that was persisted before the request but for which a completion receipt has not yet been submitted.
+        // createDirectory Use the same pregenerated ID Retry; if the server succeeded last time,DriveClient will be in 409 Then verify the same object.
         let pendingDirectoryCreates = dirItems.compactMap { item -> (DirtyRecord, DurableCreateIntent)? in
             guard let intent = item.pendingCreate else { return nil }
             return (item, intent)
@@ -3203,7 +3203,7 @@ public final class SyncEngine: Sendable {
                     operationID: intent.operationID,
                     error: error
                 )
-                logger.error("恢复远端目录创建失败 [\(item.name)]: \(error)")
+                logger.error("Failed to restore remote directory creation [\(item.name)]: \(error)")
             }
         }
 
@@ -3214,15 +3214,15 @@ public final class SyncEngine: Sendable {
             throw error
         }
 
-        // 等待所有文件级上传、下载、修改保留与删除动作彻底完成并落库
+        // Wait for all file-level uploads, downloads, modifications, retention, and deletions to be completed and dropped into the database.
         await drainTransfers()
         try await store.flush()
 
         // -------------------------------------------------------------
-        // 5B. 阶段二：后代冲突屏障与受控自底向上目录处理 (A04)
-        // 依赖所有后代裁决结果，任何保留、新增、待上传/下载或冲突都会阻断目录删除
+        // 5B. Phase 2: Descendant conflict barrier and controlled bottom-up directory processing (A04)
+        // Depends on the results of all descendant rulings, any reserved, added, and pending uploads/Downloads or conflicts will block directory deletion
         // -------------------------------------------------------------
-        // 1. 对于非删除状态的普通目录，直接提交并清除 dirty_generation
+        // 1. For ordinary directories in a non-deleted state, submit and clear them directly. dirty_generation
         if !dirItems.isEmpty {
             try await store.write { conn in
                 for item in dirItems {
@@ -3242,7 +3242,7 @@ public final class SyncEngine: Sendable {
                             }
                         }
                     } else if item.local?.status == .absent && item.remote?.status == .trashed {
-                        // 两端皆已删除
+                        // Both ends have been deleted
                         do {
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
@@ -3259,7 +3259,7 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        // 2. 对于存在单侧删除意图的目录，按树深度倒序（自底向上，叶子目录优先）进行屏障核验
+        // 2. For directories with unilateral deletion intentions, perform barrier verification in reverse order of tree depth (bottom-up, leaf directories first)
         let dirCandidates = dirItems.filter {
             ($0.local?.status == .absent && $0.remote?.status == .present) ||
             ($0.remote?.status == .trashed && $0.local?.status == .present)
@@ -3276,7 +3276,7 @@ public final class SyncEngine: Sendable {
             let relPath = parentRel.isEmpty ? dirItem.name : "\(parentRel)/\(dirItem.name)"
             let localDirURL = rootURL.appendingPathComponent(relPath)
 
-            // 递归查询当前目录的所有后代状态
+            // Recursively query the status of all descendants of the current directory
             let barrier = try await store.read { conn in
                 let stmt = try conn.cachedStatement("""
                 WITH RECURSIVE subtree AS (
@@ -3311,10 +3311,10 @@ public final class SyncEngine: Sendable {
             }
 
             if dirItem.local?.status == .absent && dirItem.remote?.status == .present {
-                // 本地删除了目录，但远端目录仍在 (原意图: trashRemote)
-                // 屏障检查：若后代中存在任何需保留的远端文件/本地下载文件/冲突/未决项，绝对禁止删除远端目录
+                // The directory is deleted locally, but the remote directory is still there (original intention: trashRemote)
+                // Barrier check: if there are any remote files in the descendants that need to be preserved/Download files locally/conflict/Pending items, deletion of remote directories is absolutely prohibited
                 if barrier.remotePresent > 0 || barrier.localPresent > 0 || barrier.pending > 0 {
-                    self.logger.info("后代屏障生效：远端目录 [\(relPath)] 包含需保留或新增的后代文件 (remotePresent: \(barrier.remotePresent), localPresent: \(barrier.localPresent))，阻止远端目录删除并恢复本地目录")
+                    self.logger.info("Descendant barrier blocked deletion of remote directory [\(relPath)]: descendants must be retained or added (remotePresent: \(barrier.remotePresent), localPresent: \(barrier.localPresent)); restoring the local directory")
                     try? FileManager.default.createDirectory(at: localDirURL, withIntermediateDirectories: true)
                     try await store.batchWrite { conn in
                         let stmt = try conn.cachedStatement("""
@@ -3326,7 +3326,7 @@ public final class SyncEngine: Sendable {
                         stmt.reset()
                     }
                 } else {
-                    // 后代全部已安全删除，向云端发送 trashRemote
+                    // All descendants have been safely deleted and sent to the cloud trashRemote
                     do {
                         if let rId = dirItem.remoteFileId {
                             try await self.client.trash(remoteId: rId)
@@ -3342,14 +3342,14 @@ public final class SyncEngine: Sendable {
                         }
                         actionTracker.counts.withLock { $0.deleted += 1 }
                     } catch {
-                        self.logger.error("远端目录删除失败 [\(relPath)]: \(error)")
+                        self.logger.error("Failed to delete remote directory [\(relPath)]: \(error)")
                     }
                 }
             } else if dirItem.remote?.status == .trashed && dirItem.local?.status == .present {
-                // 远端删除了目录，但本地目录仍在 (原意图: deleteLocal)
-                // 屏障检查：若后代中存在本地新增、修改或冲突文件，绝对禁止删除本地目录
+                // The remote end deleted the directory, but the local directory is still there (original intention: deleteLocal)
+                // Barrier check: If there are local new, modified or conflicting files in the descendants, deletion of the local directory is absolutely prohibited
                 if barrier.localPresent > 0 || barrier.remotePresent > 0 || barrier.pending > 0 {
-                    self.logger.info("后代屏障生效：本地目录 [\(relPath)] 包含本地新增或修改的后代文件 (localPresent: \(barrier.localPresent))，阻止本地目录删除扩散")
+                    self.logger.info("Descendant barrier blocked deletion of local directory [\(relPath)]: it contains locally added or modified descendants (localPresent: \(barrier.localPresent))")
                     do {
                         if let rId = dirItem.remoteFileId {
                             try await self.client.untrash(remoteId: rId)
@@ -3364,10 +3364,10 @@ public final class SyncEngine: Sendable {
                             stmt.reset()
                         }
                     } catch {
-                        self.logger.error("后代屏障恢复远端目录失败 [\(relPath)]: \(error)")
+                        self.logger.error("Descendant barrier failed to restore remote directory [\(relPath)]: \(error)")
                     }
                 } else {
-                    // 后代全部已清理，核实本地目录为空后安全移入废纸篓
+                    // All descendants have been cleaned up. Verify that the local directory is empty and safely move it to the trash.
                     var trashSucceeded = true
                     if FileManager.default.fileExists(atPath: localDirURL.path) {
                         let contents = (try? FileManager.default.contentsOfDirectory(atPath: localDirURL.path)) ?? []
@@ -3378,11 +3378,11 @@ public final class SyncEngine: Sendable {
                                 try FileManager.default.trashItem(at: localDirURL, resultingItemURL: &trashURL)
                             } catch {
                                 trashSucceeded = false
-                                self.logger.warning("无法将本地目录移入废纸篓 [\(relPath)]: \(error)，保留本地目录并标记为 blocked")
+                                self.logger.warning("Unable to move local directory to Trash [\(relPath)]: \(error). Keeping it and marking the operation blocked.")
                             }
                         } else {
                             trashSucceeded = false
-                            self.logger.warning("本地目录 [\(relPath)] 非空，阻止删除并标记为 blocked")
+                            self.logger.warning("Local directory [\(relPath)] is not empty; blocking deletion")
                         }
                     }
 
