@@ -65,6 +65,14 @@ let package = Package(
                 .swiftLanguageMode(.v6)
             ]
         ),
+        .executableTarget(
+            name: "GDriveKillProcessTestHelper",
+            dependencies: ["GDrive"],
+            path: "Tests/GDriveKillProcessTestHelper",
+            swiftSettings: [
+                .swiftLanguageMode(.v6)
+            ]
+        ),
         .testTarget(
             name: "GDriveTests",
             dependencies: [
