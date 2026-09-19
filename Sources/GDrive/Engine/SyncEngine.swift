@@ -1279,7 +1279,7 @@ public final class SyncEngine: Sendable {
     /// - 采用恒定内存的 FileHandle 流式切片读取 (默认 8MB，必须是 256KB 的整数倍)
     /// - 每完成一个分块，立即将新 offset 持久化至 SQLite operations 表，断电/换线程后可无缝续传
     @discardableResult
-    private func performResumableUpload(
+    func performResumableUpload(
         rootId: Int64,
         itemId: Int64,
         fileURL: URL,
@@ -1651,6 +1651,20 @@ public final class SyncEngine: Sendable {
         guard remoteRoot.isDirectory else {
             logger.error("[Sync] 远端同步根目录不是有效目录: \(remoteRootId)，终止同步以保护本地文件")
             throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notDirectory")
+        }
+
+        // Recover before Changes/scanning can mistake intermediate publications for new input.
+        let pendingConflicts = try await ConflictOperation.pending(store: store, rootID: rootId)
+        let recoveredConflicts = pendingConflicts.count
+        if !pendingConflicts.isEmpty {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                let limit = max(1, min(64, maxConcurrency))
+                for (index, op) in pendingConflicts.enumerated() {
+                    if index >= limit { try await group.next() }
+                    group.addTask { try await self.resolveConflict(op) }
+                }
+                try await group.waitForAll()
+            }
         }
 
         // -------------------------------------------------------------
@@ -2542,7 +2556,7 @@ public final class SyncEngine: Sendable {
             var downloaded = 0
             var bytesDown: Int64 = 0
             var deleted = 0
-            var conflicts = 0
+            let conflicts = OSAllocatedUnfairLock(initialState: 0)
             let failures = OSAllocatedUnfairLock(initialState: 0)
         }
         let actionTracker = ActionTracker()
@@ -3011,45 +3025,27 @@ public final class SyncEngine: Sendable {
                 syncGroup.enter()
                 Task {
                     await syncSemaphore.wait()
-                    defer {
-                        syncSemaphore.signal()
-                        syncGroup.leave()
-                    }
-                    let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
-                    let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-                    let originalURL = rootURL.appendingPathComponent(relPath)
-
-                    let ext = originalURL.pathExtension
-                    let base = (item.name as NSString).deletingPathExtension
-                    let conflictName = ext.isEmpty ? "\(base) (Conflict \(conflictId))" : "\(base) (Conflict \(conflictId)).\(ext)"
-                    let conflictURL = originalURL.deletingLastPathComponent().appendingPathComponent(conflictName)
-
+                    defer { syncSemaphore.signal(); syncGroup.leave() }
                     do {
-                        if winner == .remote, let rId = item.remoteFileId {
-                            try FileManager.default.moveItem(at: originalURL, to: conflictURL)
-                            try await self.client.downloadFile(remoteId: rId, destinationURL: originalURL, expectedSha256: item.remote?.sha256)
-                        } else if winner == .local, let rId = item.remoteFileId {
-                            try await self.client.downloadFile(remoteId: rId, destinationURL: conflictURL, expectedSha256: item.remote?.sha256)
+                        guard winner == .remote, let remoteID = item.remoteFileId,
+                              let localSHA = item.local?.sha256?.lowercased(),
+                              let remoteSHA = item.remote?.sha256?.lowercased() else {
+                            throw SyncEngineError.general("冲突缺少有效的双方内容证据")
                         }
-
-                        try await self.store.write { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET conflict_id = ?, conflict_winner = ?, phase = 'committed', dirty_generation = 0, updated_at = ?
-                            WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
-                            """)
-                            stmt.bindText(conflictId, at: 1)
-                            stmt.bindText(winner.rawValue, at: 2)
-                            stmt.bindDouble(now, at: 3)
-                            stmt.bindInt64(item.itemId, at: 4)
-                            stmt.bindInt64(item.localGeneration, at: 5)
-                            stmt.bindInt64(item.remoteGeneration, at: 6)
-                            stmt.bindInt64(item.dirtyGeneration, at: 7)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-
-                        actionTracker.conflicts += 1
+                        let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
+                        let original = rootURL.appendingPathComponent(parentRel).appendingPathComponent(item.name)
+                        let op = try await ConflictOperation.prepare(store: self.store,
+                            rootID: rootId, itemID: item.itemId, parentID: item.parentId,
+                            original: original, remoteID: remoteID,
+                            parentRemoteID: dirContext.getRemoteId(for: item.parentId) ?? remoteRootId,
+                            copyRemoteID: self.idPool.nextId(), conflictID: conflictId,
+                            localSHA: localSHA, remoteSHA: remoteSHA,
+                            localGeneration: item.localGeneration, remoteGeneration: item.remoteGeneration,
+                            dirtyGeneration: item.dirtyGeneration)
+                        try await self.resolveConflict(op)
+                        actionTracker.conflicts.withLock { $0 += 1 }
                     } catch {
+                        actionTracker.failures.withLock { $0 += 1 }
                         self.logger.error("处理文件冲突失败 [\(item.name)]: \(error)")
                     }
                 }
@@ -3285,7 +3281,7 @@ public final class SyncEngine: Sendable {
         stats.filesDownloaded = actionTracker.downloaded
         stats.bytesDownloaded = actionTracker.bytesDown
         stats.filesDeleted = actionTracker.deleted
-        stats.conflictsResolved = actionTracker.conflicts
+        stats.conflictsResolved = recoveredConflicts + actionTracker.conflicts.withLock { $0 }
         stats.filesFailed = actionTracker.failures.withLock { $0 }
         stats.elapsedSeconds = elapsed
         notifier.finish()

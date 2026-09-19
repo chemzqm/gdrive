@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 /// 共同基线 (B: Baseline)
 public struct ItemBaseline: Sendable, Equatable {
@@ -90,6 +91,12 @@ public enum ReconcileDecision: Sendable, Equatable {
 /// 以共同基线 B、本地观察 L、远端观察 R 进行无偏逐项比对，mtime 不决定谁覆盖谁。
 /// 严格保证“存在性证据”与“内容证据”完备性：拒绝任何单侧 unknown 或缺少 SHA-256 摘要的无证据删除、覆盖决策。
 public struct Reconciler: Sendable {
+    // Content identity is deterministic; execution scopes it to the persisted item ID.
+    private static func conflictIdentity(base: String?, local: String?, remote: String?) -> String {
+        let input = [base ?? "", local ?? "", remote ?? ""].joined(separator: ":")
+        return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     public static func decide(
         baseline: ItemBaseline?,
         local: LocalObservation?,
@@ -141,7 +148,7 @@ public struct Reconciler: Sendable {
                 if let localSha, let remoteSha, localSha == remoteSha {
                     return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
                 } else {
-                    let conflictId = UUID().uuidString.prefix(8)
+                    let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
                     return .conflict(winner: .remote, conflictId: String(conflictId))
                 }
             }
@@ -214,7 +221,7 @@ public struct Reconciler: Sendable {
             if let localSha, let remoteSha, localSha == remoteSha {
                 return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
             } else {
-                let conflictId = UUID().uuidString.prefix(8)
+                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
                 return .conflict(winner: .remote, conflictId: String(conflictId))
             }
         }

@@ -64,15 +64,18 @@ struct TransferPerformanceTests {
             let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
             let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }))
             let first = try await engine.syncLocalToRemoteEmpty(localPath: local.path, remoteRootId: "root", maxUploadConcurrency: 64)
-            let second = try await engine.syncIncremental(localPath: local.path, remoteRootId: "root")
+            let scanCount = max(1, Int(ProcessInfo.processInfo.environment["GDRIVE_PERF_SCANS"] ?? "1") ?? 1)
             #expect(first.filesUploaded == 128)
             #expect(first.filesFailed == 0)
-            #expect(second.filesSkipped == 128)
-            #expect(second.filesUploaded == 0)
+            for _ in 0..<scanCount {
+                let second = try await engine.syncIncremental(localPath: local.path, remoteRootId: "root")
+                #expect(second.filesSkipped == 128)
+                #expect(second.filesUploaded == 0)
+                skips.append(second.elapsedSeconds)
+            }
             uploads.append(first.elapsedSeconds)
-            skips.append(second.elapsedSeconds)
         }
         print("A11 PERF upload seconds: \(uploads); median=\(uploads.sorted()[2])")
-        print("A11 PERF unchanged seconds: \(skips); median=\(skips.sorted()[2])")
+        print("A11 PERF unchanged seconds: \(skips); median=\(skips.sorted()[skips.count / 2])")
     }
 }

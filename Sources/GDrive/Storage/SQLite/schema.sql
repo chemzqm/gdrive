@@ -246,3 +246,16 @@ CREATE TABLE IF NOT EXISTS cleanup_queue (
 CREATE INDEX IF NOT EXISTS idx_cleanup_due
     ON cleanup_queue(state, next_attempt_at)
     WHERE state = 'pending';
+
+-- A12: recover before observations can reinterpret an interrupted publication.
+CREATE TABLE IF NOT EXISTS conflict_operations (
+    operation_id TEXT PRIMARY KEY NOT NULL,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
+    payload TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'completed'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_conflict_pending_item
+    ON conflict_operations(item_id) WHERE state = 'pending';
+CREATE INDEX IF NOT EXISTS idx_conflict_pending_root
+    ON conflict_operations(root_id) WHERE state = 'pending';

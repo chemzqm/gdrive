@@ -52,6 +52,17 @@ struct ReconcilerTests {
         }
     }
 
+    @Test("Conflict identity is stable with and without a baseline", arguments: [true, false])
+    func stableConflictIdentity(hasBaseline: Bool) {
+        let baseline = hasBaseline ? ItemBaseline(sha256: baseSha, size: 100) : nil
+        let local = LocalObservation(status: .present, sha256: modSha1, size: 120)
+        let remote = RemoteObservation(status: .present, sha256: modSha2, size: 130)
+        let first = Reconciler.decide(baseline: baseline, local: local, remote: remote)
+        #expect(first == Reconciler.decide(baseline: baseline, local: local, remote: remote))
+        #expect(first == Reconciler.decide(baseline: baseline,
+            local: LocalObservation(status: .present, sha256: modSha1.uppercased(), size: 120), remote: remote))
+    }
+
     @Test("Local deleted while remote unchanged trashes remote")
     func testLocalDeletedRemoteUnchanged() {
         let baseline = ItemBaseline(sha256: baseSha, size: 100)
