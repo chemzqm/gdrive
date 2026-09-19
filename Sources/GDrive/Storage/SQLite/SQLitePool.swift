@@ -4,6 +4,11 @@ import Foundation
 public actor ReaderPool {
     private let path: String
     private let maxConnections: Int
+    private nonisolated let executionQueue = DispatchQueue(
+        label: "gdrive.reader-pool",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
     private var available: [SQLiteConnection] = []
     private var totalCreated: Int = 0
     private var waiters: [CheckedContinuation<SQLiteConnection, Never>] = []
@@ -14,24 +19,34 @@ public actor ReaderPool {
     }
 
     /// Borrow the connection from the read connection pool to perform a read-only query, and automatically return it after completion
-    public func withReader<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) async throws -> T {
-        let conn = await acquire()
-        defer { release(conn) }
-        return try block(conn)
+    public nonisolated func withReader<T: Sendable>(_ block: @escaping @Sendable (SQLiteConnection) throws -> T) async throws -> T {
+        let conn = try await acquire()
+        do {
+            let result = try await withCheckedThrowingContinuation { continuation in
+                executionQueue.async {
+                    do {
+                        continuation.resume(returning: try block(conn))
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
+            await release(conn)
+            return result
+        } catch {
+            await release(conn)
+            throw error
+        }
     }
 
-    private func acquire() async -> SQLiteConnection {
+    private func acquire() async throws -> SQLiteConnection {
         if let conn = available.popLast() {
             return conn
         }
         if totalCreated < maxConnections {
-            do {
-                let conn = try SQLiteConnection(path: path, readonly: true)
-                totalCreated += 1
-                return conn
-            } catch {
-                // Fallback waiting for existing connection if read-only connection creation fails
-            }
+            let conn = try SQLiteConnection(path: path, readonly: true)
+            totalCreated += 1
+            return conn
         }
         return await withCheckedContinuation { continuation in
             waiters.append(continuation)

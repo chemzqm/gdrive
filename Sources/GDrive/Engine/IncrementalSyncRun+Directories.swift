@@ -256,8 +256,8 @@ extension IncrementalSyncRun {
                     FROM subtree;
                     """)
                 stmt.bindInt64(dirItem.itemId, at: 1)
-                stmt.bindInt64(rootID, at: 2)
-                stmt.bindInt64(rootID, at: 3)
+                stmt.bindInt64(self.rootID, at: 2)
+                stmt.bindInt64(self.rootID, at: 3)
                 defer { stmt.reset() }
                 if try stmt.step() {
                     let total = Int(stmt.columnInt64(at: 0) ?? 0)

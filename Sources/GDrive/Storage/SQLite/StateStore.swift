@@ -29,12 +29,12 @@ public final class StateStore: Sendable {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
 
         // 1. Initialize single writer and apply Schema
-        let writer = try DedicatedWriter(path: path, batchCapacity: batchCapacity, batchTimeoutMs: batchTimeoutMs)
+        let writer = try DedicatedWriter(path: resolvedPath, batchCapacity: batchCapacity, batchTimeoutMs: batchTimeoutMs)
         try await Self.initSchema(writer: writer)
         self.writer = writer
 
         // 2. Initialize concurrent read-only connection pools
-        self.readerPool = ReaderPool(path: path, maxConnections: maxReaders)
+        self.readerPool = ReaderPool(path: resolvedPath, maxConnections: maxReaders)
     }
 
     /// Get the underlying writer statistic metrics
@@ -43,7 +43,7 @@ public final class StateStore: Sendable {
     }
 
     /// Execute concurrent read-only queries
-    public func read<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) async throws -> T {
+    public func read<T: Sendable>(_ block: @escaping @Sendable (SQLiteConnection) throws -> T) async throws -> T {
         try await readerPool.withReader(block)
     }
 

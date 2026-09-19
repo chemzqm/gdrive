@@ -2,8 +2,91 @@ import Foundation
 import Testing
 @testable import GDrive
 
+private final class ReaderConcurrencyCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var active = 0
+    private var peak = 0
+
+    func enter() {
+        lock.lock()
+        active += 1
+        peak = max(peak, active)
+        lock.unlock()
+    }
+
+    func leave() {
+        lock.lock()
+        active -= 1
+        lock.unlock()
+    }
+
+    var peakCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peak
+    }
+}
+
 @Suite("StateStore Concurrency & Connection Pool Tests")
 struct StateStoreTests {
+
+    @Test("Reader pool executes independent reads concurrently")
+    func testReaderPoolActuallyRunsConcurrently() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("reader-pool-concurrency-\(UUID().uuidString).sqlite").path
+        defer {
+            try? FileManager.default.removeItem(atPath: tempDB)
+            try? FileManager.default.removeItem(atPath: "\(tempDB)-wal")
+            try? FileManager.default.removeItem(atPath: "\(tempDB)-shm")
+        }
+
+        let store = try await StateStore(path: tempDB, maxReaders: 4)
+        let counter = ReaderConcurrencyCounter()
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<8 {
+                group.addTask {
+                    try await store.read { _ in
+                        counter.enter()
+                        defer { counter.leave() }
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
+                }
+            }
+            try await group.waitForAll()
+        }
+
+        #expect(counter.peakCount > 1)
+    }
+
+    @Test("Reader pool reports connection creation failures")
+    func testReaderPoolConnectionFailureThrows() async {
+        let missingParent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("missing-reader-parent-\(UUID().uuidString)")
+        let pool = ReaderPool(path: missingParent.appendingPathComponent("state.sqlite").path)
+
+        await #expect(throws: (any Error).self) {
+            try await pool.withReader { _ in () }
+        }
+    }
+
+    @Test("StateStore opens the expanded tilde path")
+    func testTildePathUsesExpandedLocation() async throws {
+        let relativeDirectory = ".gdrive-state-store-test-\(UUID().uuidString)"
+        let suppliedPath = "~/\(relativeDirectory)/state.sqlite"
+        let expandedDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(relativeDirectory)
+        defer { try? FileManager.default.removeItem(at: expandedDirectory) }
+
+        let store = try await StateStore(path: suppliedPath)
+
+        #expect(store.path == expandedDirectory.appendingPathComponent("state.sqlite").path)
+        #expect(FileManager.default.fileExists(atPath: store.path))
+        _ = try await store.read { conn in
+            let statement = try conn.prepare("SELECT 1;")
+            return try statement.step()
+        }
+    }
 
     @Test("StateStore schema initialization and basic CRUD")
     func testSchemaInitAndCRUD() async throws {
