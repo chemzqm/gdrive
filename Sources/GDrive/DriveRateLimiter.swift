@@ -35,15 +35,16 @@ public actor DriveRateLimiter {
     }
 
     /// Initiate any HTTP Get token before request (non-blocking pending if in cooldown or insufficient token)
-    public func acquire() async {
+    public func acquire() async throws {
         while true {
+            try Task.checkCancellation()
             let now = Date()
 
             // 1. Check Global Cooling Period
             if let cooldown = cooldownUntil {
                 let remaining = cooldown.timeIntervalSince(now)
                 if remaining > 0 {
-                    try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
                     continue
                 } else {
                     cooldownUntil = nil
@@ -64,7 +65,7 @@ public actor DriveRateLimiter {
             // 4. Insufficient tokens, calculate the micro-delay to the next token and hang
             let deficit = 1.0 - tokens
             let waitSeconds = min(0.1, max(0.004, deficit / currentRate))
-            try? await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
+            try await Task.sleep(nanoseconds: UInt64(waitSeconds * 1_000_000_000))
         }
     }
 

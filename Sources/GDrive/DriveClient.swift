@@ -180,21 +180,23 @@ public final class DriveClient: Sendable {
     ) async throws -> (Data, HTTPURLResponse) {
         var attempt = 0
         var currentReq = request
+        var didRefreshAfterUnauthorized = false
 
         while true {
             attempt += 1
-            await rateLimiter.acquire()
+            try await rateLimiter.acquire()
 
             let data: Data
             let response: URLResponse
             do {
                 (data, response) = try await session.data(for: currentReq)
             } catch {
+                try Task.checkCancellation()
                 if attempt <= maxRetries {
                     let jitter = Double.random(in: 0.1...0.5)
                     let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
                     await rateLimiter.reportRateLimit(retryAfter: delay)
-                    try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                     continue
                 }
                 throw error
@@ -204,11 +206,10 @@ public final class DriveClient: Sendable {
                 throw DriveError.invalidResponse(message: "Response is not HTTP")
             }
 
-            // 401 Certificate Expired: Empty Memory Token Cache, reload valid Token Automatic Retry
-            if http.statusCode == 401 && attempt <= 2 {
-                tokenState.withLock { $0 = nil }
-                let freshToken = try await getValidToken()
-                currentReq.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
+            // A rejected token must bypass both cache layers. Refresh only once for this request.
+            if http.statusCode == 401 && !didRefreshAfterUnauthorized {
+                didRefreshAfterUnauthorized = true
+                try await refreshAuthorization(in: &currentReq)
                 continue
             }
 
@@ -233,12 +234,21 @@ public final class DriveClient: Sendable {
             if isRateLimit {
                 if attempt <= maxRetries {
                     let jitter = Double.random(in: 0.2...0.8)
-                    let backoff = min(16.0, (retryDelay ?? pow(2.0, Double(attempt))) + jitter)
+                    let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+                    let backoff = max(retryDelay ?? 0, exponential)
                     await rateLimiter.reportRateLimit(retryAfter: backoff)
-                    try? await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                    try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
                     continue
                 }
                 throw DriveError.rateLimited(retryAfter: retryDelay)
+            }
+
+            if [500, 502, 504].contains(http.statusCode), attempt <= maxRetries {
+                let jitter = Double.random(in: 0.2...0.8)
+                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+                let backoff = max(retryDelay ?? 0, exponential)
+                try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                continue
             }
 
             // Encounter 409(Often verified as existing in the business) or 308(Resumable chunking incomplete), returning directly to the upper level for processing
@@ -250,6 +260,73 @@ public final class DriveClient: Sendable {
             // Other HTTP Error Status
             let detail = String(decoding: data, as: UTF8.self)
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
+        }
+    }
+
+    private func refreshAuthorization(in request: inout URLRequest) async throws {
+        let rejectedToken = request.value(forHTTPHeaderField: "Authorization")?
+            .replacingOccurrences(of: "Bearer ", with: "")
+        tokenState.withLock { $0 = nil }
+        let freshToken = try await auth.forceRefresh(rejecting: rejectedToken)
+        let authData = await auth.authData()
+        let expiry = authData.expiresAt ?? Date(timeIntervalSinceNow: 3500)
+        tokenState.withLock { $0 = CachedToken(token: freshToken, expiresAt: expiry) }
+        request.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
+    }
+
+    private func executeStreamingRequest(
+        _ request: URLRequest,
+        maxRetries: Int = 5
+    ) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        var attempt = 0
+        var currentRequest = request
+        var didRefreshAfterUnauthorized = false
+
+        while true {
+            attempt += 1
+            try await rateLimiter.acquire()
+
+            let bytes: URLSession.AsyncBytes
+            let response: URLResponse
+            do {
+                (bytes, response) = try await session.bytes(for: currentRequest)
+            } catch {
+                try Task.checkCancellation()
+                guard attempt <= maxRetries else { throw error }
+                let jitter = Double.random(in: 0.1...0.5)
+                let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
+                await rateLimiter.reportRateLimit(retryAfter: delay)
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                continue
+            }
+
+            guard let http = response as? HTTPURLResponse else {
+                throw DriveError.invalidResponse(message: "Response is not HTTP")
+            }
+            if http.statusCode == 401 && !didRefreshAfterUnauthorized {
+                didRefreshAfterUnauthorized = true
+                try await refreshAuthorization(in: &currentRequest)
+                continue
+            }
+
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+            let rateLimited = http.statusCode == 429 || http.statusCode == 503
+            let transientServerError = [500, 502, 504].contains(http.statusCode)
+            if rateLimited || transientServerError {
+                guard attempt <= maxRetries else {
+                    if rateLimited { throw DriveError.rateLimited(retryAfter: retryAfter) }
+                    throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
+                }
+                let jitter = Double.random(in: 0.2...0.8)
+                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+                let backoff = max(retryAfter ?? 0, exponential)
+                if rateLimited { await rateLimiter.reportRateLimit(retryAfter: backoff) }
+                try await Task.sleep(nanoseconds: UInt64(backoff * 1_000_000_000))
+                continue
+            }
+
+            await rateLimiter.reportSuccess()
+            return (bytes, http)
         }
     }
 
@@ -671,7 +748,6 @@ public final class DriveClient: Sendable {
         var req = URLRequest(url: components.url!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
-        await rateLimiter.acquire()
         let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
         var publishedSuccessfully = false
         defer {
@@ -680,10 +756,7 @@ public final class DriveClient: Sendable {
             }
         }
 
-        let (asyncBytes, response) = try await session.bytes(for: req)
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "Response is not HTTP")
-        }
+        let (asyncBytes, http) = try await executeStreamingRequest(req)
         if http.statusCode == 404 {
             throw DriveError.notFound(fileId: remoteId)
         }

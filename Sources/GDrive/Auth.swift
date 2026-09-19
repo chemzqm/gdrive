@@ -41,9 +41,16 @@ public actor Auth {
 
     public let fileURL: URL
     private var data: AuthData
+    private let session: URLSession
+    private var refreshTask: Task<String, Error>?
 
     public init(path: String = defaultPath) throws {
+        try self.init(path: path, session: .shared)
+    }
+
+    init(path: String, session: URLSession) throws {
         self.fileURL = URL(fileURLWithPath: path)
+        self.session = session
         guard FileManager.default.fileExists(atPath: path) else {
             throw NSError(domain: "GDriveAuth", code: 1, userInfo: [NSLocalizedDescriptionKey: "Credential file not found: \(path)"])
         }
@@ -65,10 +72,21 @@ public actor Auth {
            expiresAt.timeIntervalSinceNow > 60 {
             return token
         }
-        guard let refreshToken = data.refreshToken, !refreshToken.isEmpty else {
-            throw NSError(domain: "GDriveAuth", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing refresh token. Complete authorization first."])
+        return try await refreshAccessToken()
+    }
+
+    /// Refreshes the access token even when its recorded expiry is still valid.
+    /// Concurrent callers share one refresh request. If another caller already
+    /// replaced `rejectedToken`, its newer token is returned without refreshing again.
+    func forceRefresh(rejecting rejectedToken: String? = nil) async throws -> String {
+        if let rejectedToken,
+           let currentToken = data.accessToken,
+           currentToken != rejectedToken,
+           let expiresAt = data.expiresAt,
+           expiresAt.timeIntervalSinceNow > 60 {
+            return currentToken
         }
-        return try await refresh(with: refreshToken)
+        return try await refreshAccessToken()
     }
 
     /// Opens browser authorization and saves the resulting token.
@@ -141,6 +159,24 @@ public actor Auth {
         return try await exchangeToken(params: params)
     }
 
+    private func refreshAccessToken() async throws -> String {
+        try Task.checkCancellation()
+        if let refreshTask {
+            let token = try await refreshTask.value
+            try Task.checkCancellation()
+            return token
+        }
+        guard let refreshToken = data.refreshToken, !refreshToken.isEmpty else {
+            throw NSError(domain: "GDriveAuth", code: 2, userInfo: [NSLocalizedDescriptionKey: "Missing refresh token. Complete authorization first."])
+        }
+        let task = Task { try await self.refresh(with: refreshToken) }
+        refreshTask = task
+        defer { refreshTask = nil }
+        let token = try await task.value
+        try Task.checkCancellation()
+        return token
+    }
+
     @discardableResult
     private func exchangeToken(params: [String: String]) async throws -> String {
         var req = URLRequest(url: URL(string: "https://oauth2.googleapis.com/token")!)
@@ -149,7 +185,7 @@ public actor Auth {
         let bodyString = params.map { "\($0.key)=\(urlEncode($0.value))" }.joined(separator: "&")
         req.httpBody = Data(bodyString.utf8)
 
-        let (respData, response) = try await URLSession.shared.data(for: req)
+        let (respData, response) = try await session.data(for: req)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
             let detail = String(decoding: respData, as: UTF8.self)
             throw NSError(domain: "GDriveAuth", code: 4, userInfo: [NSLocalizedDescriptionKey: "Token request failed: \(detail)"])
