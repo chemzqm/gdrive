@@ -17,6 +17,94 @@ struct Config {
     var dbPath: String = "/tmp/gdrive_vim_bench.sqlite"
 }
 
+/// Records the first request that carries file content. URLSession reports
+/// `requestStartDate` after a task completes, so this is the start of the HTTP
+/// request as observed by URLSession, not an exact first-byte-on-the-wire time.
+final class UploadRequestMetrics: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var firstRequestStart: Date?
+    let delegateQueue: OperationQueue
+
+    override init() {
+        let queue = OperationQueue()
+        queue.name = "gdrive.upload-benchmark.metrics"
+        queue.maxConcurrentOperationCount = 1
+        delegateQueue = queue
+        super.init()
+    }
+
+    static func isContentUpload(_ request: URLRequest) -> Bool {
+        let method = request.httpMethod?.uppercased()
+
+        if method == "POST",
+           let url = request.url,
+           let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           components.queryItems?.contains(where: { $0.name == "uploadType" && $0.value == "multipart" }) == true {
+            return true
+        }
+
+        guard method == "PUT",
+              let contentRange = request.value(forHTTPHeaderField: "Content-Range"),
+              contentRange.hasPrefix("bytes "),
+              !contentRange.hasPrefix("bytes */") else {
+            return false
+        }
+        return true
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didFinishCollecting metrics: URLSessionTaskMetrics
+    ) {
+        let starts = metrics.transactionMetrics.compactMap { transaction -> Date? in
+            guard Self.isContentUpload(transaction.request) else { return nil }
+            return transaction.requestStartDate
+        }
+        guard let earliest = starts.min() else { return }
+        lock.lock()
+        if firstRequestStart == nil || earliest < firstRequestStart! {
+            firstRequestStart = earliest
+        }
+        lock.unlock()
+    }
+
+    func firstRequestElapsed(since applicationStart: Date) -> TimeInterval? {
+        lock.lock()
+        let start = firstRequestStart
+        lock.unlock()
+        guard let start else { return nil }
+        return max(0, start.timeIntervalSince(applicationStart))
+    }
+
+    /// Wait for delegate callbacks already submitted by completed data tasks.
+    func drain() async {
+        await withCheckedContinuation { continuation in
+            delegateQueue.addOperation {
+                continuation.resume()
+            }
+        }
+    }
+}
+
+func makeBenchmarkSession(delegate: UploadRequestMetrics) -> URLSession {
+    let configuration = URLSessionConfiguration.default
+    configuration.httpMaximumConnectionsPerHost = 128
+    configuration.httpShouldUsePipelining = true
+    configuration.timeoutIntervalForRequest = 60
+    configuration.timeoutIntervalForResource = 300
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    return URLSession(configuration: configuration, delegate: delegate, delegateQueue: delegate.delegateQueue)
+}
+
+func elapsedSeconds(since start: DispatchTime) -> Double {
+    Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000.0
+}
+
+func elapsedSeconds(from start: DispatchTime, to end: DispatchTime) -> Double {
+    Double(end.uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000.0
+}
+
 func parseArguments() -> Config {
     var config = Config()
     let args = CommandLine.arguments
@@ -80,7 +168,9 @@ func formatBytes(_ bytes: Int64) -> String {
     return String(format: "%.2f MB", mb)
 }
 
-func main() async {
+func main() async -> Int32 {
+    let applicationStart = DispatchTime.now()
+    let applicationWallStart = Date()
     let config = parseArguments()
     let resolvedLocalPath = (config.localPath as NSString).expandingTildeInPath
 
@@ -96,7 +186,7 @@ func main() async {
     var isDir: ObjCBool = false
     guard FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir), isDir.boolValue else {
         print("❌ Error: The local directory does not exist: \(resolvedLocalPath)")
-        exit(1)
+        return 1
     }
 
     // 1. Initialize Google Drive credentials.
@@ -108,11 +198,13 @@ func main() async {
     } catch {
         print("❌ Authentication failed: \(error)")
         print("👉 Run `swift run gdrive-auth` to complete authorization first")
-        exit(1)
+        return 1
     }
 
     // 2. Initialize DriveClient.
-    let client = DriveClient(auth: auth)
+    let uploadMetrics = UploadRequestMetrics()
+    let session = makeBenchmarkSession(delegate: uploadMetrics)
+    let client = DriveClient(auth: auth, session: session)
 
     // 3. Determine or create an empty directory on the remote target
     let remoteRootId: String
@@ -132,7 +224,7 @@ func main() async {
             print("✅ Successfully created remote test directory: \(folderName) (ID: \(remoteRootId))")
         } catch {
             print("❌ Failed to create remote directory: \(error)")
-            exit(1)
+            return 1
         }
     }
 
@@ -149,19 +241,19 @@ func main() async {
         engine = try await SyncEngine(auth: auth, store: store, client: client)
     } catch {
         print("❌ Failed to initialize storage engine: \(error)")
-        exit(1)
+        return 1
     }
 
     print("--------------------------------------------------------------------------------")
     print("⏳ Starting concurrent streaming scan and upload...")
     print("--------------------------------------------------------------------------------")
 
-    let startTime = DispatchTime.now()
+    let engineStart = DispatchTime.now()
+    let setupElapsed = elapsedSeconds(from: applicationStart, to: engineStart)
 
     // Real-time dashboard refresh
     let onProgress: @Sendable (SyncProgress) -> Void = { progress in
-        let now = DispatchTime.now()
-        let elapsed = Double(now.uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000.0
+        let elapsed = elapsedSeconds(since: engineStart)
 
         let snapshot = engine.transferStatus
         let speedMB = snapshot.uploadSpeedBytesPerSecond / (1024.0 * 1024.0)
@@ -198,22 +290,38 @@ func main() async {
             onProgress: onProgress
         )
 
-        let totalElapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000.0
+        let syncCompleted = DispatchTime.now()
+        let engineElapsed = elapsedSeconds(from: engineStart, to: syncCompleted)
+        let applicationElapsed = elapsedSeconds(from: applicationStart, to: syncCompleted)
+        await uploadMetrics.drain()
+        let firstUploadRequestElapsed = uploadMetrics.firstRequestElapsed(since: applicationWallStart)
 
         print("\n\n================================================================================")
-        print("🎉 Upload benchmark completed")
+        if stats.filesFailed == 0 {
+            print("🎉 Upload benchmark completed successfully")
+        } else {
+            print("❌ Upload benchmark failed: \(stats.filesFailed) upload(s) failed")
+        }
         print("================================================================================")
-        print(String(format: "⏱️  Elapsed:                %.2f seconds", totalElapsed))
+        print(String(format: "⏱️  Start through sync completion: %.2f seconds", applicationElapsed))
+        print(String(format: "⏱️  Setup before SyncEngine:       %.2f seconds", setupElapsed))
+        print(String(format: "⏱️  SyncEngine sync window:    %.2f seconds", engineElapsed))
+        if let firstUploadRequestElapsed {
+            print(String(format: "🌐 First upload request start: %.2f seconds after application start", firstUploadRequestElapsed))
+        } else {
+            print("🌐 First upload request start: unavailable (no upload content request observed)")
+        }
+        print("ℹ️  Request start is URLSession's requestStartDate, not an exact first wire-byte timestamp.")
         print("📁 Remote directories created: \(stats.directoriesCreated)")
         print("📄 Files uploaded:             \(stats.filesUploaded)")
         print("❌ Upload failures:            \(stats.filesFailed)")
         print("⏭️  Files skipped:              \(stats.filesSkipped)")
         print("💾 Data uploaded:              \(formatBytes(stats.bytesUploaded)) (\(stats.bytesUploaded) bytes)")
 
-        let avgMBPerSec = totalElapsed > 0 ? (Double(stats.bytesUploaded) / (1024.0 * 1024.0)) / totalElapsed : 0.0
-        let avgFilesPerSec = totalElapsed > 0 ? Double(stats.filesUploaded) / totalElapsed : 0.0
-        print(String(format: "🚀 Average upload rate:     %.2f MB/s", avgMBPerSec))
-        print(String(format: "⚡ Average file throughput: %.1f files/s", avgFilesPerSec))
+        let avgMBPerSec = engineElapsed > 0 ? (Double(stats.bytesUploaded) / (1024.0 * 1024.0)) / engineElapsed : 0.0
+        let avgFilesPerSec = engineElapsed > 0 ? Double(stats.filesUploaded) / engineElapsed : 0.0
+        print(String(format: "📊 Sync-window aggregate:   %.2f MB/s", avgMBPerSec))
+        print(String(format: "📊 Sync-window aggregate:   %.1f uploaded files/s", avgFilesPerSec))
 
         let writerStats = await store.getWriterStats()
         print("🗄️  SQLite writes: \(writerStats.totalCommits) commits (average batch: \(String(format: "%.1f", writerStats.averageBatchSize)) operations)")
@@ -234,10 +342,12 @@ func main() async {
             print("💡 The remote directory and local database were preserved. Pass --clean to remove them automatically.")
         }
 
+        return stats.filesFailed == 0 ? 0 : 1
+
     } catch {
         print("\n\n❌ Upload failed: \(error)")
-        exit(1)
+        return 1
     }
 }
 
-await main()
+exit(await main())

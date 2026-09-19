@@ -79,8 +79,12 @@ public final class SyncEngine: Sendable {
     }
     private let logger = Logger(label: "gdrive.engine")
 
-    typealias IncrementalScan = @Sendable (ScanRequest, @escaping @Sendable (ScanBatch) async throws -> Void) async throws -> Void
-    private let incrementalScan: IncrementalScan
+    typealias DirectoryScan = @Sendable (ScanRequest, @escaping @Sendable (ScanBatch) async throws -> Void) async throws -> Void
+    typealias IncrementalScan = DirectoryScan
+    static let defaultDirectoryScan: DirectoryScan = { request, consume in
+        _ = try await DirectoryScanner().scan(request, consume: consume)
+    }
+    private let directoryScan: DirectoryScan
 
     public convenience init(
         auth: Auth,
@@ -90,9 +94,7 @@ public final class SyncEngine: Sendable {
         downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory
     ) async throws {
         try await self.init(auth: auth, store: store, client: client, idPool: idPool,
-            downloadTemporaryDirectory: downloadTemporaryDirectory, incrementalScan: { request, consume in
-            _ = try await DirectoryScanner().scan(request, consume: consume)
-        })
+            downloadTemporaryDirectory: downloadTemporaryDirectory, incrementalScan: Self.defaultDirectoryScan)
     }
 
     init(auth: Auth, store: StateStore? = nil, client: DriveClient? = nil, idPool: IDPool? = nil,
@@ -102,7 +104,7 @@ public final class SyncEngine: Sendable {
             throw SyncEngineError.general("The temporary download directory must be a local file path")
         }
         self.downloadTemporaryDirectoryStorage = OSAllocatedUnfairLock(initialState: downloadTemporaryDirectory)
-        self.incrementalScan = incrementalScan
+        self.directoryScan = incrementalScan
         self.auth = auth
         let effectiveClient = client ?? DriveClient(auth: auth)
         self.client = effectiveClient
@@ -603,9 +605,7 @@ public final class SyncEngine: Sendable {
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
-        let scanner = DirectoryScanner()
-
-        _ = try await scanner.scan(request) { batch in
+        try await directoryScan(request) { batch in
             struct BootstrapScanRecord: Sendable {
                 let type: EntryType
                 let metadata: FileMetadata?
@@ -2888,7 +2888,7 @@ public final class SyncEngine: Sendable {
         let sentFirstObservation = OSAllocatedUnfairLock(initialState: false)
 
         do {
-            try await incrementalScan(request) { batch in
+            try await directoryScan(request) { batch in
                 var pendingObservations: [IncrementalLocalObservation] = []
                 var firstObservationSent = sentFirstObservation.withLock { $0 }
                 var itemsInBatch: [DiscoveredRecord] = []

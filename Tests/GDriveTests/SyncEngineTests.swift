@@ -5,14 +5,14 @@ import Testing
 
 @Suite("SyncEngine Live Tests")
 struct SyncEngineTests {
-    @Test("Streaming localToRemoteEmpty sync with nested directories and small files")
-    func testLocalToRemoteEmptyStreamingSync() async throws {
+    @Test("localToRemoteEmpty round trip with nested directories and small files")
+    func testLocalToRemoteEmptyRoundTrip() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            print("Not configured rootID,Skip cloud testing")
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -46,7 +46,7 @@ struct SyncEngineTests {
             }
         }
 
-        // 3. run SyncEngine streaming upload
+        // 3. Run the initial local-to-remote upload.
         let testDbPath = "/tmp/test_sync_engine_\(UUID().uuidString.prefix(8)).sqlite"
         defer {
             for ext in ["", "-wal", "-shm"] {
@@ -127,13 +127,14 @@ struct SyncEngineTests {
         print("✅ Remote to local file content integrity verification 100% Passed!")
     }
 
-    @Test("Fast change detection skips 100% unchanged files without I/O or SHA-256")
+    @Test("Fast change detection skips all unchanged files")
     func testFastChangeSkippingOnUnchangedDirectory() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -143,10 +144,13 @@ struct SyncEngineTests {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
+        var initialSHAByName: [String: String] = [:]
         // Create 5 files
         for i in 1...5 {
             let f = tempDir.appendingPathComponent("file_\(i).txt")
-            try "Sample content for file \(i)\n".write(to: f, atomically: true, encoding: .utf8)
+            let content = Data("Sample content for file \(i)\n".utf8)
+            try content.write(to: f, options: .atomic)
+            initialSHAByName[f.lastPathComponent] = SyncEngine.computeSha256(of: content)
         }
 
         let remoteRootGenIds = try await client.generateIds(count: 1)
@@ -172,11 +176,29 @@ struct SyncEngineTests {
         let round1 = try await engine.syncLocalToRemoteEmpty(localPath: tempDir.path, remoteRootId: remoteRoot.id)
         #expect(round1.filesUploaded == 5)
         #expect(round1.filesSkipped == 0)
+        #expect(round1.filesFailed == 0)
+
+        let round1Remote = try await client.listChildren(parentId: remoteRoot.id)
+        #expect(round1Remote.count == 5)
+        #expect(Set(round1Remote.map(\.name)) == Set(initialSHAByName.keys))
+        var stableRemoteIDByName: [String: String] = [:]
+        for file in round1Remote {
+            stableRemoteIDByName[file.name] = file.id
+            #expect(file.sha256Checksum?.lowercased() == initialSHAByName[file.name])
+        }
 
         // Second round of synchronization (files unchanged):0 upload,5 all passed FastChangeDetector Skip quickly in memory!
         let round2 = try await engine.syncLocalToRemoteEmpty(localPath: tempDir.path, remoteRootId: remoteRoot.id)
         #expect(round2.filesUploaded == 0)
         #expect(round2.filesSkipped == 5)
+        #expect(round2.filesFailed == 0)
+        let round2Remote = try await client.listChildren(parentId: remoteRoot.id)
+        #expect(round2Remote.count == 5)
+        #expect(Set(round2Remote.map(\.name)) == Set(initialSHAByName.keys))
+        for file in round2Remote {
+            #expect(file.id == stableRemoteIDByName[file.name])
+            #expect(file.sha256Checksum?.lowercased() == initialSHAByName[file.name])
+        }
         print("✅ Second round of quick change skip rate: 100% (\(round2.filesSkipped)/5 Items skipped in seconds)")
 
         // Modify it 1 files, sync again
@@ -187,6 +209,13 @@ struct SyncEngineTests {
         #expect(round3.filesUploaded == 0)
         #expect(round3.filesFailed == 1)
         #expect(round3.filesSkipped == 4)
+        let round3Remote = try await client.listChildren(parentId: remoteRoot.id)
+        #expect(round3Remote.count == 5)
+        #expect(Set(round3Remote.map(\.name)) == Set(initialSHAByName.keys))
+        for file in round3Remote {
+            #expect(file.id == stableRemoteIDByName[file.name])
+            #expect(file.sha256Checksum?.lowercased() == initialSHAByName[file.name])
+        }
         print("✅ The third round of partial change detection: The remote text coverage has been blocked and skipped. 4 item")
     }
 
@@ -194,9 +223,10 @@ struct SyncEngineTests {
     func testIncrementalBidirectionalSync() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -299,7 +329,10 @@ struct SyncEngineTests {
     func testFileAndDirectoryLifecycleEvents() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else { return }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -406,10 +439,10 @@ struct SyncEngineTests {
     func testLargeFileResumableUpload() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            print("Not configured rootID,Skip cloud testing")
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -487,10 +520,10 @@ struct SyncEngineTests {
     func testLargeFileResumeInvalidatedWhenFileModified() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            print("Not configured rootID,Skip cloud testing")
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
@@ -508,6 +541,18 @@ struct SyncEngineTests {
             try writeHandle.write(contentsOf: chunkPattern)
         }
         try writeHandle.close()
+        let expectedSHA256 = try SyncEngine.computeFileSha256(at: largeFilePath).sha256Hex
+        let oldChunkPattern = Data(repeating: 0x44, count: 1024 * 1024)
+        var oldSHAContext = CC_SHA256_CTX()
+        CC_SHA256_Init(&oldSHAContext)
+        for _ in 0..<9 {
+            _ = oldChunkPattern.withUnsafeBytes {
+                CC_SHA256_Update(&oldSHAContext, $0.baseAddress, CC_LONG(oldChunkPattern.count))
+            }
+        }
+        var oldDigest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+        CC_SHA256_Final(&oldDigest, &oldSHAContext)
+        let oldExpectedSHA256 = oldDigest.map { String(format: "%02x", $0) }.joined()
 
         let remoteTestDirName = "sync_stale_\(UUID().uuidString.prefix(8))"
         let remoteRootGenIds = try await client.generateIds(count: 2)
@@ -518,6 +563,28 @@ struct SyncEngineTests {
             }
         }
 
+        // Seed a real, incomplete Drive session for the same preallocated object ID using
+        // different content. This covers changed-hash invalidation, not process-crash recovery.
+        let staleSessionURL = try await client.initiateResumableUpload(
+            name: "large_stale_9mb.bin",
+            parentId: remoteRoot.id,
+            remoteId: remoteRootGenIds[1],
+            totalBytes: 9 * 1024 * 1024
+        )
+        let stalePrefix = Data(repeating: 0x44, count: 4 * 1024 * 1024)
+        let staleChunkResult = try await client.uploadResumableChunk(
+            sessionURL: staleSessionURL,
+            chunkData: stalePrefix,
+            offset: 0,
+            totalBytes: 9 * 1024 * 1024
+        )
+        switch staleChunkResult {
+        case .incomplete(let confirmedOffset):
+            try #require(confirmedOffset == 4 * 1024 * 1024, "Drive must confirm the 4 MiB stale-session prefix.")
+        case .complete, .expired:
+            throw DriveError.invalidResponse(message: "Expected a live incomplete resumable session after uploading its 4 MiB prefix.")
+        }
+
         let testDbPath = "/tmp/test_sync_stale_\(UUID().uuidString.prefix(8)).sqlite"
         defer {
             for ext in ["", "-wal", "-shm"] {
@@ -526,10 +593,10 @@ struct SyncEngineTests {
         }
 
         let testStore = try await StateStore(path: testDbPath)
-        let fakeRemoteId = remoteRootGenIds[1]
+        let retainedRemoteID = remoteRootGenIds[1]
         let startPageToken = try await client.getStartPageToken()
 
-        // Defaults to an expired one with a mismatched hash inFlight session
+        // Persist the live partial session with the SHA-256 of its old, differing full input.
         try await testStore.write { conn in
             // Build first root and item
             _ = try conn.execute("""
@@ -550,8 +617,8 @@ struct SyncEngineTests {
                 local_device, local_inode, local_mtime, local_size, local_sha256,
                 local_generation, local_status, phase, dirty_generation, created_at, updated_at
             ) VALUES (
-                100, 1, 1, 'large_stale_9mb.bin', 'file', '\(fakeRemoteId)',
-                1, 1, 0, 9437184, '0000000000000000000000000000000000000000000000000000000000000000',
+                100, 1, 1, 'large_stale_9mb.bin', 'file', '\(retainedRemoteID)',
+                1, 1, 0, 9437184, '\(oldExpectedSHA256)',
                 1, 'present', 'inFlight', 1, 0, 0
             );
             INSERT INTO operations (
@@ -559,9 +626,9 @@ struct SyncEngineTests {
                 expected_sha256, target_remote_id, target_parent_remote_id,
                 session_uri, confirmed_offset, total_bytes, created_at, updated_at
             ) VALUES (
-                'resumable_\(fakeRemoteId)', 1, 100, 'uploadResumable', 'inFlight',
-                '0000000000000000000000000000000000000000000000000000000000000000', '\(fakeRemoteId)', '\(remoteRoot.id)',
-                'https://upload.invalid/stale_session', 4194304, 9437184, 0, 0
+                'resumable_\(retainedRemoteID)', 1, 100, 'uploadResumable', 'inFlight',
+                '\(oldExpectedSHA256)', '\(retainedRemoteID)', '\(remoteRoot.id)',
+                '\(staleSessionURL.absoluteString)', 4194304, 9437184, 0, 0
             );
             INSERT INTO cursors (
                 root_id, account_id, cursor_kind, token_value, updated_at
@@ -576,11 +643,85 @@ struct SyncEngineTests {
         print("🚀 [StaleSession] test file SHA-256 When changes are made, old breakpoints are safely invalidated and uploaded in full again....")
         let stats = try await engine.syncLocalToRemoteEmpty(localPath: tempDir.path, remoteRootId: remoteRoot.id)
         #expect(stats.filesUploaded == 1)
+        #expect(stats.filesFailed == 0)
+
+        struct StaleSessionResult {
+            let operationID: String
+            let operationItemID: Int64
+            let expectedSHA256: String?
+            let sessionURI: String?
+            let confirmedOffset: Int64
+            let totalBytes: Int64?
+            let operationState: String
+            let itemRemoteID: String?
+            let baseSHA256: String?
+            let localSHA256: String?
+            let remoteSHA256: String?
+            let localStatus: String
+            let remoteStatus: String
+            let phase: String
+            let dirtyGeneration: Int64
+        }
+        let persisted = try await testStore.read { conn -> StaleSessionResult in
+            let stmt = try conn.cachedStatement("""
+            SELECT op.operation_id, op.item_id, op.expected_sha256, op.session_uri,
+                   op.confirmed_offset, op.total_bytes, op.state,
+                   item.remote_file_id, item.base_sha256, item.local_sha256,
+                   item.remote_sha256, item.local_status, item.remote_status,
+                   item.phase, item.dirty_generation
+            FROM operations AS op
+            JOIN items AS item ON item.item_id = op.item_id
+            WHERE op.operation_id = ?;
+            """)
+            stmt.bindText("resumable_\(retainedRemoteID)", at: 1)
+            defer { stmt.reset() }
+            _ = try #require(try stmt.step(), "Expected the original resumable operation to remain persisted.")
+            return StaleSessionResult(
+                operationID: stmt.columnText(at: 0) ?? "",
+                operationItemID: stmt.columnInt64(at: 1) ?? -1,
+                expectedSHA256: stmt.columnText(at: 2),
+                sessionURI: stmt.columnText(at: 3),
+                confirmedOffset: stmt.columnInt64(at: 4) ?? -1,
+                totalBytes: stmt.columnInt64(at: 5),
+                operationState: stmt.columnText(at: 6) ?? "",
+                itemRemoteID: stmt.columnText(at: 7),
+                baseSHA256: stmt.columnText(at: 8),
+                localSHA256: stmt.columnText(at: 9),
+                remoteSHA256: stmt.columnText(at: 10),
+                localStatus: stmt.columnText(at: 11) ?? "",
+                remoteStatus: stmt.columnText(at: 12) ?? "",
+                phase: stmt.columnText(at: 13) ?? "",
+                dirtyGeneration: stmt.columnInt64(at: 14) ?? -1
+            )
+        }
+        let expectedOperationID = "resumable_\(retainedRemoteID)"
+        let expectedByteCount: Int64 = 9 * 1024 * 1024
+        #expect(persisted.operationID == expectedOperationID)
+        #expect(persisted.operationItemID == 100)
+        #expect(persisted.expectedSHA256?.lowercased() == expectedSHA256)
+        #expect(persisted.confirmedOffset == expectedByteCount)
+        let persistedTotalBytes = try #require(persisted.totalBytes)
+        #expect(persistedTotalBytes == expectedByteCount)
+        #expect(persisted.operationState == "completed")
+        let replacementSessionURI = try #require(persisted.sessionURI)
+        #expect(replacementSessionURI != staleSessionURL.absoluteString)
+        #expect(persisted.itemRemoteID == retainedRemoteID)
+        #expect(persisted.baseSHA256?.lowercased() == expectedSHA256)
+        #expect(persisted.localSHA256?.lowercased() == expectedSHA256)
+        #expect(persisted.remoteSHA256?.lowercased() == expectedSHA256)
+        #expect(persisted.localStatus == "present")
+        #expect(persisted.remoteStatus == "present")
+        #expect(persisted.phase == "committed")
+        #expect(persisted.dirtyGeneration == 0)
 
         // Verify cloud files
         let remoteChildren = try await client.listChildren(parentId: remoteRoot.id)
         #expect(remoteChildren.count == 1)
-        #expect(remoteChildren[0].sizeBytes == Int64(9 * 1024 * 1024))
+        let uploaded = try #require(remoteChildren.first)
+        #expect(uploaded.id == retainedRemoteID)
+        #expect(uploaded.name == "large_stale_9mb.bin")
+        #expect(uploaded.sizeBytes == expectedByteCount)
+        #expect(uploaded.sha256Checksum?.lowercased() == expectedSHA256)
         print("✅ [StaleSession] Dirty breakpoints are automatically and safely discarded, reset and uploaded successfully!")
     }
 
@@ -588,10 +729,10 @@ struct SyncEngineTests {
     func testUnifiedSyncAutoDetection() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            print("Not configured rootID,Skip cloud testing")
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 

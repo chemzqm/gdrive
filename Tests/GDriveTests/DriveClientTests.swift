@@ -9,10 +9,10 @@ struct DriveClientTests {
     func testFolderAndMultipartUpload() async throws {
         let auth = try Auth()
         let authData = await auth.authData()
-        guard let rootID = authData.rootID else {
-            print("Not configured rootID,Skip cloud testing")
-            return
-        }
+        let rootID = try #require(
+            authData.rootID,
+            "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
+        )
 
         let client = DriveClient(auth: auth)
 
