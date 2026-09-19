@@ -1,6 +1,6 @@
 # GDrive 外部接口调用指南 (Usage Guide)
 
-`GDrive` 是一个专为 macOS (14.0+) 设计的 Google Drive 双向流式同步库。核心架构采用 SQLite WAL 作为同步基线，结合 Darwin 原生 `DirectoryScanner` 进行极速文件树扫描与变更比对，依托预分配 ID 池和三方状态协调决策引擎（Reconciler）保证文件级最终一致性。
+`GDrive` 是一个面向 macOS (14.0+) 的 Google Drive 双向流式同步库。核心架构采用 SQLite WAL 作为同步基线，结合 `DirectoryScanner` 扫描文件树，以 SHA-256 比较内容变化，由三方状态协调决策引擎（Reconciler）决定同步操作。
 
 ---
 
@@ -16,6 +16,14 @@
         ├── 3. 网络传输 ──────→ DriveClient (Google Drive REST / Multipart / Resumable)
         └── 4. 同步调度 ──────→ SyncEngine (驱动初始同步与增量双向同步)
 ```
+
+`SyncEngine`、`SyncStats` 和 `SyncEngineError` 的公共定义集中在
+[`SyncEngineAPI.swift`](../Sources/GDrive/Engine/SyncEngineAPI.swift)，包括初始化、配置、
+状态查询和同步入口。[`SyncEngine.swift`](../Sources/GDrive/Engine/SyncEngine.swift) 负责内部路由，
+初始化与断点续传分别位于对应模式扩展，增量同步由
+[`IncrementalSyncRun.swift`](../Sources/GDrive/Engine/IncrementalSyncRun.swift) 及其阶段扩展实现。
+完整文件职责见 [架构设计](design.md)。
+调用方仍通过 `import GDrive` 使用下述接口，文件拆分不改变调用方式。
 
 ---
 
@@ -69,6 +77,10 @@ let client = DriveClient(auth: auth)
 let engine = try await SyncEngine(auth: auth, store: store, client: client)
 ```
 
+初始化时仅 `auth` 必填。`store`、`client` 和 `idPool` 均可省略，由引擎创建；
+需要共享已有组件时可显式传入。引擎通过同名只读属性公开这些组件，并通过 `monitor`
+公开传输监控器（快照读取见第 8 节）。
+
 ### 2.3 设置下载临时目录
 
 默认下载到 `~/.gdrive/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
@@ -111,7 +123,21 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 
 ## 3. 同步接口调用方法
 
-`SyncEngine` 提供了开箱即用的**统一同步入口**（内部自动探测状态并安全分流），同时也保留了底层明确意图的子接口：
+`SyncEngine` 提供统一入口 `sync`，也提供显式初始化和增量同步入口。
+所有同步入口均为 `async throws -> SyncStats`，支持可选的
+`onProgress: (@Sendable (SyncProgress) -> Void)?` 回调，默认 `nil`。
+回调不保证在主线程执行，更新 UI 时应切换到 `MainActor`。
+
+| 同步入口 | 并发参数 | 默认值 |
+| --- | --- | --- |
+| `sync` | `concurrency` | `64` |
+| `syncLocalToRemoteEmpty` | `maxUploadConcurrency` | `64` |
+| `syncRemoteToLocalEmpty` | `maxDownloadConcurrency` | `64` |
+| `syncIncremental`（两个重载） | `maxConcurrency` | `64` |
+
+所有入口共用进程内根目录锁：同一本地路径（展开 `~` 后）已有同步运行时，后续调用立即抛出
+`SyncEngineError.rootBusy(path:)`，不会排队等待；不同引擎实例也共享这一限制。
+调用方应合并同一根目录的重复触发。不同本地根可独立运行，该锁不提供跨进程互斥。
 
 ### 3.1 统一智能同步入口 (`sync`) 【推荐】
 
@@ -137,10 +163,10 @@ print("同步完成: 上传 \(stats.filesUploaded) 项, 下载 \(stats.filesDown
 ```
 
 - **自动决策流程**：
-  1. **已有基线**：自动执行增量双向同步 (`syncIncremental`)，毫秒级比对。
+  1. **已有基线**：已完成初始化时执行增量双向同步 (`syncIncremental`)；未完成时按记录的方向继续初始化。
   2. **首次同步**：
-     - 本地有文件且云端为空：自动路由至 `syncLocalToRemoteEmpty` 极速流式上传。
-     - 云端有文件且本地为空：自动路由至 `syncRemoteToLocalEmpty` 极速下载。
+     - 本地有文件且云端为空：自动路由至 `syncLocalToRemoteEmpty` 流式上传。
+     - 云端有文件且本地为空：自动路由至 `syncRemoteToLocalEmpty` 下载。
      - 双端均为空：自动初始化空基线。
      - 双端皆非空且无基线：抛出清晰异常拦截，杜绝盲合并导致覆盖已有文件。
 
@@ -159,14 +185,14 @@ let remoteRootId = "1UCWm-xg7Ih8LL9C64pKdZJcIBhwx-z36" // Google Drive 目标文
 let stats = try await engine.syncLocalToRemoteEmpty(
     localPath: localDir,
     remoteRootId: remoteRootId,
-    maxConcurrency: 16 // 传输并发数，默认 16
+    maxUploadConcurrency: 16 // 上传并发数，默认 64
 )
 
 print("初始上传完成:")
 print("  - 上传文件: \(stats.filesUploaded)")
 print("  - 上传字节: \(stats.bytesUploaded) bytes")
 print("  - 创建目录: \(stats.directoriesCreated)")
-print("  - 耗时: \(String(format: "%.2f", stats.durationSeconds))s")
+print("  - 耗时: \(String(format: "%.2f", stats.elapsedSeconds))s")
 ```
 
 - **特性**：采用“边扫描、边建目录、边上传”的流水线，首文件发现后立即开始网络请求，无需等待整树扫描完成。
@@ -174,7 +200,7 @@ print("  - 耗时: \(String(format: "%.2f", stats.durationSeconds))s")
 
 ---
 
-### 3.2 远端目录到本地空目录同步 (`syncRemoteToLocalEmpty`)
+#### (2) 远端目录到本地空目录同步 (`syncRemoteToLocalEmpty`)
 
 适用于新设备首次将云端已有目录完整下载至本地空目录。
 
@@ -185,7 +211,7 @@ let remoteRootId = "1UCWm-xg7Ih8LL9C64pKdZJcIBhwx-z36"
 let stats = try await engine.syncRemoteToLocalEmpty(
     localPath: emptyLocalDir,
     remoteRootId: remoteRootId,
-    maxDownloadConcurrency: 16 // 下载并发数，默认 16
+    maxDownloadConcurrency: 16 // 下载并发数，默认 64
 )
 
 print("初始下载完成:")
@@ -207,49 +233,65 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 let stats = try await engine.syncIncremental(
     localPath: localDir,
     remoteRootId: remoteRootId,
-    maxConcurrency: 16
+    maxConcurrency: 16 // 并发数，默认 64
 )
 
 print("增量同步完成:")
 print("  - 上传文件: \(stats.filesUploaded)")
 print("  - 下载文件: \(stats.filesDownloaded)")
 print("  - 删除项数: \(stats.filesDeleted)")
-print("  - 冲突保留: \(stats.conflicts)")
+print("  - 已解决冲突: \(stats.conflictsResolved)")
 print("  - 跳过未变: \(stats.filesSkipped)")
 ```
 
+已有 SQLite 根记录的调用方也可使用
+`syncIncremental(rootId:rootItemId:localPath:remoteRootId:maxConcurrency:onProgress:)` 重载。
+其中 `rootId` 和 `rootItemId` 为同一同步根的 SQLite 数字 ID，`remoteRootId` 为对应的
+Google Drive 文件夹 ID；通常使用上例按路径和远端 ID 调用的版本即可。
+
 - **三方仲裁（Reconciler）行为规范**：
-  1. **文件修改**：本地修改上传至云端；云端修改原子下载至本地。
+  1. **文件修改**：云端修改经校验后原子下载至本地。本地新文件可上传；已有远端文件的正文覆盖
+     当前受 A11 保护限制，会计入 `filesFailed` 并保留待同步状态及旧基线，详见 [A11 验收记录](a11-validation.md)。
   2. **文件/目录重命名与移动**：
-     - 本地重命名或移动：通过 Darwin `(device, inode)` 零传输秒级识别，仅向云端发送元数据 `PATCH` 更新名称或父级，**不重复上传文件正文**。
+     - 本地重命名或移动：通过 Darwin `(device, inode)` 识别，仅向云端发送元数据 `PATCH` 更新名称或父级，**不重复上传文件正文**。
      - 云端重命名或移动：通过 Changes 事件感知，本地直接在磁盘执行原子 `moveItem`，保持两端拓扑对齐。
   3. **删除与废纸篓保护**：
      - 云端删除项：本地优先调用 `FileManager.default.trashItem` 移入 macOS 系统废纸篓，杜绝硬删除丢失数据。
      - 本地删除项：云端调用 `trash(remoteId:)` 移入 Google Drive 回收站（`trashed: true`），两端皆可安全找回。
   4. **冲突解决**：
-     - 若双端同时修改且 SHA-256 摘要不同，双向保留版本（原路径保留胜者，另一方保存为 `... (Conflict <uuid>).ext` 副本），两端永久记录冲突标记，不丢任何数据。
-  5. **秒级快速比对**：
-     - 未修改的文件通过 `(dev, ino, mtime, size)` 缓存 100% 毫秒级跳过，不读盘、不算哈希。
+     - 若双端同时修改且 SHA-256 摘要不同，先保留并上传本地冲突副本，再将远端内容发布到原路径；
+       两项基线提交后才计入 `conflictsResolved`。失败时保留待恢复操作，见 [A12 验收记录](a12-validation.md)。
+  5. **未变文件缓存**：
+     - 文件身份、路径和元数据均命中缓存时，可跳过重复读取与哈希计算；内容变化仍以 SHA-256 判断。
 
 ---
 
 ## 4. 统计结果结构 (`SyncStats`)
 
-每次同步调用均返回不可变的 `SyncStats` 结构体：
+每次同步调用均返回本轮的 `SyncStats` 值，字段均为可读写的 `public var`，初始值为 `0`：
 
 ```swift
 public struct SyncStats: Sendable {
+    public var filesScanned: Int        // 扫描的文件数量
+    public var filesSkipped: Int        // 跳过的文件数量
+    public var directoriesCreated: Int  // 创建的目录总数
     public var filesUploaded: Int       // 成功上传的文件数量
     public var bytesUploaded: Int64     // 成功上传的总字节数
     public var filesDownloaded: Int     // 成功下载的文件数量
     public var bytesDownloaded: Int64   // 成功下载的总字节数
     public var filesDeleted: Int        // 本地/远端删除或移入回收站的项数
-    public var directoriesCreated: Int  // 创建的目录总数
-    public var filesSkipped: Int        // 秒级跳过的无变更文件数量
-    public var conflicts: Int           // 产生并妥善保留的冲突版本数量
-    public var durationSeconds: Double  // 本次同步耗时（秒）
+    public var conflictsResolved: Int   // 完成恢复或解决的冲突数量
+    public var remoteWorkPending: Int   // 留待后续同步轮次处理的远端工作数量
+    public var remoteNameConflicts: Int // 因本地等价名称而受阻的远端对象数量
+    public var filesFailed: Int         // 本轮处理失败的文件数量
+    public var elapsedSeconds: Double  // 本次同步耗时（秒）
 }
 ```
+
+调用成功返回不代表所有文件均已收敛：应同时检查 `filesFailed` 和 `remoteWorkPending`。
+`remoteWorkPending` 包含远端观察、目录分页等待处理工作，不是互不重复的文件数；非零时需在
+后续同步轮次继续处理。`remoteNameConflicts` 表示需要在远端重命名以消除的名称冲突。
+部分字段仅由相应同步模式填充，例如初始化模式不会填充 `filesScanned`。
 
 ---
 
@@ -339,15 +381,23 @@ let watcher = DirectoryWatcher(path: localDir) {
 
 ## 6. 异常与错误处理
 
-所有公开方法均为标准 Swift `async throws`。可能抛出的主要异常类型包括：
+初始化和同步入口使用 `async throws`；`setDownloadTemporaryDirectory(_:)` 为同步 `throws`，
+读取配置和传输快照不抛出异常。可能抛出的主要异常类型包括：
 
+- `SyncEngineError.rootBusy(path:)`：同一本地根在当前进程中已有同步运行，应合并重复触发。
+- `SyncEngineError.localRootNotFound(path:)`：增量同步的本地根消失或不再是目录，停止同步以保护远端数据。
+- `SyncEngineError.remoteRootLost(remoteId:reason:)`：远端同步根丢失、被移入回收站或不再是目录，停止同步以保护本地数据。
+- `SyncEngineError.general(_:)`：配置或同步保护条件不满足，具体原因见错误描述。
 - `DriveError.rateLimited(retryAfter:)`: Google Drive API 429 限流，包含建议退避等待时间。
 - `DriveError.checksumMismatch(expected:actual:)`: 数据下载或上传的 SHA-256 校验不匹配。
 - `DriveError.notFound(fileId:)`: 远端目录或文件不存在（404）。
+- `DriveError.unsafeOverwrite(fileId:)`：已有远端文件的正文覆盖被保护机制阻止。
 - `CocoaError`: 本地文件读写、权限或磁盘已满错误。
 - `NSError (domain: "SyncEngine")`: 核心状态机校验不通过（如目标路径非空、目录拓扑断链等）。
 
-建议在外部使用 `do-catch` 捕获并记录日志，针对临时性网络或限流错误进行指数退避重试。
+同步可能将单项传输错误记录在日志及 `SyncStats.filesFailed` 中并继续处理其他文件；
+调用方既要使用 `do-catch` 处理整轮失败，也要检查返回统计。临时性网络或限流错误可退避重试，
+根丢失、名称冲突和覆盖保护等情况需要先解决相应原因。
 
 ---
 
@@ -368,7 +418,9 @@ let watcher = DirectoryWatcher(path: localDir) {
 
 ## 8. 实时传输与速率监控 (`TransferSnapshot`)
 
-同步引擎内置了线程安全的 `TransferMonitor`，并在内存中每 500ms 自动采样并刷新一次最新状态。UI 或监控定时器可随时直接同步获取当前状态，耗时 0ms（无磁盘/无网络 I/O）：
+同步引擎内置了线程安全的 `TransferMonitor`，并在内存中每 500ms 自动采样并刷新一次最新状态。
+`transferStatus` 和 `getTransferStatus()` 均同步返回 `TransferSnapshot`，无需 `await` 或 `try`，
+读取过程不涉及磁盘或网络 I/O：
 
 ```swift
 // 直接从内存获取最新快照
