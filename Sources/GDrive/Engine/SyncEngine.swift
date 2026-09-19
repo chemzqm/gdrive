@@ -445,7 +445,7 @@ public final class SyncEngine: Sendable {
                             var createIntent: DurableCreateIntent?
                             do {
                                 let candidateRemoteId = try await self.idPool.nextId()
-                                let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
                                 let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
                                 let intent = try await DurableCreateIntentStore.prepareDirectory(
                                     store: self.store,
@@ -485,6 +485,7 @@ public final class SyncEngine: Sendable {
                                 await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
                                 progress.recordDirCreated()
                             } catch {
+                                await directoryTracker.markDirectoryFailed(relPath: relPath, error: error)
                                 if let createIntent {
                                     await DurableCreateIntentStore.markUnknownOutcome(
                                         store: self.store,
@@ -512,19 +513,25 @@ public final class SyncEngine: Sendable {
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
                         uploadGroup.enter()
                         Task {
+                            defer { uploadGroup.leave() }
                             var createIntent: DurableCreateIntent?
-                            // 先等待直接父目录在 Google Drive 远端就绪，避免空占并发上传槽位
-                            let remoteParentId = await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                            var didAcquireSemaphore = false
 
-                            await uploadSemaphore.wait()
                             defer {
+                                if didAcquireSemaphore {
+                                    uploadSemaphore.signal()
+                                }
                                 self.monitor.finishUpload(id: fullPath)
-                                uploadSemaphore.signal()
-                                uploadGroup.leave()
                                 notifier.addCompleted(files: 1, bytes: Int64(fileSize))
                             }
 
                             do {
+                                // 先等待直接父目录在 Google Drive 远端就绪，避免空占并发上传槽位
+                                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+
+                                await uploadSemaphore.wait()
+                                didAcquireSemaphore = true
+
                                 let fileURL = URL(fileURLWithPath: fullPath)
                                 let limit8MB: Int64 = 8 * 1024 * 1024
                                 let metaSize = Int64(record.metadata?.fileSize ?? 0)
@@ -771,9 +778,15 @@ public final class SyncEngine: Sendable {
         }
 
         // 5. 等待所有并发目录创建与上传完成
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            uploadGroup.notify(queue: .global(qos: .userInitiated)) {
-                cont.resume()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                uploadGroup.notify(queue: .global(qos: .userInitiated)) {
+                    cont.resume()
+                }
+            }
+        } onCancel: {
+            Task {
+                await directoryTracker.cancelAll()
             }
         }
 
