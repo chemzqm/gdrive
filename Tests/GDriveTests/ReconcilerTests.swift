@@ -103,8 +103,6 @@ struct ReconcilerTests {
         #expect(decision == .unchanged)
     }
 
-    // MARK: - A02 Specialized regression testing for audit issues (P05 - P08)
-
     @Test("P05 Regression: Baseline exists, L absent, R unknown -> waitingEvidence (refuses trashRemote without remote evidence)")
     func testP05AbsentUnknown() {
         let baseline = ItemBaseline(sha256: baseSha, size: 100)
