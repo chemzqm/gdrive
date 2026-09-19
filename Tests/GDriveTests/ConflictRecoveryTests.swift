@@ -124,7 +124,9 @@ struct ConflictRecoveryTests {
         configuration.protocolClasses = [ConflictProtocol.self]
         let client = DriveClient(auth: auth, session: URLSession(configuration: configuration))
         let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
-        let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }))
+        let engine = try await SyncEngine(auth: auth, store: store, client: client,
+            idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"))
         let first = try await engine.syncLocalToRemoteEmpty(localPath: local.path, remoteRootId: "root")
         #expect(first.filesUploaded == 1)
         let ids = try await store.read { conn -> (Int64, Int64, Int64, String) in
@@ -159,6 +161,7 @@ struct ConflictRecoveryTests {
             return q.columnInt64(at: 0)
         }
         #expect(committed == 2)
+        #expect(FileManager.default.fileExists(atPath: f.directory.appendingPathComponent("downloads/root").path))
     }
 
     @Test("One incremental round publishes both versions; next round transfers nothing")
@@ -222,7 +225,8 @@ struct ConflictRecoveryTests {
         #expect(pending.count == 1)
         #expect(pending.first?.id == op.id)
         #expect(pending.first?.copyRemoteID == "copy-id")
-        let engine = try await SyncEngine(auth: f.auth, store: reopened, client: f.client)
+        let engine = try await SyncEngine(auth: f.auth, store: reopened, client: f.client,
+            downloadTemporaryDirectory: f.engine.downloadTemporaryDirectory)
         let resumed = try await engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
         #expect(resumed.conflictsResolved == 1)
         try await assertConverged(f)

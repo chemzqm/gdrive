@@ -139,7 +139,25 @@ enum ConflictCheckpoint: String, Sendable, CaseIterable {
 
 extension SyncEngine {
     func resolveConflict(_ op: ConflictOperation,
+                         temporaryDirectory: URL? = nil,
                          checkpoint: (@Sendable (ConflictCheckpoint) throws -> Void)? = nil) async throws {
+        let downloadDirectory: URL
+        if let temporaryDirectory {
+            downloadDirectory = temporaryDirectory
+        } else {
+            let root = try await store.read { conn -> (String, String) in
+                let query = try conn.cachedStatement("SELECT remote_root_id, local_root_path FROM roots WHERE root_id = ?;")
+                defer { query.reset() }
+                query.bindInt64(op.rootID, at: 1)
+                guard try query.step(), let remoteID = query.columnText(at: 0),
+                      let localPath = query.columnText(at: 1) else {
+                    throw SyncEngineError.general("冲突恢复缺少同步根")
+                }
+                return (remoteID, localPath)
+            }
+            downloadDirectory = try await downloadStagingDirectory(remoteRootID: root.0,
+                localRoot: URL(fileURLWithPath: (root.1 as NSString).expandingTildeInPath))
+        }
         let original = URL(fileURLWithPath: op.originalPath)
         let copy = URL(fileURLWithPath: op.copyPath)
         try await store.read { try op.validatePlan($0) }
@@ -195,7 +213,7 @@ extension SyncEngine {
             }
             published = try await client.downloadFileSafely(remoteId: op.remoteID,
                 destinationURL: original, expectedSha256: op.remoteSHA,
-                expectedDestination: originalVersion, beforePublish: {
+                expectedDestination: originalVersion, temporaryDirectory: downloadDirectory, beforePublish: {
                     try input.version.validate(at: copy)
                     try await self.store.read { try op.validatePlan($0) }
                 })

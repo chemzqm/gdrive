@@ -4,7 +4,7 @@ import Foundation
 enum LocalFilePublication {
     /// Atomic namespace publication. Never remove the destination first.
     /// A race at the final exchange is detected on the displaced inode and its
-    /// bytes are preserved as a visible conflict file instead of being deleted.
+    /// bytes are preserved in the staging directory instead of being deleted.
     static func publish(_ temporaryURL: URL, to destination: URL, expected: LocalFileVersion?) throws -> LocalFileVersion {
         guard try LocalFileVersion.read(at: destination) == expected,
               let downloaded = try LocalFileVersion.read(at: temporaryURL) else {
@@ -13,7 +13,7 @@ enum LocalFilePublication {
         if let expected {
             // Use a dedicated recovery path: callers may clean their download
             // temporary path on failure, but must never delete displaced data.
-            let recovery = destination.appendingPathExtension("local-conflict-\(UUID().uuidString)")
+            let recovery = temporaryURL.appendingPathExtension("local-conflict-\(UUID().uuidString)")
             try FileManager.default.moveItem(at: temporaryURL, to: recovery)
             guard renameatx_np(AT_FDCWD, recovery.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) == 0 else {
                 let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
@@ -27,7 +27,7 @@ enum LocalFilePublication {
                 throw SyncEngineError.general("发布时本地文件发生并发变化，已保留原内容: \(recovery.path)")
             }
             // Keep the previous version recoverable (also preserves open writers).
-            // If Trash is unavailable, leave the visible conflict file in place.
+            // If Trash is unavailable, leave the recovery file outside the sync tree.
             var trashURL: NSURL?
             _ = try? FileManager.default.trashItem(at: recovery, resultingItemURL: &trashURL)
         } else {

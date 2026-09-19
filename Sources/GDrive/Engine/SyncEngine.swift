@@ -64,14 +64,42 @@ public final class SyncEngine: Sendable {
     public let store: StateStore
     public let client: DriveClient
     public let idPool: IDPool
+    /// Downloads stage under this directory's remote-root-ID subdirectory.
+    /// Keep it outside all sync roots and on the destination filesystem.
+    public var downloadTemporaryDirectory: URL { downloadTemporaryDirectoryStorage.withLock { $0 } }
+    private let downloadTemporaryDirectoryStorage: OSAllocatedUnfairLock<URL>
+
+    /// Applies to subsequent sync runs. Existing runs keep their selected directory.
+    public func setDownloadTemporaryDirectory(_ directory: URL) throws {
+        guard directory.isFileURL else { throw SyncEngineError.general("下载临时目录必须是本地文件路径") }
+        downloadTemporaryDirectoryStorage.withLock { $0 = directory }
+    }
     private let logger = Logger(label: "gdrive.engine")
 
-    public init(
+    typealias IncrementalScan = @Sendable (ScanRequest, @escaping @Sendable (ScanBatch) async throws -> Void) async throws -> Void
+    private let incrementalScan: IncrementalScan
+
+    public convenience init(
         auth: Auth,
         store: StateStore? = nil,
         client: DriveClient? = nil,
-        idPool: IDPool? = nil
+        idPool: IDPool? = nil,
+        downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory
     ) async throws {
+        try await self.init(auth: auth, store: store, client: client, idPool: idPool,
+            downloadTemporaryDirectory: downloadTemporaryDirectory, incrementalScan: { request, consume in
+            _ = try await DirectoryScanner().scan(request, consume: consume)
+        })
+    }
+
+    init(auth: Auth, store: StateStore? = nil, client: DriveClient? = nil, idPool: IDPool? = nil,
+         downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
+         incrementalScan: @escaping IncrementalScan) async throws {
+        guard downloadTemporaryDirectory.isFileURL else {
+            throw SyncEngineError.general("下载临时目录必须是本地文件路径")
+        }
+        self.downloadTemporaryDirectoryStorage = OSAllocatedUnfairLock(initialState: downloadTemporaryDirectory)
+        self.incrementalScan = incrementalScan
         self.auth = auth
         let effectiveClient = client ?? DriveClient(auth: auth)
         self.client = effectiveClient
@@ -1035,6 +1063,8 @@ public final class SyncEngine: Sendable {
             throw NSError(domain: "SyncEngine", code: 10, userInfo: [NSLocalizedDescriptionKey: "远端目标不是有效目录: \(remoteRootId)"])
         }
 
+        let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
+
         // 确保本地目录存在且为空
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir) {
@@ -1193,6 +1223,7 @@ public final class SyncEngine: Sendable {
                                 destinationURL: itemLocalURL,
                                 expectedSha256: item.sha256Checksum,
                                 expectedDestination: nil,
+                                temporaryDirectory: downloadDirectory,
                                 onProgress: { delta in
                                     self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
                                 }
@@ -1720,6 +1751,8 @@ public final class SyncEngine: Sendable {
             throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "notDirectory")
         }
 
+        let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
+
         // Recover before Changes/scanning can mistake intermediate publications for new input.
         let pendingConflicts = try await ConflictOperation.pending(store: store, rootID: rootId)
         let recoveredConflicts = pendingConflicts.count
@@ -1728,7 +1761,7 @@ public final class SyncEngine: Sendable {
                 let limit = max(1, min(64, maxConcurrency))
                 for (index, op) in pendingConflicts.enumerated() {
                     if index >= limit { try await group.next() }
-                    group.addTask { try await self.resolveConflict(op) }
+                    group.addTask { try await self.resolveConflict(op, temporaryDirectory: downloadDirectory) }
                 }
                 try await group.waitForAll()
             }
@@ -1747,24 +1780,35 @@ public final class SyncEngine: Sendable {
             private var dirRemoteIds: [Int64: String] = [:]     // item_id -> remote_file_id
             private var dirIdByRemote: [String: Int64] = [:]    // remote_file_id -> item_id
             private var dirIdByRelPath: [String: Int64] = [:]   // relPath -> item_id
+            private var readyDirectories: Set<Int64> = []
             private var lock = os_unfair_lock()
 
             init(rootItemId: Int64, remoteRootId: String) {
+                readyDirectories.insert(rootItemId)
                 dirPaths[rootItemId] = ""
                 dirRemoteIds[rootItemId] = remoteRootId
                 dirIdByRemote[remoteRootId] = rootItemId
                 dirIdByRelPath[""] = rootItemId
             }
 
-            func register(itemId: Int64, parentItemId: Int64, name: String, remoteId: String) {
+            func register(itemId: Int64, parentItemId: Int64, name: String, remoteId: String, remotePresent: Bool = true) {
                 os_unfair_lock_lock(&lock)
                 defer { os_unfair_lock_unlock(&lock) }
+                if remotePresent && readyDirectories.contains(parentItemId) {
+                    readyDirectories.insert(itemId)
+                } else { readyDirectories.remove(itemId) }
                 let parentPath = dirPaths[parentItemId] ?? ""
                 let relPath = parentPath.isEmpty ? name : "\(parentPath)/\(name)"
                 dirPaths[itemId] = relPath
                 dirRemoteIds[itemId] = remoteId
                 dirIdByRemote[remoteId] = itemId
                 dirIdByRelPath[relPath] = itemId
+            }
+
+            func isReady(_ itemID: Int64) -> Bool {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return readyDirectories.contains(itemID)
             }
 
             func getRelPath(for itemId: Int64) -> String? {
@@ -1797,18 +1841,18 @@ public final class SyncEngine: Sendable {
         // 从 SQLite 加载已知的所有目录
         try await store.read { conn in
             let stmt = try conn.cachedStatement("""
-            SELECT item_id, parent_id, name, remote_file_id
+            SELECT item_id, parent_id, name, remote_file_id, remote_status
             FROM items
             WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
             """)
             stmt.bindInt64(rootId, at: 1)
-            var rawDirs: [(id: Int64, parentId: Int64, name: String, remoteId: String)] = []
+            var rawDirs: [(id: Int64, parentId: Int64, name: String, remoteId: String, present: Bool)] = []
             while try stmt.step() {
                 if let id = stmt.columnInt64(at: 0),
                    let parentId = stmt.columnInt64(at: 1),
                    let name = stmt.columnText(at: 2),
                    let rId = stmt.columnText(at: 3) {
-                    rawDirs.append((id, parentId, name, rId))
+                    rawDirs.append((id, parentId, name, rId, stmt.columnText(at: 4) == "present"))
                 }
             }
             stmt.reset()
@@ -1820,7 +1864,7 @@ public final class SyncEngine: Sendable {
                 let countBefore = remaining.count
                 remaining.removeAll { dir in
                     if registered.contains(dir.parentId) {
-                        dirContext.register(itemId: dir.id, parentItemId: dir.parentId, name: dir.name, remoteId: dir.remoteId)
+                        dirContext.register(itemId: dir.id, parentItemId: dir.parentId, name: dir.name, remoteId: dir.remoteId, remotePresent: dir.present)
                         registered.insert(dir.id)
                         return true
                     }
@@ -1829,9 +1873,654 @@ public final class SyncEngine: Sendable {
                 if remaining.count == countBefore {
                     // 若存在孤立项则按根目录兜底
                     for dir in remaining {
-                        dirContext.register(itemId: dir.id, parentItemId: rootItemId, name: dir.name, remoteId: dir.remoteId)
+                        dirContext.register(itemId: dir.id, parentItemId: rootItemId, name: dir.name, remoteId: dir.remoteId, remotePresent: false)
                     }
                     break
+                }
+            }
+        }
+
+        struct DirtyRecord: Sendable {
+            let itemId: Int64
+            let parentId: Int64
+            let name: String
+            let remoteFileId: String?
+            let entryKind: String
+            let baseline: ItemBaseline?
+            let local: LocalObservation?
+            let remote: RemoteObservation?
+            let pendingCreate: DurableCreateIntent?
+            let localGeneration: Int64
+            let remoteGeneration: Int64
+            let dirtyGeneration: Int64
+            let localDevice: Int64?
+            let localInode: Int64?
+            let localMtime: Int64?
+        }
+
+        @Sendable func loadDirtyItems(_ ids: [Int64]? = nil) async throws -> [DirtyRecord] {
+            // CROSS JOIN fixes the driving side to this window. An IN filter can otherwise
+            // choose idx_items_dirty and rescan every remaining dirty item for each batch.
+            let source = ids == nil ? "items" : "json_each(?2) selected CROSS JOIN items ON items.item_id = selected.value"
+            let encodedIDs = ids.map { "[" + $0.map(String.init).joined(separator: ",") + "]" }
+            return try await store.read { conn in
+                let stmt = try conn.cachedStatement("""
+                SELECT items.item_id, items.parent_id, items.name, items.remote_file_id, items.entry_kind,
+                       items.base_sha256, items.base_size,
+                       items.local_sha256, items.local_size, items.local_status,
+                       items.remote_sha256, items.remote_size, items.remote_status,
+                       op.operation_id, op.target_remote_id, op.target_parent_remote_id,
+                       op.expected_local_generation, op.expected_sha256, op.total_bytes,
+                       items.local_generation, items.remote_generation, items.dirty_generation,
+                       items.local_device, items.local_inode, items.local_mtime
+                FROM \(source)
+                LEFT JOIN operations op ON op.operation_id = (
+                    SELECT candidate.operation_id
+                    FROM operations candidate
+                    WHERE candidate.item_id = items.item_id
+                      AND candidate.operation_type IN ('createDirectory', 'uploadMultipart')
+                      AND candidate.state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
+                    ORDER BY candidate.created_at DESC
+                    LIMIT 1
+                )
+                WHERE items.root_id = ?1 AND items.dirty_generation > 0 AND items.is_tombstone = 0;
+                """)
+                stmt.bindInt64(rootId, at: 1)
+                if let encodedIDs { stmt.bindText(encodedIDs, at: 2) }
+                var records: [DirtyRecord] = []
+                while try stmt.step() {
+                    guard let iId = stmt.columnInt64(at: 0),
+                          let pId = stmt.columnInt64(at: 1),
+                          let name = stmt.columnText(at: 2) else { continue }
+                    let rFileId = stmt.columnText(at: 3)
+                    let kind = stmt.columnText(at: 4) ?? "file"
+
+                    let bSha = stmt.columnText(at: 5)
+                    let bSize = stmt.columnInt64(at: 6)
+                    let baseline: ItemBaseline? = (bSha != nil) ? ItemBaseline(sha256: bSha, size: bSize) : nil
+
+                    let lSha = stmt.columnText(at: 7)
+                    let lSize = stmt.columnInt64(at: 8)
+                    let lStatusStr = stmt.columnText(at: 9) ?? "unknown"
+                    let lStatus = LocalObservation.Status(rawValue: lStatusStr) ?? .unknown
+                    let local = LocalObservation(status: lStatus, sha256: lSha, size: lSize)
+
+                    let rSha = stmt.columnText(at: 10)
+                    let rSize = stmt.columnInt64(at: 11)
+                    let rStatusStr = stmt.columnText(at: 12) ?? "unknown"
+                    let rStatus = RemoteObservation.Status(rawValue: rStatusStr) ?? .unknown
+                    let remote = RemoteObservation(status: rStatus, sha256: rSha, size: rSize)
+
+                    let pendingCreate: DurableCreateIntent?
+                    if let operationID = stmt.columnText(at: 13),
+                       let targetRemoteID = stmt.columnText(at: 14),
+                       let targetParentRemoteID = stmt.columnText(at: 15) {
+                        pendingCreate = DurableCreateIntent(
+                            operationID: operationID,
+                            itemID: iId,
+                            targetRemoteID: targetRemoteID,
+                            targetParentRemoteID: targetParentRemoteID,
+                            expectedLocalGeneration: stmt.columnInt64(at: 16) ?? 0,
+                            expectedSHA256: stmt.columnText(at: 17),
+                            totalBytes: stmt.columnInt64(at: 18)
+                        )
+                    } else {
+                        pendingCreate = nil
+                    }
+
+                    records.append(DirtyRecord(
+                        itemId: iId, parentId: pId, name: name, remoteFileId: rFileId,
+                        entryKind: kind, baseline: baseline, local: local, remote: remote,
+                        pendingCreate: pendingCreate,
+                        localGeneration: stmt.columnInt64(at: 19) ?? 0,
+                        remoteGeneration: stmt.columnInt64(at: 20) ?? 0,
+                        dirtyGeneration: stmt.columnInt64(at: 21) ?? 0,
+                        localDevice: stmt.columnInt64(at: 22),
+                        localInode: stmt.columnInt64(at: 23),
+                        localMtime: stmt.columnInt64(at: 24)
+                    ))
+                }
+                stmt.reset()
+                return records
+            }
+        }
+
+        let effectiveSyncConcurrency = max(1, min(64, maxConcurrency))
+        let syncSemaphore = AsyncSemaphore(count: effectiveSyncConcurrency)
+        let syncGroup = DispatchGroup()
+
+        final class ActionTracker: @unchecked Sendable {
+            struct Counts {
+                var uploaded = 0
+                var bytesUp: Int64 = 0
+                var downloaded = 0
+                var bytesDown: Int64 = 0
+                var deleted = 0
+            }
+            let counts = OSAllocatedUnfairLock(initialState: Counts())
+            var uploaded: Int { counts.withLock { $0.uploaded } }
+            var bytesUp: Int64 { counts.withLock { $0.bytesUp } }
+            var downloaded: Int { counts.withLock { $0.downloaded } }
+            var bytesDown: Int64 { counts.withLock { $0.bytesDown } }
+            var deleted: Int { counts.withLock { $0.deleted } }
+            let conflicts = OSAllocatedUnfairLock(initialState: 0)
+            let failures = OSAllocatedUnfairLock(initialState: 0)
+        }
+        let actionTracker = ActionTracker()
+
+        // A failed early attempt remains dirty, but is not retried again by the final sweep.
+        let scheduled = OSAllocatedUnfairLock(initialState: Set<Int64>())
+        let startedTransfers = OSAllocatedUnfairLock(initialState: false)
+        @Sendable func drainTransfers() async {
+            // Keep no-change scans free of the new streaming phase's queue hops.
+            guard startedTransfers.withLock({ $0 }) else { return }
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                syncGroup.notify(queue: .global(qos: .userInitiated)) { cont.resume() }
+            }
+        }
+
+        @Sendable func acquireTransfer() async throws {
+            try Task.checkCancellation()
+            await syncSemaphore.wait()
+            if Task.isCancelled {
+                syncSemaphore.signal()
+                throw CancellationError()
+            }
+            startedTransfers.withLock { $0 = true }
+        }
+
+        @Sendable func scheduleFiles(_ fileItems: [DirtyRecord], duringScan: Bool) async throws {
+            var receipts: [@Sendable (SQLiteConnection) throws -> Void] = []
+            for item in fileItems {
+                let parent = dirContext.getRelPath(for: item.parentId) ?? ""
+                let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
+                guard !remoteGate.blocks(path) else { continue }
+                // Pending parent creation must recover before any child request is sent.
+                if duringScan && !dirContext.isReady(item.parentId) { continue }
+                let decision: ReconcileDecision
+                if item.pendingCreate != nil {
+                    decision = .upload(reason: "恢复已持久化的小文件创建意图")
+                } else {
+                    decision = Reconciler.decide(baseline: item.baseline, local: item.local, remote: item.remote)
+                }
+
+                // Deletions and conflict copies require the completed local inventory.
+                if duringScan {
+                    switch decision {
+                    case .upload, .download, .keepModified, .matchUpdateBaseline, .unchanged: break
+                    default: continue
+                    }
+                }
+                guard !scheduled.withLock({ $0.contains(item.itemId) }) else { continue }
+                if duringScan {
+                    switch decision {
+                    case .upload, .download, .keepModified:
+                        scheduled.withLock { _ = $0.insert(item.itemId) }
+                    default: break
+                    }
+                }
+                try Task.checkCancellation()
+                switch decision {
+                case .upload, .keepModified(preferLocal: true):
+                    let upBytes = item.local?.size ?? 0
+                    notifier.addDiscovered(files: 1, bytes: upBytes)
+                    try await acquireTransfer()
+                    self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
+                    syncGroup.enter()
+                    Task {
+                        var createIntent = item.pendingCreate
+                        defer {
+                            self.monitor.finishUpload(id: item.name)
+                            syncSemaphore.signal()
+                            syncGroup.leave()
+                            notifier.addCompleted(files: 1, bytes: upBytes)
+                        }
+
+                        do {
+                            let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
+                            let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
+                            let localFileURL = rootURL.appendingPathComponent(relPath)
+                            let remoteParentId = dirContext.getRemoteId(for: item.parentId) ?? remoteRootId
+
+                            if createIntent == nil, let remoteID = item.remoteFileId {
+                                throw DriveError.unsafeOverwrite(fileId: remoteID)
+                            }
+
+                            // 若远端父目录此前被移入回收站，在上传子文件前自动恢复父目录
+                            if let parentRId = dirContext.getRemoteId(for: item.parentId) {
+                                let isParentTrashed: Bool = (try? await self.store.read { conn in
+                                    let stmt = try conn.cachedStatement("SELECT remote_status FROM items WHERE item_id = ?;")
+                                    stmt.bindInt64(item.parentId, at: 1)
+                                    defer { stmt.reset() }
+                                    if try stmt.step(), let st = stmt.columnText(at: 0) {
+                                        return st == "trashed"
+                                    }
+                                    return false
+                                }) ?? false
+
+                                if isParentTrashed {
+                                    do {
+                                        try await self.client.untrash(remoteId: parentRId)
+                                        try await self.store.write { conn in
+                                            let stmt = try conn.cachedStatement("UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;")
+                                            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                                            stmt.bindInt64(item.parentId, at: 2)
+                                            _ = try stmt.step()
+                                        }
+                                    } catch {
+                                        self.logger.error("恢复远端父目录失败 [\(parentRId)]: \(error)")
+                                    }
+                                }
+                            }
+
+                            let fSize: Int64
+                            let sha256Hex: String
+                            if let s = item.local?.sha256, let sz = item.local?.size {
+                                sha256Hex = s
+                                fSize = sz
+                            } else {
+                                let res = try SyncEngine.computeFileSha256(at: localFileURL)
+                                sha256Hex = res.sha256Hex
+                                fSize = res.fileSize
+                            }
+                            self.monitor.startUpload(id: item.name, name: item.name, totalBytes: fSize)
+
+                            let input = try StableUploadInput.capture(at: localFileURL)
+                            guard input.size == fSize, input.sha256 == sha256Hex else {
+                                throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                            }
+                            let fileData = try input.data ?? Data(contentsOf: input.fileURL)
+                            let mtime = input.version.mtime
+                            let dev = input.version.device
+                            let ino = input.version.inode
+                            let uploadedFile: DriveFile
+                            if let pending = createIntent {
+                                guard let expectedSHA256 = pending.expectedSHA256,
+                                      expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
+                                      pending.totalBytes == fSize else {
+                                    throw SyncEngineError.general("未完成的小文件创建意图输入已变化: \(item.name)")
+                                }
+                                uploadedFile = try await self.client.uploadMultipart(
+                                    name: item.name,
+                                    parentId: pending.targetParentRemoteID,
+                                    remoteId: pending.targetRemoteID,
+                                    content: fileData,
+                                    expectedSha256: sha256Hex
+                                )
+                            } else if let existingRemoteId = item.remoteFileId {
+                                uploadedFile = try await self.client.updateMultipart(
+                                    remoteId: existingRemoteId,
+                                    content: fileData,
+                                    expectedSha256: sha256Hex
+                                )
+                            } else {
+                                let newRemoteId = try await self.idPool.nextId()
+                                let prepared = try await DurableCreateIntentStore.prepareMultipartUpload(
+                                    store: self.store,
+                                    rootID: rootId,
+                                    itemID: item.itemId,
+                                    parentItemID: item.parentId,
+                                    name: item.name,
+                                    targetParentRemoteID: remoteParentId,
+                                    candidateRemoteID: newRemoteId,
+                                    device: dev,
+                                    inode: ino,
+                                    mtime: Int64(mtime),
+                                    size: fSize,
+                                    sha256: sha256Hex
+                                )
+                                createIntent = prepared
+                                uploadedFile = try await self.client.uploadMultipart(
+                                    name: item.name,
+                                    parentId: prepared.targetParentRemoteID,
+                                    remoteId: prepared.targetRemoteID,
+                                    content: fileData,
+                                    expectedSha256: sha256Hex
+                                )
+                            }
+
+                            let completedCreateIntent = createIntent
+                            try input.version.validate(at: localFileURL)
+                            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+                            try await self.store.batchWrite { conn in
+                                guard (try? LocalFileVersion.read(at: localFileURL)) == input.version else { return }
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET
+                                    remote_file_id = ?,
+                                    local_device = ?,
+                                    local_inode = ?,
+                                    local_mtime = ?,
+                                    local_size = ?,
+                                    base_sha256 = ?,
+                                    base_size = ?,
+                                    remote_sha256 = ?,
+                                    remote_size = ?,
+                                    remote_status = 'present',
+                                    phase = 'committed',
+                                    dirty_generation = 0,
+                                    updated_at = ?
+                                WHERE item_id = ? AND local_generation = ?
+                                    AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                                """)
+                                stmt.bindText(uploadedFile.id, at: 1)
+                                stmt.bindInt64(dev, at: 2)
+                                stmt.bindInt64(ino, at: 3)
+                                stmt.bindInt64(Int64(mtime), at: 4)
+                                stmt.bindInt64(fSize, at: 5)
+                                stmt.bindText(sha256Hex, at: 6)
+                                stmt.bindInt64(fSize, at: 7)
+                                stmt.bindText(sha256Hex, at: 8)
+                                stmt.bindInt64(fSize, at: 9)
+                                stmt.bindDouble(now, at: 10)
+                                stmt.bindInt64(item.itemId, at: 11)
+                                stmt.bindInt64(item.localGeneration, at: 12)
+                                stmt.bindInt64(item.remoteGeneration, at: 13)
+                                stmt.bindInt64(item.dirtyGeneration, at: 14)
+                                _ = try stmt.step()
+                                stmt.reset()
+                                guard conn.changes == 1 else { return }
+                                receiptApplied.withLock { $0 = true }
+                                if let createIntent = completedCreateIntent {
+                                    try DurableCreateIntentStore.completeOperation(
+                                        conn: conn,
+                                        operationID: createIntent.operationID,
+                                        now: now
+                                    )
+                                }
+                            }
+
+                            guard receiptApplied.withLock({ $0 }) else {
+                                throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(item.name)")
+                            }
+
+                            scheduled.withLock { _ = $0.remove(item.itemId) }
+                            actionTracker.counts.withLock { $0.uploaded += 1; $0.bytesUp += fSize }
+                        } catch {
+                            actionTracker.failures.withLock { $0 += 1 }
+                            if let createIntent {
+                                await DurableCreateIntentStore.markUnknownOutcome(
+                                    store: self.store,
+                                    operationID: createIntent.operationID,
+                                    error: error
+                                )
+                            }
+                            if case DriveError.unsafeOverwrite = error {
+                                try? await self.store.batchWrite { conn in
+                                    let stmt = try conn.cachedStatement("""
+                                    UPDATE items SET phase = 'blocked'
+                                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                                    """)
+                                    stmt.bindInt64(item.itemId, at: 1)
+                                    stmt.bindInt64(item.localGeneration, at: 2)
+                                    stmt.bindInt64(item.remoteGeneration, at: 3)
+                                    stmt.bindInt64(item.dirtyGeneration, at: 4)
+                                    _ = try stmt.step()
+                                    stmt.reset()
+                                }
+                            }
+                            self.logger.error("增量上传失败 [\(item.name)]: \(error)")
+                        }
+                    }
+
+                case .download, .keepModified(preferLocal: false):
+                    let downId = item.remoteFileId ?? item.name
+                    let downSize = item.remote?.size ?? 0
+                    notifier.addDiscovered(files: 1, bytes: downSize)
+                    try await acquireTransfer()
+                    self.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
+                    syncGroup.enter()
+                    Task {
+                        defer {
+                            self.monitor.finishDownload(id: downId)
+                            syncSemaphore.signal()
+                            syncGroup.leave()
+                            notifier.addCompleted(files: 1, bytes: downSize)
+                        }
+
+                        do {
+                            guard let remoteFileId = item.remoteFileId else { return }
+                            let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
+                            let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
+                            let localFileURL = rootURL.appendingPathComponent(relPath)
+
+                            // 确保本地目标父目录存在
+                            try? FileManager.default.createDirectory(at: localFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+
+                            let expectedDestination = try LocalFileVersion.read(at: localFileURL)
+                            if item.local?.status == .present {
+                                guard let expectedDestination,
+                                      expectedDestination.device == item.localDevice,
+                                      expectedDestination.inode == item.localInode,
+                                      expectedDestination.mtime == item.localMtime,
+                                      expectedDestination.size == item.local?.size else {
+                                    throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                                }
+                            } else if expectedDestination != nil {
+                                throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                            }
+                            self.monitor.startDownload(id: downId, name: item.name, totalBytes: downSize)
+                            let published = try await self.client.downloadFileSafely(
+                                remoteId: remoteFileId,
+                                destinationURL: localFileURL,
+                                expectedSha256: item.remote?.sha256,
+                                expectedDestination: expectedDestination,
+                                temporaryDirectory: downloadDirectory,
+                                beforePublish: {
+                                    let current = try await self.store.read { conn in
+                                        let stmt = try conn.cachedStatement("""
+                                        SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
+                                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                                        """)
+                                        defer { stmt.reset() }
+                                        stmt.bindInt64(item.itemId, at: 1)
+                                        stmt.bindInt64(item.localGeneration, at: 2)
+                                        stmt.bindInt64(item.remoteGeneration, at: 3)
+                                        stmt.bindInt64(item.dirtyGeneration, at: 4)
+                                        return try stmt.step()
+                                    }
+                                    guard current else {
+                                        throw SyncEngineError.general("下载计划已过期，保留本地文件: \(item.name)")
+                                    }
+                                },
+                                onProgress: { delta in
+                                    self.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
+                                }
+                            )
+
+                            let fSize = published.size
+                            let mtime = published.mtime
+
+                            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+                            try await self.store.batchWrite { conn in
+                                guard (try? LocalFileVersion.read(at: localFileURL)) == published else { return }
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET
+                                    local_sha256 = remote_sha256,
+                                    local_size = remote_size,
+                                    local_mtime = ?,
+                                    local_device = ?,
+                                    local_inode = ?,
+                                    local_status = 'present',
+                                    remote_status = 'present',
+                                    base_sha256 = remote_sha256,
+                                    base_size = remote_size,
+                                    phase = 'committed',
+                                    dirty_generation = 0,
+                                    updated_at = ?
+                                WHERE item_id = ? AND local_generation = ?
+                                    AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                                """)
+                                stmt.bindInt64(Int64(mtime), at: 1)
+                                stmt.bindInt64(published.device, at: 2)
+                                stmt.bindInt64(published.inode, at: 3)
+                                stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
+                                stmt.bindInt64(item.itemId, at: 5)
+                                stmt.bindInt64(item.localGeneration, at: 6)
+                                stmt.bindInt64(item.remoteGeneration, at: 7)
+                                stmt.bindInt64(item.dirtyGeneration, at: 8)
+                                _ = try stmt.step()
+                                stmt.reset()
+                                guard conn.changes == 1 else { return }
+                                receiptApplied.withLock { $0 = true }
+                            }
+                            guard receiptApplied.withLock({ $0 }) else {
+                                throw SyncEngineError.general("下载回执已过期，保留新一代待同步状态: \(item.name)")
+                            }
+
+                            scheduled.withLock { _ = $0.remove(item.itemId) }
+                            actionTracker.counts.withLock { $0.downloaded += 1; $0.bytesDown += fSize }
+                        } catch {
+                            actionTracker.failures.withLock { $0 += 1 }
+                            self.logger.error("增量下载失败 [\(item.name)]: \(error)")
+                        }
+                    }
+
+                case .matchUpdateBaseline(let sha, let size):
+                    receipts.append { conn in
+                        let stmt = try conn.cachedStatement("""
+                        UPDATE items SET
+                            base_sha256 = ?,
+                            base_size = ?,
+                            remote_status = 'present',
+                            local_status = 'present',
+                            phase = 'committed',
+                            dirty_generation = 0,
+                            updated_at = ?
+                        WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                        """)
+                        stmt.bindText(sha, at: 1)
+                        stmt.bindInt64(size, at: 2)
+                        stmt.bindDouble(now, at: 3)
+                        stmt.bindInt64(item.itemId, at: 4)
+                        stmt.bindInt64(item.localGeneration, at: 5)
+                        stmt.bindInt64(item.remoteGeneration, at: 6)
+                        stmt.bindInt64(item.dirtyGeneration, at: 7)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+
+                case .trashRemote:
+                    try await acquireTransfer()
+                    syncGroup.enter()
+                    Task {
+                        defer {
+                            syncSemaphore.signal()
+                            syncGroup.leave()
+                        }
+                        do {
+                            if let rId = item.remoteFileId {
+                                try await self.client.trash(remoteId: rId)
+                            }
+                            try await self.store.batchWrite { conn in
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                """)
+                                stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                                stmt.bindInt64(item.itemId, at: 2)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
+                            actionTracker.counts.withLock { $0.deleted += 1 }
+                        } catch {
+                            self.logger.error("远端文件删除失败 [\(item.name)]: \(error)")
+                        }
+                    }
+
+                case .deleteLocal:
+                    let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
+                    let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
+                    let localFileURL = rootURL.appendingPathComponent(relPath)
+                    var trashSucceeded = true
+
+                    if FileManager.default.fileExists(atPath: localFileURL.path) {
+                        var trashURL: NSURL?
+                        do {
+                            try FileManager.default.trashItem(at: localFileURL, resultingItemURL: &trashURL)
+                        } catch {
+                            trashSucceeded = false
+                            self.logger.warning("无法将本地文件移入废纸篓 [\(relPath)]: \(error)，保留本地文件并标记为 blocked，绝不执行永久删除")
+                        }
+                    }
+
+                    if trashSucceeded {
+                        try await store.batchWrite { conn in
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            """)
+                            stmt.bindDouble(now, at: 1)
+                            stmt.bindInt64(item.itemId, at: 2)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                        actionTracker.counts.withLock { $0.deleted += 1 }
+                    } else {
+                        try await store.batchWrite { conn in
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            """)
+                            stmt.bindDouble(now, at: 1)
+                            stmt.bindInt64(item.itemId, at: 2)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                    }
+
+                case .conflict(let winner, let conflictId):
+                    try await acquireTransfer()
+                    syncGroup.enter()
+                    Task {
+                        defer { syncSemaphore.signal(); syncGroup.leave() }
+                        do {
+                            guard winner == .remote, let remoteID = item.remoteFileId,
+                                  let localSHA = item.local?.sha256?.lowercased(),
+                                  let remoteSHA = item.remote?.sha256?.lowercased() else {
+                                throw SyncEngineError.general("冲突缺少有效的双方内容证据")
+                            }
+                            let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
+                            let original = rootURL.appendingPathComponent(parentRel).appendingPathComponent(item.name)
+                            let op = try await ConflictOperation.prepare(store: self.store,
+                                rootID: rootId, itemID: item.itemId, parentID: item.parentId,
+                                original: original, remoteID: remoteID,
+                                parentRemoteID: dirContext.getRemoteId(for: item.parentId) ?? remoteRootId,
+                                copyRemoteID: self.idPool.nextId(), conflictID: conflictId,
+                                localSHA: localSHA, remoteSHA: remoteSHA,
+                                localGeneration: item.localGeneration, remoteGeneration: item.remoteGeneration,
+                                dirtyGeneration: item.dirtyGeneration)
+                            try await self.resolveConflict(op, temporaryDirectory: downloadDirectory)
+                            actionTracker.conflicts.withLock { $0 += 1 }
+                        } catch {
+                            actionTracker.failures.withLock { $0 += 1 }
+                            self.logger.error("处理文件冲突失败 [\(item.name)]: \(error)")
+                        }
+                    }
+
+                case .unchanged:
+                    receipts.append { conn in
+                        let stmt = try conn.cachedStatement("UPDATE items SET dirty_generation = 0 WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;")
+                        stmt.bindInt64(item.itemId, at: 1)
+                        stmt.bindInt64(item.localGeneration, at: 2)
+                        stmt.bindInt64(item.remoteGeneration, at: 3)
+                        stmt.bindInt64(item.dirtyGeneration, at: 4)
+                        _ = try stmt.step()
+                        stmt.reset()
+                    }
+
+                case .waitingEvidence:
+                    break
+                }
+                if receipts.count >= 64 {
+                    let batch = receipts
+                    try await store.write { conn in
+                        for receipt in batch { try receipt(conn) }
+                    }
+                    receipts.removeAll(keepingCapacity: true)
+                }
+            }
+
+            if !receipts.isEmpty {
+                let batch = receipts
+                try await store.write { conn in
+                    for receipt in batch { try receipt(conn) }
                 }
             }
         }
@@ -1899,7 +2588,6 @@ public final class SyncEngine: Sendable {
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
-        let scanner = DirectoryScanner()
 
         struct DiscoveredRecord {
             let type: EntryType
@@ -1910,301 +2598,348 @@ public final class SyncEngine: Sendable {
             let fileSize: Int64
         }
 
-        _ = try await scanner.scan(request) { batch in
-            var itemsInBatch: [DiscoveredRecord] = []
-            batch.withRawData { rawBuf in
-                guard let basePtr = rawBuf.baseAddress else { return }
-
-                for idx in 0..<batch.count {
-                    let record = batch.records[idx]
-                    let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
-                    let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
-                    let fullPath = String(cString: cPath)
-
-                    let dev = Int64(record.metadata?.identity.device ?? 1)
-                    let ino = Int64(record.metadata?.identity.inode ?? 0)
-                    let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
-                    let fileSize = record.metadata?.fileSize ?? 0
-
-                    itemsInBatch.append(DiscoveredRecord(
-                        type: record.type,
-                        fullPath: fullPath,
-                        dev: dev,
-                        ino: ino,
-                        mtime: mtime,
-                        fileSize: fileSize
-                    ))
+        @Sendable func commitObservations(_ pending: [IncrementalLocalObservation]) async throws {
+            guard !pending.isEmpty else { return }
+            let observations = try await IncrementalLocalObservation.hash(pending, concurrency: min(6, effectiveSyncConcurrency))
+            let ids = try await self.store.write { conn -> [Int64] in
+                var ids: [Int64] = []
+                for result in observations {
+                    let observation = result.observation
+                    let parentItemId = observation.parentID
+                    let name = observation.name
+                    let dev = observation.device
+                    let ino = observation.inode
+                    let mtime = observation.mtime
+                    let fileSize = observation.size
+                    let sha256Hex = result.sha256
+                    let stmt = try conn.cachedStatement("""
+                    INSERT INTO items (
+                        root_id, parent_id, name, entry_kind,
+                        local_device, local_inode, local_mtime, local_size, local_sha256,
+                        remote_status,
+                        local_generation, local_status, phase, dirty_generation,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, 'file',
+                        ?, ?, ?, ?, ?,
+                        'absent',
+                        1, 'present', 'ready', 1,
+                        ?, ?
+                    )
+                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                    DO UPDATE SET
+                        local_device = excluded.local_device,
+                        local_inode = excluded.local_inode,
+                        local_mtime = excluded.local_mtime,
+                        local_size = excluded.local_size,
+                        local_sha256 = excluded.local_sha256,
+                        local_status = 'present',
+                        local_generation = items.local_generation + 1,
+                        dirty_generation = items.dirty_generation + 1,
+                        phase = 'ready',
+                        updated_at = excluded.updated_at
+                    RETURNING item_id;
+                    """)
+                    stmt.bindInt64(rootId, at: 1)
+                    stmt.bindInt64(parentItemId, at: 2)
+                    stmt.bindText(name, at: 3)
+                    stmt.bindInt64(dev, at: 4)
+                    stmt.bindInt64(ino, at: 5)
+                    stmt.bindInt64(mtime, at: 6)
+                    stmt.bindInt64(fileSize, at: 7)
+                    stmt.bindText(sha256Hex, at: 8)
+                    stmt.bindDouble(now, at: 9)
+                    stmt.bindDouble(now, at: 10)
+                    if try stmt.step(), let id = stmt.columnInt64(at: 0) { ids.append(id) }
+                    _ = try stmt.step()
+                    stmt.reset()
                 }
+                return ids
             }
+            try await scheduleFiles(loadDirtyItems(ids), duringScan: true)
+        }
+        let sentFirstObservation = OSAllocatedUnfairLock(initialState: false)
 
-            for record in itemsInBatch {
-                let fullPath = record.fullPath
-                let relPath: String
-                if fullPath.hasPrefix(staticPrefix) {
-                    relPath = String(fullPath.dropFirst(staticPrefix.count))
-                } else {
-                    relPath = (fullPath as NSString).lastPathComponent
+        do {
+            try await incrementalScan(request) { batch in
+                var pendingObservations: [IncrementalLocalObservation] = []
+                var firstObservationSent = sentFirstObservation.withLock { $0 }
+                var itemsInBatch: [DiscoveredRecord] = []
+                batch.withRawData { rawBuf in
+                    guard let basePtr = rawBuf.baseAddress else { return }
+
+                    for idx in 0..<batch.count {
+                        let record = batch.records[idx]
+                        let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
+                        let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
+                        let fullPath = String(cString: cPath)
+
+                        let dev = Int64(record.metadata?.identity.device ?? 1)
+                        let ino = Int64(record.metadata?.identity.inode ?? 0)
+                        let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
+                        let fileSize = record.metadata?.fileSize ?? 0
+
+                        itemsInBatch.append(DiscoveredRecord(
+                            type: record.type,
+                            fullPath: fullPath,
+                            dev: dev,
+                            ino: ino,
+                            mtime: mtime,
+                            fileSize: fileSize
+                        ))
+                    }
                 }
 
-                if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") { continue }
-
-                if remoteGate.blocks(relPath) { continue }
-                let name = (relPath as NSString).lastPathComponent
-                let parentRel = (relPath as NSString).deletingLastPathComponent
-                let parentRelNormalized = (parentRel == "." || parentRel.isEmpty) ? "" : parentRel
-
-                if !remoteGate.paths.isEmpty,
-                   dirContext.getItemId(byRelPath: parentRelNormalized) == nil,
-                   try remoteGate.blocksLocalAncestors(URL(fileURLWithPath: fullPath).deletingLastPathComponent(), root: rootURL) {
-                    continue
-                }
-
-                if record.type == .directory {
-                    let parentItemId = dirContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemId
-                    let dev = record.dev
-                    let ino = record.ino
-
-                    // 检查本地目录是否发生重命名或移动 (按 dev + ino 查找)
-                    let existingDir: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
-                        let stmt = try conn.cachedStatement("""
-                        SELECT item_id, parent_id, name, remote_file_id
-                        FROM items
-                        WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
-                        """)
-                        stmt.bindInt64(rootId, at: 1)
-                        stmt.bindInt64(dev, at: 2)
-                        stmt.bindInt64(ino, at: 3)
-                        defer { stmt.reset() }
-                        if try stmt.step(),
-                           let iId = stmt.columnInt64(at: 0),
-                           let pId = stmt.columnInt64(at: 1),
-                           let nm = stmt.columnText(at: 2) {
-                            let rId = stmt.columnText(at: 3)
-                            return (iId, pId, nm, rId)
-                        }
-                        return nil
+                for record in itemsInBatch {
+                    let fullPath = record.fullPath
+                    let relPath: String
+                    if fullPath.hasPrefix(staticPrefix) {
+                        relPath = String(fullPath.dropFirst(staticPrefix.count))
+                    } else {
+                        relPath = (fullPath as NSString).lastPathComponent
                     }
 
-                    if let existing = existingDir,
-                       remoteGate.blocks(dirContext.getRelPath(for: existing.itemId) ?? "") {
-                        remoteGate.addAlias(relPath)
+                    if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") { continue }
+
+                    if remoteGate.blocks(relPath) { continue }
+                    let name = (relPath as NSString).lastPathComponent
+                    let parentRel = (relPath as NSString).deletingLastPathComponent
+                    let parentRelNormalized = (parentRel == "." || parentRel.isEmpty) ? "" : parentRel
+
+                    if !remoteGate.paths.isEmpty,
+                       dirContext.getItemId(byRelPath: parentRelNormalized) == nil,
+                       try remoteGate.blocksLocalAncestors(URL(fileURLWithPath: fullPath).deletingLastPathComponent(), root: rootURL) {
                         continue
                     }
-                    if let existing = existingDir, (existing.name != name || existing.parentId != parentItemId) {
-                        // 本地目录发生重命名或移动
-                        seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
-                        do {
-                            if let rId = existing.remoteId {
-                                let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
-                                let newPRemote = dirContext.getRemoteId(for: parentItemId)
-                                let addP = (parentItemId != existing.parentId) ? newPRemote : nil
-                                let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
-                                _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
-                            }
-                            try await self.store.write { conn in
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
-                                """)
-                                stmt.bindText(name, at: 1)
-                                stmt.bindInt64(parentItemId, at: 2)
-                                stmt.bindDouble(now, at: 3)
-                                stmt.bindInt64(existing.itemId, at: 4)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                            dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: name, remoteId: existing.remoteId ?? "")
-                        } catch {
-                            self.logger.error("重命名/移动远端目录失败 [\(existing.name) -> \(name)]: \(error)")
-                        }
-                    } else if dirContext.getItemId(byRelPath: relPath) == nil {
-                        // 新建本地目录
-                        let remoteParentId = dirContext.getRemoteId(for: parentItemId) ?? remoteRootId
-                        var intent: DurableCreateIntent?
-                        do {
-                            let candidateRemoteID = try await self.idPool.nextId()
-                            let prepared = try await DurableCreateIntentStore.prepareDirectory(
-                                store: self.store,
-                                rootID: rootId,
-                                parentItemID: parentItemId,
-                                name: name,
-                                targetParentRemoteID: remoteParentId,
-                                candidateRemoteID: candidateRemoteID,
-                                device: dev,
-                                inode: ino
-                            )
-                            intent = prepared
-                            _ = try await self.client.createDirectory(
-                                name: name,
-                                parentId: prepared.targetParentRemoteID,
-                                remoteId: prepared.targetRemoteID
-                            )
-                            try await self.store.batchWrite { conn in
-                                let ts = Date().timeIntervalSince1970
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET
-                                    remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
-                                WHERE item_id = ?;
-                                """)
-                                stmt.bindDouble(ts, at: 1)
-                                stmt.bindInt64(prepared.itemID, at: 2)
-                                _ = try stmt.step()
-                                stmt.reset()
-                                try DurableCreateIntentStore.completeOperation(conn: conn, operationID: prepared.operationID, now: ts)
-                            }
-                            dirContext.register(
-                                itemId: prepared.itemID,
-                                parentItemId: parentItemId,
-                                name: name,
-                                remoteId: prepared.targetRemoteID
-                            )
-                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                            scanProgress.incDirs()
-                        } catch {
-                            if let intent {
-                                await DurableCreateIntentStore.markUnknownOutcome(
-                                    store: self.store,
-                                    operationID: intent.operationID,
-                                    error: error
-                                )
-                            }
-                            self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
-                        }
-                    } else {
-                        seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                    }
-                } else if record.type == .file {
-                    scanProgress.incScanned()
-                    let parentItemId = dirContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemId
-                    let dev = record.dev
-                    let ino = record.ino
-                    let mtime = record.mtime
-                    let fileSize = record.fileSize
 
-                    // 检查本地文件是否发生重命名或移动 (按 dev + ino 查找)
-                    let existingFile: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
-                        let stmt = try conn.cachedStatement("""
-                        SELECT item_id, parent_id, name, remote_file_id
-                        FROM items
-                        WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
-                        """)
-                        stmt.bindInt64(rootId, at: 1)
-                        stmt.bindInt64(dev, at: 2)
-                        stmt.bindInt64(ino, at: 3)
-                        defer { stmt.reset() }
-                        if try stmt.step(),
-                           let iId = stmt.columnInt64(at: 0),
-                           let pId = stmt.columnInt64(at: 1),
-                           let nm = stmt.columnText(at: 2) {
-                            let rId = stmt.columnText(at: 3)
-                            return (iId, pId, nm, rId)
+                    if record.type == .directory, !pendingObservations.isEmpty {
+                        try await commitObservations(pendingObservations)
+                        pendingObservations.removeAll(keepingCapacity: true)
+                        firstObservationSent = true
+                    }
+                    if record.type == .directory {
+                        let parentItemId = dirContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemId
+                        let dev = record.dev
+                        let ino = record.ino
+
+                        // 检查本地目录是否发生重命名或移动 (按 dev + ino 查找)
+                        let existingDir: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
+                            let stmt = try conn.cachedStatement("""
+                            SELECT item_id, parent_id, name, remote_file_id
+                            FROM items
+                            WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                            """)
+                            stmt.bindInt64(rootId, at: 1)
+                            stmt.bindInt64(dev, at: 2)
+                            stmt.bindInt64(ino, at: 3)
+                            defer { stmt.reset() }
+                            if try stmt.step(),
+                               let iId = stmt.columnInt64(at: 0),
+                               let pId = stmt.columnInt64(at: 1),
+                               let nm = stmt.columnText(at: 2) {
+                                let rId = stmt.columnText(at: 3)
+                                return (iId, pId, nm, rId)
+                            }
+                            return nil
                         }
-                        return nil
-                    }
 
-                    if let existing = existingFile {
-                        let parentPath = dirContext.getRelPath(for: existing.parentId) ?? ""
-                        let oldPath = parentPath.isEmpty ? existing.name : "\(parentPath)/\(existing.name)"
-                        if remoteGate.blocks(oldPath) { continue }
-                    }
-                    if let existing = existingFile, (existing.name != name || existing.parentId != parentItemId) {
-                        // 本地文件发生重命名或移动
-                        seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
-                        do {
-                            if let rId = existing.remoteId {
-                                let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
-                                let newPRemote = dirContext.getRemoteId(for: parentItemId)
-                                let addP = (parentItemId != existing.parentId) ? newPRemote : nil
-                                let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
-                                _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
-                            }
-
-                            try await self.store.batchWrite { conn in
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET
-                                    name = ?,
-                                    parent_id = ?,
-                                    updated_at = ?
-                                WHERE item_id = ?;
-                                """)
-                                stmt.bindText(name, at: 1)
-                                stmt.bindInt64(parentItemId, at: 2)
-                                stmt.bindDouble(now, at: 3)
-                                stmt.bindInt64(existing.itemId, at: 4)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                            seenTracker.markSeen(parentId: parentItemId, name: name)
-                        } catch {
-                            self.logger.error("重命名/移动远端文件失败 [\(existing.name) -> \(name)]: \(error)")
+                        if let existing = existingDir,
+                           remoteGate.blocks(dirContext.getRelPath(for: existing.itemId) ?? "") {
+                            remoteGate.addAlias(relPath)
                             continue
                         }
-                        // 路径更新不代表正文已验证；保留旧元数据并继续内容比对。
-                        // 纯改名仍命中下方缓存，正文变化则复用既有摘要与裁决流程。
-                    }
+                        if let existing = existingDir, (existing.name != name || existing.parentId != parentItemId) {
+                            // 本地目录发生重命名或移动
+                            seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
+                            do {
+                                if let rId = existing.remoteId {
+                                    let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
+                                    let newPRemote = dirContext.getRemoteId(for: parentItemId)
+                                    let addP = (parentItemId != existing.parentId) ? newPRemote : nil
+                                    let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
+                                    _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
+                                }
+                                try await self.store.write { conn in
+                                    let stmt = try conn.cachedStatement("""
+                                    UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
+                                    """)
+                                    stmt.bindText(name, at: 1)
+                                    stmt.bindInt64(parentItemId, at: 2)
+                                    stmt.bindDouble(now, at: 3)
+                                    stmt.bindInt64(existing.itemId, at: 4)
+                                    _ = try stmt.step()
+                                    stmt.reset()
+                                }
+                                seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                                dirContext.register(itemId: existing.itemId, parentItemId: parentItemId, name: name, remoteId: existing.remoteId ?? "")
+                            } catch {
+                                self.logger.error("重命名/移动远端目录失败 [\(existing.name) -> \(name)]: \(error)")
+                            }
+                        } else if dirContext.getItemId(byRelPath: relPath) == nil {
+                            // 新建本地目录
+                            let remoteParentId = dirContext.getRemoteId(for: parentItemId) ?? remoteRootId
+                            var intent: DurableCreateIntent?
+                            do {
+                                let candidateRemoteID = try await self.idPool.nextId()
+                                let prepared = try await DurableCreateIntentStore.prepareDirectory(
+                                    store: self.store,
+                                    rootID: rootId,
+                                    parentItemID: parentItemId,
+                                    name: name,
+                                    targetParentRemoteID: remoteParentId,
+                                    candidateRemoteID: candidateRemoteID,
+                                    device: dev,
+                                    inode: ino
+                                )
+                                intent = prepared
+                                _ = try await self.client.createDirectory(
+                                    name: name,
+                                    parentId: prepared.targetParentRemoteID,
+                                    remoteId: prepared.targetRemoteID
+                                )
+                                try await self.store.write { conn in
+                                    let ts = Date().timeIntervalSince1970
+                                    let stmt = try conn.cachedStatement("""
+                                    UPDATE items SET
+                                        remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                                    WHERE item_id = ?;
+                                    """)
+                                    stmt.bindDouble(ts, at: 1)
+                                    stmt.bindInt64(prepared.itemID, at: 2)
+                                    _ = try stmt.step()
+                                    stmt.reset()
+                                    try DurableCreateIntentStore.completeOperation(conn: conn, operationID: prepared.operationID, now: ts)
+                                }
+                                dirContext.register(
+                                    itemId: prepared.itemID,
+                                    parentItemId: parentItemId,
+                                    name: name,
+                                    remoteId: prepared.targetRemoteID
+                                )
+                                seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                                scanProgress.incDirs()
+                            } catch {
+                                if let intent {
+                                    await DurableCreateIntentStore.markUnknownOutcome(
+                                        store: self.store,
+                                        operationID: intent.operationID,
+                                        error: error
+                                    )
+                                }
+                                self.logger.error("创建远端目录失败 [\(relPath)]: \(error)")
+                            }
+                        } else {
+                            seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                        }
+                    } else if record.type == .file {
+                        scanProgress.incScanned()
+                        let parentItemId = dirContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemId
+                        let dev = record.dev
+                        let ino = record.ino
+                        let mtime = record.mtime
+                        let fileSize = record.fileSize
 
-                    seenTracker.markSeen(parentId: parentItemId, name: name)
+                        // The cache only contains committed, clean remote-present baselines.
+                        // Matching the path as well as identity preserves the rename path below,
+                        // while an ordinary unchanged file needs no per-item SQLite round trip.
+                        if let cached = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize),
+                           cached.parentId == parentItemId, cached.name == name {
+                            seenTracker.markSeen(parentId: parentItemId, name: name)
+                            scanProgress.incSkipped()
+                            continue
+                        }
 
-                    // 快速变更比对 (§6.2)
-                    if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
-                        scanProgress.incSkipped()
-                        continue
-                    }
+                        // 检查本地文件是否发生重命名或移动 (按 dev + ino 查找)
+                        let existingFile: (itemId: Int64, parentId: Int64, name: String, remoteId: String?)? = try await self.store.read { conn in
+                            let stmt = try conn.cachedStatement("""
+                            SELECT item_id, parent_id, name, remote_file_id
+                            FROM items
+                            WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                            """)
+                            stmt.bindInt64(rootId, at: 1)
+                            stmt.bindInt64(dev, at: 2)
+                            stmt.bindInt64(ino, at: 3)
+                            defer { stmt.reset() }
+                            if try stmt.step(),
+                               let iId = stmt.columnInt64(at: 0),
+                               let pId = stmt.columnInt64(at: 1),
+                               let nm = stmt.columnText(at: 2) {
+                                let rId = stmt.columnText(at: 3)
+                                return (iId, pId, nm, rId)
+                            }
+                            return nil
+                        }
 
-                    // 文件有修改或为新文件：计算 SHA-256
-                    let fileURL = URL(fileURLWithPath: fullPath)
-                    guard let fileData = try? Data(contentsOf: fileURL) else { continue }
-                    var ctx = CC_SHA256_CTX()
-                    CC_SHA256_Init(&ctx)
-                    _ = fileData.withUnsafeBytes { CC_SHA256_Update(&ctx, $0.baseAddress, CC_LONG(fileData.count)) }
-                    var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-                    CC_SHA256_Final(&digest, &ctx)
-                    let sha256Hex = digest.map { String(format: "%02x", $0) }.joined()
+                        if let existing = existingFile {
+                            let parentPath = dirContext.getRelPath(for: existing.parentId) ?? ""
+                            let oldPath = parentPath.isEmpty ? existing.name : "\(parentPath)/\(existing.name)"
+                            if remoteGate.blocks(oldPath) { continue }
+                        }
+                        if let existing = existingFile, (existing.name != name || existing.parentId != parentItemId) {
+                            // 本地文件发生重命名或移动
+                            seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
+                            do {
+                                if let rId = existing.remoteId {
+                                    let oldPRemote = dirContext.getRemoteId(for: existing.parentId)
+                                    let newPRemote = dirContext.getRemoteId(for: parentItemId)
+                                    let addP = (parentItemId != existing.parentId) ? newPRemote : nil
+                                    let remP = (parentItemId != existing.parentId) ? oldPRemote : nil
+                                    _ = try await self.client.updateMetadata(remoteId: rId, newName: name, addParentId: addP, removeParentId: remP)
+                                }
 
-                    try await self.store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        INSERT INTO items (
-                            root_id, parent_id, name, entry_kind,
-                            local_device, local_inode, local_mtime, local_size, local_sha256,
-                            remote_status,
-                            local_generation, local_status, phase, dirty_generation,
-                            created_at, updated_at
-                        ) VALUES (
-                            ?, ?, ?, 'file',
-                            ?, ?, ?, ?, ?,
-                            'absent',
-                            1, 'present', 'ready', 1,
-                            ?, ?
-                        )
-                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                        DO UPDATE SET
-                            local_device = excluded.local_device,
-                            local_inode = excluded.local_inode,
-                            local_mtime = excluded.local_mtime,
-                            local_size = excluded.local_size,
-                            local_sha256 = excluded.local_sha256,
-                            local_status = 'present',
-                            local_generation = items.local_generation + 1,
-                            dirty_generation = items.dirty_generation + 1,
-                            phase = 'ready',
-                            updated_at = excluded.updated_at;
-                        """)
-                        stmt.bindInt64(rootId, at: 1)
-                        stmt.bindInt64(parentItemId, at: 2)
-                        stmt.bindText(name, at: 3)
-                        stmt.bindInt64(dev, at: 4)
-                        stmt.bindInt64(ino, at: 5)
-                        stmt.bindInt64(mtime, at: 6)
-                        stmt.bindInt64(fileSize, at: 7)
-                        stmt.bindText(sha256Hex, at: 8)
-                        stmt.bindDouble(now, at: 9)
-                        stmt.bindDouble(now, at: 10)
-                        _ = try stmt.step()
-                        stmt.reset()
+                                try await self.store.write { conn in
+                                    let stmt = try conn.cachedStatement("""
+                                    UPDATE items SET
+                                        name = ?,
+                                        parent_id = ?,
+                                        updated_at = ?
+                                    WHERE item_id = ?;
+                                    """)
+                                    stmt.bindText(name, at: 1)
+                                    stmt.bindInt64(parentItemId, at: 2)
+                                    stmt.bindDouble(now, at: 3)
+                                    stmt.bindInt64(existing.itemId, at: 4)
+                                    _ = try stmt.step()
+                                    stmt.reset()
+                                }
+                                seenTracker.markSeen(parentId: parentItemId, name: name)
+                            } catch {
+                                self.logger.error("重命名/移动远端文件失败 [\(existing.name) -> \(name)]: \(error)")
+                                continue
+                            }
+                            // 路径更新不代表正文已验证；保留旧元数据并继续内容比对。
+                            // 纯改名仍命中下方缓存，正文变化则复用既有摘要与裁决流程。
+                        }
+
+                        seenTracker.markSeen(parentId: parentItemId, name: name)
+
+                        // 快速变更比对 (§6.2)
+                        if let _ = baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) {
+                            scanProgress.incSkipped()
+                            continue
+                        }
+
+                        pendingObservations.append(IncrementalLocalObservation(
+                            parentID: parentItemId, name: name, url: URL(fileURLWithPath: fullPath),
+                            device: dev, inode: ino, mtime: mtime, size: fileSize))
+                        // First ready file goes immediately; subsequent work uses bounded natural chunks.
+                        if !firstObservationSent || pendingObservations.count >= 64 {
+                            try await commitObservations(pendingObservations)
+                            pendingObservations.removeAll(keepingCapacity: true)
+                            firstObservationSent = true
+                        }
                     }
                 }
+                try await commitObservations(pendingObservations)
+                let sent = firstObservationSent || !pendingObservations.isEmpty
+                sentFirstObservation.withLock { $0 = sent }
             }
+        } catch {
+            // No transfer may escape a failed/cancelled scan and mutate state after return.
+            await drainTransfers()
+            throw error
         }
+        await drainTransfers()
 
         // 识别本地已删除的文件与目录 (§9.1)
         // 再次核验本地根目录是否存在，避免在扫描期间本地目录被移除导致全部误判 absent 扩散删除
@@ -2279,118 +3014,7 @@ public final class SyncEngine: Sendable {
         // -------------------------------------------------------------
         // 4. Reconciler 决策与执行 (§9.1)
         // -------------------------------------------------------------
-        struct DirtyRecord: Sendable {
-            let itemId: Int64
-            let parentId: Int64
-            let name: String
-            let remoteFileId: String?
-            let entryKind: String
-            let baseline: ItemBaseline?
-            let local: LocalObservation?
-            let remote: RemoteObservation?
-            let pendingCreate: DurableCreateIntent?
-            let localGeneration: Int64
-            let remoteGeneration: Int64
-            let dirtyGeneration: Int64
-            let localDevice: Int64?
-            let localInode: Int64?
-            let localMtime: Int64?
-        }
-
-        let dirtyItems: [DirtyRecord] = try await store.read { conn in
-            let stmt = try conn.cachedStatement("""
-            SELECT items.item_id, items.parent_id, items.name, items.remote_file_id, items.entry_kind,
-                   items.base_sha256, items.base_size,
-                   items.local_sha256, items.local_size, items.local_status,
-                   items.remote_sha256, items.remote_size, items.remote_status,
-                   op.operation_id, op.target_remote_id, op.target_parent_remote_id,
-                   op.expected_local_generation, op.expected_sha256, op.total_bytes,
-                   items.local_generation, items.remote_generation, items.dirty_generation,
-                   items.local_device, items.local_inode, items.local_mtime
-            FROM items
-            LEFT JOIN operations op ON op.operation_id = (
-                SELECT candidate.operation_id
-                FROM operations candidate
-                WHERE candidate.item_id = items.item_id
-                  AND candidate.operation_type IN ('createDirectory', 'uploadMultipart')
-                  AND candidate.state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
-                ORDER BY candidate.created_at DESC
-                LIMIT 1
-            )
-            WHERE items.root_id = ? AND items.dirty_generation > 0 AND items.is_tombstone = 0;
-            """)
-            stmt.bindInt64(rootId, at: 1)
-            var records: [DirtyRecord] = []
-            while try stmt.step() {
-                guard let iId = stmt.columnInt64(at: 0),
-                      let pId = stmt.columnInt64(at: 1),
-                      let name = stmt.columnText(at: 2) else { continue }
-                let rFileId = stmt.columnText(at: 3)
-                let kind = stmt.columnText(at: 4) ?? "file"
-
-                let bSha = stmt.columnText(at: 5)
-                let bSize = stmt.columnInt64(at: 6)
-                let baseline: ItemBaseline? = (bSha != nil) ? ItemBaseline(sha256: bSha, size: bSize) : nil
-
-                let lSha = stmt.columnText(at: 7)
-                let lSize = stmt.columnInt64(at: 8)
-                let lStatusStr = stmt.columnText(at: 9) ?? "unknown"
-                let lStatus = LocalObservation.Status(rawValue: lStatusStr) ?? .unknown
-                let local = LocalObservation(status: lStatus, sha256: lSha, size: lSize)
-
-                let rSha = stmt.columnText(at: 10)
-                let rSize = stmt.columnInt64(at: 11)
-                let rStatusStr = stmt.columnText(at: 12) ?? "unknown"
-                let rStatus = RemoteObservation.Status(rawValue: rStatusStr) ?? .unknown
-                let remote = RemoteObservation(status: rStatus, sha256: rSha, size: rSize)
-
-                let pendingCreate: DurableCreateIntent?
-                if let operationID = stmt.columnText(at: 13),
-                   let targetRemoteID = stmt.columnText(at: 14),
-                   let targetParentRemoteID = stmt.columnText(at: 15) {
-                    pendingCreate = DurableCreateIntent(
-                        operationID: operationID,
-                        itemID: iId,
-                        targetRemoteID: targetRemoteID,
-                        targetParentRemoteID: targetParentRemoteID,
-                        expectedLocalGeneration: stmt.columnInt64(at: 16) ?? 0,
-                        expectedSHA256: stmt.columnText(at: 17),
-                        totalBytes: stmt.columnInt64(at: 18)
-                    )
-                } else {
-                    pendingCreate = nil
-                }
-
-                records.append(DirtyRecord(
-                    itemId: iId, parentId: pId, name: name, remoteFileId: rFileId,
-                    entryKind: kind, baseline: baseline, local: local, remote: remote,
-                    pendingCreate: pendingCreate,
-                    localGeneration: stmt.columnInt64(at: 19) ?? 0,
-                    remoteGeneration: stmt.columnInt64(at: 20) ?? 0,
-                    dirtyGeneration: stmt.columnInt64(at: 21) ?? 0,
-                    localDevice: stmt.columnInt64(at: 22),
-                    localInode: stmt.columnInt64(at: 23),
-                    localMtime: stmt.columnInt64(at: 24)
-                ))
-            }
-            stmt.reset()
-            return records
-        }
-
-        let effectiveSyncConcurrency = max(1, min(64, maxConcurrency))
-        let syncSemaphore = AsyncSemaphore(count: effectiveSyncConcurrency)
-        let syncGroup = DispatchGroup()
-
-        final class ActionTracker: @unchecked Sendable {
-            var uploaded = 0
-            var bytesUp: Int64 = 0
-            var downloaded = 0
-            var bytesDown: Int64 = 0
-            var deleted = 0
-            let conflicts = OSAllocatedUnfairLock(initialState: 0)
-            let failures = OSAllocatedUnfairLock(initialState: 0)
-        }
-        let actionTracker = ActionTracker()
+        let dirtyItems = try await loadDirtyItems()
 
         // -------------------------------------------------------------
         // 5A. 阶段一：先对所有文件项执行 Reconciler 裁决与调度执行 (§9.1, A04)
@@ -2445,469 +3069,15 @@ public final class SyncEngine: Sendable {
             }
         }
 
-        for item in fileItems {
-            let decision: ReconcileDecision
-            if item.pendingCreate != nil {
-                decision = .upload(reason: "恢复已持久化的小文件创建意图")
-            } else {
-                decision = Reconciler.decide(baseline: item.baseline, local: item.local, remote: item.remote)
-            }
-
-            switch decision {
-            case .upload, .keepModified(preferLocal: true):
-                let upBytes = item.local?.size ?? 0
-                notifier.addDiscovered(files: 1, bytes: upBytes)
-                self.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
-                syncGroup.enter()
-                Task {
-                    var createIntent = item.pendingCreate
-                    await syncSemaphore.wait()
-                    defer {
-                        self.monitor.finishUpload(id: item.name)
-                        syncSemaphore.signal()
-                        syncGroup.leave()
-                        notifier.addCompleted(files: 1, bytes: upBytes)
-                    }
-
-                    do {
-                        let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
-                        let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-                        let localFileURL = rootURL.appendingPathComponent(relPath)
-                        let remoteParentId = dirContext.getRemoteId(for: item.parentId) ?? remoteRootId
-
-                        if createIntent == nil, let remoteID = item.remoteFileId {
-                            throw DriveError.unsafeOverwrite(fileId: remoteID)
-                        }
-
-                        // 若远端父目录此前被移入回收站，在上传子文件前自动恢复父目录
-                        if let parentRId = dirContext.getRemoteId(for: item.parentId) {
-                            let isParentTrashed: Bool = (try? await self.store.read { conn in
-                                let stmt = try conn.cachedStatement("SELECT remote_status FROM items WHERE item_id = ?;")
-                                stmt.bindInt64(item.parentId, at: 1)
-                                defer { stmt.reset() }
-                                if try stmt.step(), let st = stmt.columnText(at: 0) {
-                                    return st == "trashed"
-                                }
-                                return false
-                            }) ?? false
-
-                            if isParentTrashed {
-                                do {
-                                    try await self.client.untrash(remoteId: parentRId)
-                                    try await self.store.write { conn in
-                                        let stmt = try conn.cachedStatement("UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;")
-                                        stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                                        stmt.bindInt64(item.parentId, at: 2)
-                                        _ = try stmt.step()
-                                    }
-                                } catch {
-                                    self.logger.error("恢复远端父目录失败 [\(parentRId)]: \(error)")
-                                }
-                            }
-                        }
-
-                        let fSize: Int64
-                        let sha256Hex: String
-                        if let s = item.local?.sha256, let sz = item.local?.size {
-                            sha256Hex = s
-                            fSize = sz
-                        } else {
-                            let res = try SyncEngine.computeFileSha256(at: localFileURL)
-                            sha256Hex = res.sha256Hex
-                            fSize = res.fileSize
-                        }
-                        self.monitor.startUpload(id: item.name, name: item.name, totalBytes: fSize)
-
-                        let input = try StableUploadInput.capture(at: localFileURL)
-                        guard input.size == fSize, input.sha256 == sha256Hex else {
-                            throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
-                        }
-                        let fileData = try input.data ?? Data(contentsOf: input.fileURL)
-                        let mtime = input.version.mtime
-                        let dev = input.version.device
-                        let ino = input.version.inode
-                        let uploadedFile: DriveFile
-                        if let pending = createIntent {
-                            guard let expectedSHA256 = pending.expectedSHA256,
-                                  expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
-                                  pending.totalBytes == fSize else {
-                                throw SyncEngineError.general("未完成的小文件创建意图输入已变化: \(item.name)")
-                            }
-                            uploadedFile = try await self.client.uploadMultipart(
-                                name: item.name,
-                                parentId: pending.targetParentRemoteID,
-                                remoteId: pending.targetRemoteID,
-                                content: fileData,
-                                expectedSha256: sha256Hex
-                            )
-                        } else if let existingRemoteId = item.remoteFileId {
-                            uploadedFile = try await self.client.updateMultipart(
-                                remoteId: existingRemoteId,
-                                content: fileData,
-                                expectedSha256: sha256Hex
-                            )
-                        } else {
-                            let newRemoteId = try await self.idPool.nextId()
-                            let prepared = try await DurableCreateIntentStore.prepareMultipartUpload(
-                                store: self.store,
-                                rootID: rootId,
-                                itemID: item.itemId,
-                                parentItemID: item.parentId,
-                                name: item.name,
-                                targetParentRemoteID: remoteParentId,
-                                candidateRemoteID: newRemoteId,
-                                device: dev,
-                                inode: ino,
-                                mtime: Int64(mtime),
-                                size: fSize,
-                                sha256: sha256Hex
-                            )
-                            createIntent = prepared
-                            uploadedFile = try await self.client.uploadMultipart(
-                                name: item.name,
-                                parentId: prepared.targetParentRemoteID,
-                                remoteId: prepared.targetRemoteID,
-                                content: fileData,
-                                expectedSha256: sha256Hex
-                            )
-                        }
-
-                        let completedCreateIntent = createIntent
-                        try input.version.validate(at: localFileURL)
-                        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                        try await self.store.batchWrite { conn in
-                            guard (try? LocalFileVersion.read(at: localFileURL)) == input.version else { return }
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET
-                                remote_file_id = ?,
-                                local_device = ?,
-                                local_inode = ?,
-                                local_mtime = ?,
-                                local_size = ?,
-                                base_sha256 = ?,
-                                base_size = ?,
-                                remote_sha256 = ?,
-                                remote_size = ?,
-                                remote_status = 'present',
-                                phase = 'committed',
-                                dirty_generation = 0,
-                                updated_at = ?
-                            WHERE item_id = ? AND local_generation = ?
-                                AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
-                            """)
-                            stmt.bindText(uploadedFile.id, at: 1)
-                            stmt.bindInt64(dev, at: 2)
-                            stmt.bindInt64(ino, at: 3)
-                            stmt.bindInt64(Int64(mtime), at: 4)
-                            stmt.bindInt64(fSize, at: 5)
-                            stmt.bindText(sha256Hex, at: 6)
-                            stmt.bindInt64(fSize, at: 7)
-                            stmt.bindText(sha256Hex, at: 8)
-                            stmt.bindInt64(fSize, at: 9)
-                            stmt.bindDouble(now, at: 10)
-                            stmt.bindInt64(item.itemId, at: 11)
-                            stmt.bindInt64(item.localGeneration, at: 12)
-                            stmt.bindInt64(item.remoteGeneration, at: 13)
-                            stmt.bindInt64(item.dirtyGeneration, at: 14)
-                            _ = try stmt.step()
-                            stmt.reset()
-                            guard conn.changes == 1 else { return }
-                            receiptApplied.withLock { $0 = true }
-                            if let createIntent = completedCreateIntent {
-                                try DurableCreateIntentStore.completeOperation(
-                                    conn: conn,
-                                    operationID: createIntent.operationID,
-                                    now: now
-                                )
-                            }
-                        }
-
-                        guard receiptApplied.withLock({ $0 }) else {
-                            throw SyncEngineError.general("上传回执已过期，保留新一代待同步状态: \(item.name)")
-                        }
-
-                        actionTracker.uploaded += 1
-                        actionTracker.bytesUp += fSize
-                    } catch {
-                        actionTracker.failures.withLock { $0 += 1 }
-                        if let createIntent {
-                            await DurableCreateIntentStore.markUnknownOutcome(
-                                store: self.store,
-                                operationID: createIntent.operationID,
-                                error: error
-                            )
-                        }
-                        if case DriveError.unsafeOverwrite = error {
-                            try? await self.store.batchWrite { conn in
-                                let stmt = try conn.cachedStatement("""
-                                UPDATE items SET phase = 'blocked'
-                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
-                                """)
-                                stmt.bindInt64(item.itemId, at: 1)
-                                stmt.bindInt64(item.localGeneration, at: 2)
-                                stmt.bindInt64(item.remoteGeneration, at: 3)
-                                stmt.bindInt64(item.dirtyGeneration, at: 4)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                        }
-                        self.logger.error("增量上传失败 [\(item.name)]: \(error)")
-                    }
-                }
-
-            case .download, .keepModified(preferLocal: false):
-                let downId = item.remoteFileId ?? item.name
-                let downSize = item.remote?.size ?? 0
-                notifier.addDiscovered(files: 1, bytes: downSize)
-                self.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
-                syncGroup.enter()
-                Task {
-                    await syncSemaphore.wait()
-                    defer {
-                        self.monitor.finishDownload(id: downId)
-                        syncSemaphore.signal()
-                        syncGroup.leave()
-                        notifier.addCompleted(files: 1, bytes: downSize)
-                    }
-
-                    do {
-                        guard let remoteFileId = item.remoteFileId else { return }
-                        let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
-                        let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-                        let localFileURL = rootURL.appendingPathComponent(relPath)
-
-                        // 确保本地目标父目录存在
-                        try? FileManager.default.createDirectory(at: localFileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-                        let expectedDestination = try LocalFileVersion.read(at: localFileURL)
-                        if item.local?.status == .present {
-                            guard let expectedDestination,
-                                  expectedDestination.device == item.localDevice,
-                                  expectedDestination.inode == item.localInode,
-                                  expectedDestination.mtime == item.localMtime,
-                                  expectedDestination.size == item.local?.size else {
-                                throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
-                            }
-                        } else if expectedDestination != nil {
-                            throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
-                        }
-                        self.monitor.startDownload(id: downId, name: item.name, totalBytes: downSize)
-                        let published = try await self.client.downloadFileSafely(
-                            remoteId: remoteFileId,
-                            destinationURL: localFileURL,
-                            expectedSha256: item.remote?.sha256,
-                            expectedDestination: expectedDestination,
-                            beforePublish: {
-                                let current = try await self.store.read { conn in
-                                    let stmt = try conn.cachedStatement("""
-                                    SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
-                                        AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
-                                    """)
-                                    defer { stmt.reset() }
-                                    stmt.bindInt64(item.itemId, at: 1)
-                                    stmt.bindInt64(item.localGeneration, at: 2)
-                                    stmt.bindInt64(item.remoteGeneration, at: 3)
-                                    stmt.bindInt64(item.dirtyGeneration, at: 4)
-                                    return try stmt.step()
-                                }
-                                guard current else {
-                                    throw SyncEngineError.general("下载计划已过期，保留本地文件: \(item.name)")
-                                }
-                            },
-                            onProgress: { delta in
-                                self.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
-                            }
-                        )
-
-                        let fSize = published.size
-                        let mtime = published.mtime
-
-                        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                        try await self.store.batchWrite { conn in
-                            guard (try? LocalFileVersion.read(at: localFileURL)) == published else { return }
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET
-                                local_sha256 = remote_sha256,
-                                local_size = remote_size,
-                                local_mtime = ?,
-                                local_device = ?,
-                                local_inode = ?,
-                                local_status = 'present',
-                                remote_status = 'present',
-                                base_sha256 = remote_sha256,
-                                base_size = remote_size,
-                                phase = 'committed',
-                                dirty_generation = 0,
-                                updated_at = ?
-                            WHERE item_id = ? AND local_generation = ?
-                                AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
-                            """)
-                            stmt.bindInt64(Int64(mtime), at: 1)
-                            stmt.bindInt64(published.device, at: 2)
-                            stmt.bindInt64(published.inode, at: 3)
-                            stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
-                            stmt.bindInt64(item.itemId, at: 5)
-                            stmt.bindInt64(item.localGeneration, at: 6)
-                            stmt.bindInt64(item.remoteGeneration, at: 7)
-                            stmt.bindInt64(item.dirtyGeneration, at: 8)
-                            _ = try stmt.step()
-                            stmt.reset()
-                            guard conn.changes == 1 else { return }
-                            receiptApplied.withLock { $0 = true }
-                        }
-                        guard receiptApplied.withLock({ $0 }) else {
-                            throw SyncEngineError.general("下载回执已过期，保留新一代待同步状态: \(item.name)")
-                        }
-
-                        actionTracker.downloaded += 1
-                        actionTracker.bytesDown += fSize
-                    } catch {
-                        actionTracker.failures.withLock { $0 += 1 }
-                        self.logger.error("增量下载失败 [\(item.name)]: \(error)")
-                    }
-                }
-
-            case .matchUpdateBaseline(let sha, let size):
-                try await store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement("""
-                    UPDATE items SET
-                        base_sha256 = ?,
-                        base_size = ?,
-                        remote_status = 'present',
-                        local_status = 'present',
-                        phase = 'committed',
-                        dirty_generation = 0,
-                        updated_at = ?
-                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
-                    """)
-                    stmt.bindText(sha, at: 1)
-                    stmt.bindInt64(size, at: 2)
-                    stmt.bindDouble(now, at: 3)
-                    stmt.bindInt64(item.itemId, at: 4)
-                    stmt.bindInt64(item.localGeneration, at: 5)
-                    stmt.bindInt64(item.remoteGeneration, at: 6)
-                    stmt.bindInt64(item.dirtyGeneration, at: 7)
-                    _ = try stmt.step()
-                    stmt.reset()
-                }
-
-            case .trashRemote:
-                syncGroup.enter()
-                Task {
-                    await syncSemaphore.wait()
-                    defer {
-                        syncSemaphore.signal()
-                        syncGroup.leave()
-                    }
-                    do {
-                        if let rId = item.remoteFileId {
-                            try await self.client.trash(remoteId: rId)
-                        }
-                        try await self.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                            """)
-                            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                            stmt.bindInt64(item.itemId, at: 2)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                        actionTracker.deleted += 1
-                    } catch {
-                        self.logger.error("远端文件删除失败 [\(item.name)]: \(error)")
-                    }
-                }
-
-            case .deleteLocal:
-                let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
-                let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-                let localFileURL = rootURL.appendingPathComponent(relPath)
-                var trashSucceeded = true
-
-                if FileManager.default.fileExists(atPath: localFileURL.path) {
-                    var trashURL: NSURL?
-                    do {
-                        try FileManager.default.trashItem(at: localFileURL, resultingItemURL: &trashURL)
-                    } catch {
-                        trashSucceeded = false
-                        self.logger.warning("无法将本地文件移入废纸篓 [\(relPath)]: \(error)，保留本地文件并标记为 blocked，绝不执行永久删除")
-                    }
-                }
-
-                if trashSucceeded {
-                    try await store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                        stmt.bindDouble(now, at: 1)
-                        stmt.bindInt64(item.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                    actionTracker.deleted += 1
-                } else {
-                    try await store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                        stmt.bindDouble(now, at: 1)
-                        stmt.bindInt64(item.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                }
-
-            case .conflict(let winner, let conflictId):
-                syncGroup.enter()
-                Task {
-                    await syncSemaphore.wait()
-                    defer { syncSemaphore.signal(); syncGroup.leave() }
-                    do {
-                        guard winner == .remote, let remoteID = item.remoteFileId,
-                              let localSHA = item.local?.sha256?.lowercased(),
-                              let remoteSHA = item.remote?.sha256?.lowercased() else {
-                            throw SyncEngineError.general("冲突缺少有效的双方内容证据")
-                        }
-                        let parentRel = dirContext.getRelPath(for: item.parentId) ?? ""
-                        let original = rootURL.appendingPathComponent(parentRel).appendingPathComponent(item.name)
-                        let op = try await ConflictOperation.prepare(store: self.store,
-                            rootID: rootId, itemID: item.itemId, parentID: item.parentId,
-                            original: original, remoteID: remoteID,
-                            parentRemoteID: dirContext.getRemoteId(for: item.parentId) ?? remoteRootId,
-                            copyRemoteID: self.idPool.nextId(), conflictID: conflictId,
-                            localSHA: localSHA, remoteSHA: remoteSHA,
-                            localGeneration: item.localGeneration, remoteGeneration: item.remoteGeneration,
-                            dirtyGeneration: item.dirtyGeneration)
-                        try await self.resolveConflict(op)
-                        actionTracker.conflicts.withLock { $0 += 1 }
-                    } catch {
-                        actionTracker.failures.withLock { $0 += 1 }
-                        self.logger.error("处理文件冲突失败 [\(item.name)]: \(error)")
-                    }
-                }
-
-            case .unchanged:
-                try await store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement("UPDATE items SET dirty_generation = 0 WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;")
-                    stmt.bindInt64(item.itemId, at: 1)
-                    stmt.bindInt64(item.localGeneration, at: 2)
-                    stmt.bindInt64(item.remoteGeneration, at: 3)
-                    stmt.bindInt64(item.dirtyGeneration, at: 4)
-                    _ = try stmt.step()
-                    stmt.reset()
-                }
-
-            case .waitingEvidence:
-                break
-            }
+        do {
+            try await scheduleFiles(fileItems, duringScan: false)
+        } catch {
+            await drainTransfers()
+            throw error
         }
 
         // 等待所有文件级上传、下载、修改保留与删除动作彻底完成并落库
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            syncGroup.notify(queue: .global(qos: .userInitiated)) {
-                cont.resume()
-            }
-        }
+        await drainTransfers()
         try await store.flush()
 
         // -------------------------------------------------------------
@@ -2915,34 +3085,39 @@ public final class SyncEngine: Sendable {
         // 依赖所有后代裁决结果，任何保留、新增、待上传/下载或冲突都会阻断目录删除
         // -------------------------------------------------------------
         // 1. 对于非删除状态的普通目录，直接提交并清除 dirty_generation
-        for item in dirItems {
-            let isCandidate = (item.local?.status == .absent && item.remote?.status == .present) ||
-                              (item.remote?.status == .trashed && item.local?.status == .present) ||
-                              (item.local?.status == .absent && item.remote?.status == .trashed)
-            if !isCandidate {
-                if item.local?.status != .unknown && item.remote?.status != .unknown {
-                    try await store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                        stmt.bindDouble(now, at: 1)
-                        stmt.bindInt64(item.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
+        if !dirItems.isEmpty {
+            try await store.write { conn in
+                for item in dirItems {
+                    let isCandidate = (item.local?.status == .absent && item.remote?.status == .present) ||
+                                      (item.remote?.status == .trashed && item.local?.status == .present) ||
+                                      (item.local?.status == .absent && item.remote?.status == .trashed)
+                    if !isCandidate {
+                        if item.local?.status != .unknown && item.remote?.status != .unknown {
+                            do {
+                                let stmt = try conn.cachedStatement("""
+                                UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                """)
+                                stmt.bindDouble(now, at: 1)
+                                stmt.bindInt64(item.itemId, at: 2)
+                                _ = try stmt.step()
+                                stmt.reset()
+                            }
+                        }
+                    } else if item.local?.status == .absent && item.remote?.status == .trashed {
+                        // 两端皆已删除
+                        do {
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                            """)
+                            stmt.bindDouble(now, at: 1)
+                            stmt.bindInt64(item.itemId, at: 2)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                        actionTracker.counts.withLock { $0.deleted += 1 }
                     }
                 }
-            } else if item.local?.status == .absent && item.remote?.status == .trashed {
-                // 两端皆已删除
-                try await store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement("""
-                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                    """)
-                    stmt.bindDouble(now, at: 1)
-                    stmt.bindInt64(item.itemId, at: 2)
-                    _ = try stmt.step()
-                    stmt.reset()
-                }
-                actionTracker.deleted += 1
+
             }
         }
 
@@ -3027,7 +3202,7 @@ public final class SyncEngine: Sendable {
                             _ = try stmt.step()
                             stmt.reset()
                         }
-                        actionTracker.deleted += 1
+                        actionTracker.counts.withLock { $0.deleted += 1 }
                     } catch {
                         self.logger.error("远端目录删除失败 [\(relPath)]: \(error)")
                     }
@@ -3083,7 +3258,7 @@ public final class SyncEngine: Sendable {
                             _ = try stmt.step()
                             stmt.reset()
                         }
-                        actionTracker.deleted += 1
+                        actionTracker.counts.withLock { $0.deleted += 1 }
                     } else {
                         try await store.batchWrite { conn in
                             let stmt = try conn.cachedStatement("""

@@ -69,6 +69,44 @@ let client = DriveClient(auth: auth)
 let engine = try await SyncEngine(auth: auth, store: store, client: client)
 ```
 
+### 2.3 设置下载临时目录
+
+默认下载到 `~/.gdrive/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
+这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
+初始化下载、增量下载及冲突恢复都使用此设置；目录按需创建。
+
+```swift
+// 设置的是基目录；引擎自动追加远程根 ID，不需要调用方追加。
+try engine.setDownloadTemporaryDirectory(
+    URL(fileURLWithPath: "/Volumes/Data/gdrive-downloads", isDirectory: true)
+)
+print(engine.downloadTemporaryDirectory.path)
+
+// 也可以在初始化时配置。
+let configuredEngine = try await SyncEngine(
+    auth: auth,
+    store: store,
+    client: client,
+    downloadTemporaryDirectory: URL(fileURLWithPath: "/Volumes/Data/gdrive-downloads", isDirectory: true)
+)
+
+// 恢复默认设置。
+try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDirectory)
+```
+
+`setDownloadTemporaryDirectory(_ directory: URL) throws` 接受本地文件 URL，配置由引擎实例持有，
+不写入数据库。同步轮次选定目录后，后续设置变更不会移动或重定向该轮在途下载。
+目录不能位于当前同步根或同一 StateStore 中其他已激活的同步根内（包括符号链接指向这些目录的情况）。
+临时目录与下载目标必须位于同一文件系统，以保持原子发布；跨卷会明确失败，
+应将基目录设置到目标卷上、所有同步目录之外。配置多个目标卷时，分别使用对应配置的引擎实例。
+
+普通失败会清理未发布的下载临时文件。替换本地文件时的恢复文件也保留在该临时目录：
+成功后旧版本移至废纸篓，若无法移入废纸篓或检测到发布竞态，则保留恢复文件。
+进程异常终止留下的临时文件不会在启动时自动清扫。
+
+直接调用 `DriveClient.downloadFile` 时，可用 `temporaryDirectory:` 指定完整暂存目录；
+该底层方法不知道同步根 ID，不会自动追加根 ID，省略时使用 `~/.gdrive`。
+
 ---
 
 ## 3. 同步接口调用方法

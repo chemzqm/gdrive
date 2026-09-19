@@ -57,9 +57,10 @@ struct PublicationSafetyTests {
         let newer = Data("concurrent local edit".utf8)
         let client = try client(in: directory)
         let changed = OSAllocatedUnfairLock(initialState: false)
+        let staging = directory.appendingPathComponent("downloads")
         do {
             try await client.downloadFile(remoteId: "remote", destinationURL: destination,
-                expectedSha256: SyncEngine.computeSha256(of: PublicationURLProtocol.content), onProgress: { _ in
+                expectedSha256: SyncEngine.computeSha256(of: PublicationURLProtocol.content), temporaryDirectory: staging, onProgress: { _ in
                     changed.withLock { done in
                         if !done {
                             do { try newer.write(to: destination) } catch { Issue.record(error) }
@@ -71,6 +72,7 @@ struct PublicationSafetyTests {
         } catch DriveError.fileModifiedDuringUpload { }
         #expect(try Data(contentsOf: destination) == newer)
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).allSatisfy { !$0.hasPrefix(".tmp_") })
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 
     @Test("Captured small and large inputs do not follow later source writes", arguments: [12, 9 * 1024 * 1024])
@@ -96,7 +98,9 @@ struct PublicationSafetyTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("file")
-        let download = directory.appendingPathComponent("download")
+        let staging = directory.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        let download = staging.appendingPathComponent("download")
         if kind != "created" { try Data("original".utf8).write(to: destination) }
         let expected = try LocalFileVersion.read(at: destination)
         if kind == "replaced" { try FileManager.default.removeItem(at: destination) }
@@ -116,7 +120,9 @@ struct PublicationSafetyTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let destination = directory.appendingPathComponent("file")
-        let download = directory.appendingPathComponent("download")
+        let staging = directory.appendingPathComponent("staging")
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: true)
+        let download = staging.appendingPathComponent("download")
         if existing { try Data("original".utf8).write(to: destination) }
         let expected = try LocalFileVersion.read(at: destination)
         let content = Data("remote version".utf8)
@@ -126,5 +132,28 @@ struct PublicationSafetyTests {
         #expect(published.inode == inode)
         #expect(try Data(contentsOf: destination) == content)
         #expect(!FileManager.default.fileExists(atPath: download.path))
+    }
+
+    @Test("Checksum and pre-publication cancellation clean the configured staging folder", arguments: [false, true])
+    func failedDownloadCleanup(cancel: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("staging-failure-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staging = directory.appendingPathComponent("downloads/remote-root")
+        let destination = directory.appendingPathComponent("file")
+        let original = Data("original".utf8)
+        try original.write(to: destination)
+        let client = try client(in: directory)
+        let expected = try LocalFileVersion.read(at: destination)
+        do {
+            try await client.downloadFileSafely(remoteId: "remote", destinationURL: destination,
+                expectedSha256: cancel ? SyncEngine.computeSha256(of: PublicationURLProtocol.content) : "wrong",
+                expectedDestination: expected, temporaryDirectory: staging,
+                beforePublish: { if cancel { throw CancellationError() } })
+            Issue.record("Failed download unexpectedly published")
+        } catch is CancellationError { #expect(cancel) }
+        catch DriveError.checksumMismatch { #expect(!cancel) }
+        #expect(try Data(contentsOf: destination) == original)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 }

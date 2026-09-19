@@ -628,16 +628,22 @@ public final class DriveClient: Sendable {
 
     // MARK: - 文件下载 (Download)
 
+    public static var defaultDownloadTemporaryDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive", isDirectory: true)
+    }
+
     /// 下载文件正文并流式校验 SHA-256，原子落盘到目标路径
     public func downloadFile(
         remoteId: String,
         destinationURL: URL,
         expectedSha256: String? = nil,
+        temporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws {
         _ = try await downloadFileSafely(
             remoteId: remoteId, destinationURL: destinationURL, expectedSha256: expectedSha256,
-            expectedDestination: LocalFileVersion.read(at: destinationURL), onProgress: onProgress
+            expectedDestination: LocalFileVersion.read(at: destinationURL),
+            temporaryDirectory: temporaryDirectory, onProgress: onProgress
         )
     }
 
@@ -647,12 +653,14 @@ public final class DriveClient: Sendable {
         destinationURL: URL,
         expectedSha256: String?,
         expectedDestination: LocalFileVersion?,
+        temporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
         beforePublish: (@Sendable () async throws -> Void)? = nil,
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws -> LocalFileVersion {
         guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
             throw DriveError.fileModifiedDuringUpload(path: destinationURL.path)
         }
+        try DownloadStaging.prepare(temporaryDirectory, destination: destinationURL)
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         components.queryItems = [
@@ -664,8 +672,7 @@ public final class DriveClient: Sendable {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         await rateLimiter.acquire()
-        let tempURL = destinationURL.deletingLastPathComponent()
-            .appendingPathComponent(".tmp_\(UUID().uuidString)")
+        let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
         var publishedSuccessfully = false
         defer {
             if !publishedSuccessfully {

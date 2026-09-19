@@ -1,6 +1,8 @@
 import Foundation
 import Testing
 import os
+import Darwin
+import DirectoryScanner
 @testable import GDrive
 
 private struct ChangesServer: Sendable {
@@ -15,12 +17,32 @@ private struct ChangesServer: Sendable {
     var incompleteFolder: String?
     var listingPages: [String: Data] = [:]
     var requests: [String] = []
+    var verifyUpload: (@Sendable (String) throws -> Void)?
+    var uploadDelay: TimeInterval = 0
+    var activeUploads = 0
+    var peakUploads = 0
 }
 private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
+    static let heldDownload = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+    static let holdDownloads = OSAllocatedUnfairLock(initialState: false)
     static let state = OSAllocatedUnfairLock(initialState: ChangesServer())
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
+        let delay = Self.state.withLock { state -> TimeInterval in
+            guard request.url!.path.contains("/upload/"), state.uploadDelay > 0 else { return 0 }
+            state.activeUploads += 1
+            state.peakUploads = max(state.peakUploads, state.activeUploads)
+            return state.uploadDelay
+        }
+        if delay > 0 {
+            DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                Self.state.withLock { $0.activeUploads -= 1 }
+                self.respond()
+            }
+        } else { respond() }
+    }
+    private func respond() {
         do {
             let url = request.url!
             let response: (Int, Data) = try Self.state.withLock { state in
@@ -47,6 +69,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
                     let metadata = try #require(JSONSerialization.jsonObject(with: Data(body[start...end].utf8)) as? [String: Any])
                     let id = try #require(metadata["id"] as? String)
                     let name = try #require(metadata["name"] as? String)
+                    try state.verifyUpload?(name)
                     let parent = (metadata["parents"] as? [String])?.first ?? "root"
                     let a = try #require(body.range(of: "Content-Type: application/octet-stream\r\n\r\n")?.upperBound)
                     let b = try #require(body.range(of: "\r\n--", range: a..<body.endIndex)?.lowerBound)
@@ -57,6 +80,14 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
                     return (200, try encoder.encode(file))
                 }
                 if url.path.hasSuffix("/files") {
+                    if request.httpMethod == "POST" {
+                        let metadata = try #require(JSONSerialization.jsonObject(with: request.extractBodyData ?? Data()) as? [String: Any])
+                        let id = try #require(metadata["id"] as? String)
+                        let name = try #require(metadata["name"] as? String)
+                        let file = DriveFile(id: id, name: name, mimeType: "application/vnd.google-apps.folder", parents: metadata["parents"] as? [String])
+                        state.files[id] = file
+                        return (200, try encoder.encode(file))
+                    }
                     let parent = (value("q") ?? "").split(separator: "'").first.map(String.init) ?? ""
                     if let rejected = state.rejectListingToken, value("pageToken") == rejected { return (400, Data("invalid pageToken".utf8)) }
                     if state.failFolder == parent { return (400, Data("listing failure".utf8)) }
@@ -71,6 +102,10 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
             }
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: response.0, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: response.1)
+            if request.url!.query?.contains("alt=media") == true, Self.holdDownloads.withLock({ $0 }) {
+                Self.heldDownload.withLock { $0 = { self.client?.urlProtocolDidFinishLoading(self) } }
+                return
+            }
             client?.urlProtocolDidFinishLoading(self)
         } catch { client?.urlProtocol(self, didFailWithError: error) }
     }
@@ -703,12 +738,231 @@ struct ChangesRecoveryTests {
     func downloadReusesCursor() async throws {
         let f = try await fixture()
         defer { try? FileManager.default.removeItem(at: f.directory) }
+        let staging = f.directory.appendingPathComponent("bootstrap-downloads")
+        try f.engine.setDownloadTemporaryDirectory(staging)
         try await f.store.write { try $0.execute("DELETE FROM roots;") }
         remoteFile("new", parent: "root")
         let result = try await f.engine.sync(localPath: f.local.path, remoteFolderId: "root")
         #expect(result.filesDownloaded == 1)
         #expect(result.filesFailed == 0)
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.appendingPathComponent("root").path).isEmpty)
         #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("startPageToken") }.count } == 1)
+    }
+
+    private func oneEntry(_ url: URL, type: EntryType = .file) throws -> ScanBatch {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { throw POSIXError(.EIO) }
+        let bytes = Array(url.path.utf8)
+        return ScanBatch(pathData: bytes + [0], records: [.init(offset: 0, length: UInt32(bytes.count), type: type,
+            metadata: FileMetadata(identity: FileIdentity(device: info.st_dev, inode: info.st_ino),
+                modificationTime: FileTimestamp(seconds: Int64(info.st_mtimespec.tv_sec), nanoseconds: Int32(info.st_mtimespec.tv_nsec)),
+                changeTime: FileTimestamp(seconds: Int64(info.st_ctimespec.tv_sec), nanoseconds: Int32(info.st_ctimespec.tv_nsec)),
+                fileSize: Int64(info.st_size)))])
+    }
+
+    private func waitForUpload(_ name: String) async throws -> Bool {
+        for _ in 0..<200 {
+            if ChangesProtocol.state.withLock({ $0.files.values.contains { $0.name == name } }) { return true }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
+    @Test("Streaming downloads stay outside the active scan and use the configured remote-root folder")
+    func downloadOutsideScan() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let first = f.local.appendingPathComponent("first")
+        let old = Data("old".utf8)
+        try old.write(to: first)
+        let remote = remoteFile("remote-first", parent: "root", content: String(repeating: "R", count: 131072), name: "first")
+        let oldSHA = SyncEngine.computeSha256(of: old)
+        let remoteSHA = try #require(remote.sha256Checksum)
+        try await f.store.write { conn in
+            try conn.execute("INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,base_sha256,base_size,remote_sha256,remote_size,remote_status,phase,dirty_generation,created_at,updated_at) VALUES (\(f.rootID),\(f.rootItemID),'first','file','remote-first','\(oldSHA)',3,'\(remoteSHA)',131072,'present','ready',1,1,1);")
+        }
+        let batch = try oneEntry(first)
+        let stagingBase = f.directory.appendingPathComponent("downloads")
+        let staging = stagingBase.appendingPathComponent("root")
+        ChangesProtocol.holdDownloads.withLock { $0 = true }
+        defer { ChangesProtocol.holdDownloads.withLock { $0 = false } }
+        let engine = try await SyncEngine(auth: f.auth, store: f.store, client: f.client,
+            idPool: IDPool(initialIds: ["temp-upload-id"]), incrementalScan: { _, consume in
+                defer { ChangesProtocol.heldDownload.withLock { callback in callback?(); callback = nil } }
+                try await consume(batch)
+                var temporary: URL?
+                for _ in 0..<500 {
+                    // Check both places so this reproduces the original in-tree download defect.
+                    let entries = (try? FileManager.default.contentsOfDirectory(at: staging, includingPropertiesForKeys: nil)) ?? []
+                    let localEntries = try FileManager.default.contentsOfDirectory(at: f.local, includingPropertiesForKeys: nil)
+                    temporary = (entries + localEntries).first {
+                        $0.lastPathComponent.hasPrefix(".tmp_") && ((try? LocalFileVersion.read(at: $0))?.size ?? 0) >= 131072
+                    }
+                    if temporary != nil { break }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                let observedTemporary = try #require(temporary)
+                #expect(observedTemporary.deletingLastPathComponent().resolvingSymlinksInPath().path == staging.resolvingSymlinksInPath().path)
+                for entry in try FileManager.default.contentsOfDirectory(at: f.local, includingPropertiesForKeys: nil)
+                    where entry.lastPathComponent != "first" {
+                    try await consume(oneEntry(entry))
+                    _ = try await waitForUpload(entry.lastPathComponent)
+                }
+            })
+        try engine.setDownloadTemporaryDirectory(stagingBase)
+        #expect(throws: (any Error).self) {
+            try engine.setDownloadTemporaryDirectory(URL(string: "https://example.invalid/downloads")!)
+        }
+        #expect(engine.downloadTemporaryDirectory == stagingBase)
+        let stats = try await engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+        #expect(stats.filesDownloaded == 1)
+        #expect(stats.filesUploaded == 0)
+        #expect(stats.filesFailed == 0)
+        #expect(try Data(contentsOf: first) == Data(String(repeating: "R", count: 131072).utf8))
+        #expect(ChangesProtocol.state.withLock { !$0.files.values.contains { $0.name.hasPrefix(".tmp_") } })
+        #expect(try FileManager.default.contentsOfDirectory(atPath: f.local.path) == ["first"])
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).allSatisfy { !$0.hasPrefix(".tmp_") || $0.contains(".local-conflict-") })
+    }
+
+    @Test("A16 first upload completes while the scanner's tail is paused", arguments: ["complete", "error", "cancel"])
+    func uploadBeforeScanEnd(ending: String) async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let first = f.local.appendingPathComponent("first")
+        try Data("first body".utf8).write(to: first)
+        let batch = try oneEntry(first)
+        let tail = f.local.appendingPathComponent("slow-tail")
+        try FileManager.default.createDirectory(at: tail, withIntermediateDirectories: true)
+        let tailBatch = try oneEntry(tail, type: .directory)
+        // A known tail directory avoids a fake directory creation; it is deliberately not emitted yet.
+        try await f.store.write { conn in
+            try conn.execute("INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id, local_status, remote_status, phase, created_at, updated_at) VALUES (\(f.rootID), \(f.rootItemID), 'slow-tail', 'directory', 'tail', 'present', 'present', 'committed', 1, 1);")
+        }
+        // The HTTP boundary checks that local observation AND create intent were committed first.
+        ChangesProtocol.state.withLock { state in
+            state.verifyUpload = { name in
+                let conn = try SQLiteConnection(path: f.store.path, readonly: true)
+                let q = try conn.prepare("SELECT i.local_sha256, op.expected_sha256 FROM items i JOIN operations op ON op.item_id = i.item_id WHERE i.name = ? AND op.state != 'completed';")
+                q.bindText(name, at: 1)
+                #expect(try q.step())
+                #expect(q.columnText(at: 0) == SyncEngine.computeSha256(of: Data("first body".utf8)))
+                #expect(q.columnText(at: 0) == q.columnText(at: 1))
+            }
+        }
+        let engine = try await SyncEngine(auth: f.auth, store: f.store, client: f.client,
+            idPool: IDPool(initialIds: ["first-id"]), incrementalScan: { _, consume in
+                try await consume(batch)
+                // Do not supply the tail until the real multipart request has completed.
+                #expect(try await waitForUpload("first"))
+                if ending == "error" { throw POSIXError(.EIO) }
+                if ending == "cancel" {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    try Task.checkCancellation()
+                }
+                try await consume(tailBatch)
+            })
+        let run = Task { try await engine.syncIncremental(localPath: f.local.path, remoteRootId: "root") }
+        if ending == "error" {
+            await #expect(throws: POSIXError.self) { try await run.value }
+        } else if ending == "cancel" {
+            await #expect(throws: CancellationError.self) { try await run.value }
+        } else {
+            let result = try await run.value
+            #expect(result.filesUploaded == 1)
+            #expect(result.filesFailed == 0)
+        }
+        try await f.store.read { conn in
+            let q = try conn.prepare("SELECT phase, dirty_generation FROM items WHERE name = 'first';")
+            #expect(try q.step())
+            #expect(q.columnText(at: 0) == "committed")
+            #expect(q.columnInt64(at: 1) == 0)
+            let tail = try conn.prepare("SELECT local_status, is_tombstone FROM items WHERE name = 'slow-tail';")
+            #expect(try tail.step())
+            #expect(tail.columnText(at: 0) == "present")
+            #expect(tail.columnInt64(at: 1) == 0)
+        }
+        #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("/upload/") }.count } == 1)
+    }
+
+    @Test("A16 1000 observations and matching receipts commit in bounded batches")
+    func naturalObservationCommits() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let data = Data("same body".utf8)
+        let sha = SyncEngine.computeSha256(of: data)
+        for i in 0..<1000 { try data.write(to: f.local.appendingPathComponent("file-\(i)")) }
+        try await f.store.write { conn in
+            let q = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    base_sha256, base_size, remote_sha256, remote_size, remote_status,
+                    phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, ?, 'file', ?, ?, 9, ?, 9, 'present', 'ready', 1, 1, 1);
+                """)
+            for i in 0..<1000 {
+                q.bindInt64(f.rootID, at: 1)
+                q.bindInt64(f.rootItemID, at: 2)
+                q.bindText("file-\(i)", at: 3)
+                q.bindText("remote-\(i)", at: 4)
+                q.bindText(sha, at: 5)
+                q.bindText(sha, at: 6)
+                _ = try q.step()
+                q.reset()
+            }
+        }
+        let before = await f.store.getWriterStats()
+        let result = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+        let after = await f.store.getWriterStats()
+        #expect(result.filesScanned == 1000)
+        #expect(result.filesUploaded == 0)
+        #expect(result.filesFailed == 0)
+        #expect(after.totalCommits - before.totalCommits <= 45)
+        #expect(after.timeoutTriggeredCommits == before.timeoutTriggeredCommits)
+        try await f.store.read { conn in
+            let q = try conn.prepare("SELECT COUNT(*) FROM items WHERE entry_kind = 'file' AND local_sha256 = base_sha256 AND dirty_generation = 0 AND local_generation = 1;")
+            #expect(try q.step())
+            #expect(q.columnInt64(at: 0) == 1000)
+            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT items.item_id FROM json_each('[1,2,3]') selected CROSS JOIN items ON items.item_id = selected.value WHERE items.root_id = 1 AND items.dirty_generation > 0 AND items.is_tombstone = 0;")
+            var details: [String] = []
+            while try plan.step() { details.append(plan.columnText(at: 3) ?? "") }
+            #expect(details.contains { $0.contains("SEARCH items USING INTEGER PRIMARY KEY") })
+        }
+        print("A16 1000 observations: commits=\(after.totalCommits - before.totalCommits), elapsed=\(result.elapsedSeconds)")
+    }
+
+    @Test("A16 transfer scheduling applies backpressure before creating tasks")
+    func boundedIncrementalUploads() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        for i in 0..<80 { try Data("body".utf8).write(to: f.local.appendingPathComponent("file-\(i)")) }
+        ChangesProtocol.state.withLock { $0.uploadDelay = 0.02 }
+        let result = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root", maxConcurrency: 2)
+        #expect(result.filesUploaded == 80)
+        #expect(result.filesFailed == 0)
+        #expect(ChangesProtocol.state.withLock { $0.peakUploads } == 2)
+        #expect(ChangesProtocol.state.withLock { $0.activeUploads } == 0)
+    }
+
+    @Test("A16 early child upload waits for a pending parent create to recover")
+    func pendingParentBeforeChild() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let directory = f.local.appendingPathComponent("pending-parent")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("child body".utf8).write(to: directory.appendingPathComponent("child"))
+        var version = stat()
+        #expect(stat(directory.path, &version) == 0)
+        _ = try await DurableCreateIntentStore.prepareDirectory(store: f.store,
+            rootID: f.rootID, parentItemID: f.rootItemID, name: "pending-parent",
+            targetParentRemoteID: "root", candidateRemoteID: "pending-id",
+            device: Int64(version.st_dev), inode: Int64(version.st_ino))
+        let result = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+        #expect(result.filesUploaded == 1)
+        #expect(result.filesFailed == 0)
+        let requests = ChangesProtocol.state.withLock { $0.requests }
+        let creation = try #require(requests.firstIndex { $0.hasPrefix("POST /drive/v3/files?") })
+        let upload = try #require(requests.firstIndex { $0.contains("/upload/") })
+        #expect(creation < upload)
+        #expect(ChangesProtocol.state.withLock { $0.files.values.first { $0.name == "child" }?.parents } == ["pending-id"])
     }
 
 }
