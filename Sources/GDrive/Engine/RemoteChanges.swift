@@ -382,7 +382,9 @@ struct RemoteChanges: Sendable {
                       (attrs[.systemFileNumber] as? NSNumber)?.int64Value == existing.inode else { return false }
             }
         }
-        if file.isDirectory { try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true) }
+        if file.isDirectory, existing == nil {
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        }
         let id: Int64
         if let existing { id = existing.id }
         else if let localOnlyID { id = localOnlyID }
@@ -402,10 +404,16 @@ struct RemoteChanges: Sendable {
             """, [.int(parent.id), .text(file.name), .text(file.id), .text(file.name), .text(parentRemote),
                     .text(file.sha256Checksum), .int(file.sizeBytes), .int(file.versionNumber), .int(id)])
         if file.isDirectory {
-            let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
-            try Self.execute(conn, "UPDATE items SET local_device = ?, local_inode = ?, local_status = 'present' WHERE item_id = ?;",
-                [.int((attrs[.systemNumber] as? NSNumber)?.int64Value),
-                 .int((attrs[.systemFileNumber] as? NSNumber)?.int64Value), .int(id)])
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: destination.path, isDirectory: &isDirectory) {
+                guard isDirectory.boolValue else { return false }
+                let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
+                try Self.execute(conn, "UPDATE items SET local_device = ?, local_inode = ?, local_status = 'present' WHERE item_id = ?;",
+                    [.int((attrs[.systemNumber] as? NSNumber)?.int64Value),
+                     .int((attrs[.systemFileNumber] as? NSNumber)?.int64Value), .int(id)])
+            } else {
+                try Self.execute(conn, "UPDATE items SET local_status = 'absent' WHERE item_id = ?;", [.int(id)])
+            }
         }
         let wasExcluded = try Self.statement(conn, "SELECT 1 FROM items WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 1;", [.int(rootID), .int(id)])
         let returning = try wasExcluded.step()

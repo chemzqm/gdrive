@@ -202,14 +202,14 @@ struct IDPoolTests {
 
         let taken = await pool.takeIds(count: 2)
         #expect(taken == ["id2", "id3"])
-        let countAfterTake = await pool.count
-        #expect(countAfterTake == 1)
-
-        // Remaining 1 id is below threshold of 200, so prefetch is triggered
-        // Wait a short moment for prefetch to finish
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // Wait for the background result, not an assumed 50ms scheduling deadline.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while await pool.count == 1, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
         let countAfterPrefetch = await pool.count
         #expect(countAfterPrefetch == 1001)
+        #expect(await mock.totalRequests == 1)
     }
 
     @Test("ensureCapacity pulls multiple batches up to target capacity")

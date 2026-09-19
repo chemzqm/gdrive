@@ -184,9 +184,10 @@ struct SyncEngineTests {
         try "Modified content for file 3 at \(Date())\n".write(to: modFile, atomically: true, encoding: .utf8)
 
         let round3 = try await engine.syncLocalToRemoteEmpty(localPath: tempDir.path, remoteRootId: remoteRoot.id)
-        #expect(round3.filesUploaded == 1)
+        #expect(round3.filesUploaded == 0)
+        #expect(round3.filesFailed == 1)
         #expect(round3.filesSkipped == 4)
-        print("✅ 第三轮部分变更检测: 上传 1 项，跳过 4 项，精度 100%！")
+        print("✅ 第三轮部分变更检测: 已有远端正文覆盖被阻断，跳过 4 项")
     }
 
     @Test("Incremental bidirectional sync with local modification, addition, deletion and remote change")
@@ -251,7 +252,8 @@ struct SyncEngineTests {
         print("   删除文件数: \(incStats.filesDeleted)")
         print("   跳过不变项: \(incStats.filesSkipped)")
 
-        #expect(incStats.filesUploaded == 2) // modify.txt + new_local.txt
+        #expect(incStats.filesUploaded == 1) // new_local.txt；modify.txt 的不安全覆盖被阻断
+        #expect(incStats.filesFailed == 1)
         #expect(incStats.filesDeleted == 1)  // delete_me.txt
         #expect(incStats.filesSkipped >= 1)  // keep.txt
 
@@ -525,6 +527,7 @@ struct SyncEngineTests {
 
         let testStore = try await StateStore(path: testDbPath)
         let fakeRemoteId = remoteRootGenIds[1]
+        let startPageToken = try await client.getStartPageToken()
 
         // 预设一个已失效且哈希不匹配的 inFlight 会话
         try await testStore.write { conn in
@@ -559,6 +562,11 @@ struct SyncEngineTests {
                 'resumable_\(fakeRemoteId)', 1, 100, 'uploadResumable', 'inFlight',
                 '0000000000000000000000000000000000000000000000000000000000000000', '\(fakeRemoteId)', '\(remoteRoot.id)',
                 'https://upload.invalid/stale_session', 4194304, 9437184, 0, 0
+            );
+            INSERT INTO cursors (
+                root_id, account_id, cursor_kind, token_value, updated_at
+            ) VALUES (
+                1, 'default', 'drive_changes', '\(startPageToken)', 0
             );
             """)
         }

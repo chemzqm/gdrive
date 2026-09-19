@@ -142,6 +142,53 @@ struct ChangesRecoveryTests {
         Issue.record("Remote work did not converge within the bounded fixture")
     }
 
+    @Test("A known remote directory event preserves a local deletion for reconciliation")
+    func knownDirectoryEventPreservesLocalDeletion() async throws {
+        let f = try await fixture()
+        defer { try? FileManager.default.removeItem(at: f.directory) }
+        let localDirectory = f.local.appendingPathComponent("deleted")
+        try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
+        let attrs = try FileManager.default.attributesOfItem(atPath: localDirectory.path)
+        let device = (attrs[.systemNumber] as? NSNumber)?.int64Value ?? 0
+        let inode = (attrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
+        let remoteDirectory = folder("known-directory", "root", name: "deleted")
+        try await f.store.write { conn in
+            let q = try conn.prepare("""
+                INSERT INTO items(
+                    root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status,
+                    phase, created_at, updated_at
+                ) VALUES (?, ?, 'deleted', 'directory', 'known-directory', ?, ?,
+                    'present', 'present', 'committed', 1, 1);
+                """)
+            q.bindInt64(f.rootID, at: 1)
+            q.bindInt64(f.rootItemID, at: 2)
+            q.bindInt64(device, at: 3)
+            q.bindInt64(inode, at: 4)
+            _ = try q.step()
+        }
+        try FileManager.default.removeItem(at: localDirectory)
+        ChangesProtocol.state.withLock {
+            $0.files[remoteDirectory.id] = remoteDirectory
+            $0.pages["start"] = DriveChangesPage(
+                nextPageToken: nil,
+                newStartPageToken: "steady",
+                changes: [DriveChange(fileId: remoteDirectory.id, removed: false, file: remoteDirectory)]
+            )
+        }
+
+        let stats = try await f.engine.syncIncremental(localPath: f.local.path, remoteRootId: "root")
+
+        #expect(stats.filesDeleted == 1)
+        #expect(!FileManager.default.fileExists(atPath: localDirectory.path))
+        let tombstone = try await f.store.read { conn in
+            let q = try conn.prepare("SELECT is_tombstone, local_status FROM items WHERE remote_file_id = 'known-directory';")
+            guard try q.step() else { return false }
+            return q.columnInt64(at: 0) == 1 && q.columnText(at: 1) == "absent"
+        }
+        #expect(tombstone)
+    }
+
     @Test("Child before parent across pages survives a page failure and database reopen")
     func childBeforeParent() async throws {
         let f = try await fixture()
