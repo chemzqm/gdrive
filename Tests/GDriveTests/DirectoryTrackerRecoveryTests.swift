@@ -93,6 +93,62 @@ struct DirectoryTrackerRecoveryTests {
 
     // MARK: - Unit Tests: DirectoryTracker (Probe P04 & Error Propagation)
 
+    @Test("A bootstrap download receipt database failure escapes the sync call")
+    func downloadReceiptDatabaseFailureThrows() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("download-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        try await store.write { conn in
+            try conn.execute("""
+                CREATE TRIGGER reject_download_receipt BEFORE INSERT ON items
+                WHEN NEW.entry_kind = 'file'
+                BEGIN SELECT RAISE(ABORT, 'download receipt failure'); END;
+                """)
+        }
+        let body = Data("downloaded bytes".utf8)
+        let digest = SyncEngine.computeSha256(of: body)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"initial"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(#"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/file") { return (response, body) }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [[
+                    "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                    "size": String(body.count), "sha256Checksum": digest, "parents": ["root"]
+                ]]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(auth: auth, store: store, client: createMockClient(auth: auth))
+        do {
+            _ = try await engine.syncRemoteToLocalEmpty(localPath: local.path, remoteRootId: "root")
+            Issue.record("Expected the database receipt failure to escape")
+        } catch {
+            #expect((error as NSError).domain == "SQLiteStatement")
+            #expect(error.localizedDescription.contains("download receipt failure"))
+        }
+        #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
+        let completed = try await store.read { conn in
+            let query = try conn.prepare("SELECT bootstrap_state FROM roots;")
+            defer { query.reset() }
+            guard try query.step() else { return false }
+            return query.columnText(at: 0) == "existingKnown"
+        }
+        #expect(!completed)
+    }
+
     @Test("P04 probe: Cancelling a task waiting on awaitParentReady resumes with CancellationError in bounded time")
     func testCancellationWakesUpWaiter() async throws {
         let tracker = DirectoryTracker(remoteRootId: "remote_root")

@@ -254,6 +254,41 @@ struct ChangesRecoveryTests {
         Issue.record("Remote work did not converge within the bounded fixture")
     }
 
+    @Test("An incremental upload receipt SQLite failure drains then propagates")
+    func incrementalUploadReceiptSQLiteFailurePropagates() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let local = testFixture.local.appendingPathComponent("receipt-failure.txt")
+        let content = Data("receipt body".utf8)
+        try content.write(to: local)
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+                CREATE TRIGGER fail_incremental_upload_receipt
+                BEFORE UPDATE OF remote_file_id ON items
+                WHEN NEW.name = 'receipt-failure.txt'
+                BEGIN SELECT RAISE(ABORT, 'injected upload receipt failure'); END;
+                """)
+        }
+
+        let error = await #expect(throws: (any Error).self) {
+            try await testFixture.engine.syncIncrementalUnlocked(
+                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+                onProgress: nil, localChanges: [.modified(path: local.path, isDirectory: false)])
+        }
+        let sqlite = try #require(error) as NSError
+        #expect(sqlite.domain == "SQLiteStatement")
+        let state = try await testFixture.store.read { conn -> (String?, Int64?) in
+            let statement = try conn.prepare(
+                "SELECT local_sha256, dirty_generation FROM items WHERE name = 'receipt-failure.txt';")
+            defer { statement.reset() }
+            #expect(try statement.step())
+            return (statement.columnText(at: 0), statement.columnInt64(at: 1))
+        }
+        #expect(state.0 == SyncEngine.computeSha256(of: content))
+        #expect((state.1 ?? 0) > 0)
+    }
+
     @Test("A known remote directory event preserves a local deletion for reconciliation")
     func knownDirectoryEventPreservesLocalDeletion() async throws {
         let testFixture = try await fixture()

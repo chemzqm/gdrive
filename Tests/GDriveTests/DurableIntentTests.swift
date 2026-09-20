@@ -72,6 +72,26 @@ struct DurableIntentTests {
         }
     }
 
+    @Test("Marking an unknown outcome propagates its SQLite write failure")
+    func markUnknownOutcomePropagatesWriteFailure() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-unknown-outcome-write-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        try await store.write { conn in
+            try conn.execute("DROP TABLE operations;")
+        }
+
+        await #expect(throws: (any Error).self) {
+            try await DurableCreateIntentStore.markUnknownOutcome(
+                store: store,
+                operationID: "missing-operation",
+                error: URLError(.networkConnectionLost)
+            )
+        }
+    }
+
     @Test("An unfinished multipart intent survives a fresh store and reuses its operation and Drive IDs")
     func unfinishedIntentReusesIdentity() async throws {
         defer { context.value.requestHandler = nil }

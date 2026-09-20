@@ -256,6 +256,7 @@ public final class SyncEngine: Sendable {
         localPath: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
+        try await verifyDatabaseConnection()
         let resolvedLocalPath = Self.normalizedPath(localPath)
         try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
         do {
@@ -267,6 +268,16 @@ public final class SyncEngine: Sendable {
                 Task { await self.drainPendingLocalChanges(localRootPath: resolvedLocalPath) }
             }
             throw error
+        }
+    }
+
+    private func verifyDatabaseConnection() async throws {
+        try await store.read { conn in
+            let statement = try conn.cachedStatement("SELECT 1;")
+            defer { statement.reset() }
+            guard try statement.step() else {
+                throw SyncEngineError.general("Database connection check returned no result")
+            }
         }
     }
 

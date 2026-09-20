@@ -297,6 +297,7 @@ struct RemoteChanges: Sendable {
                 } catch {
                     try conn.execute("ROLLBACK TO remote_apply;")
                     try conn.execute("RELEASE remote_apply;")
+                    if DatabaseFailure.isSQLite(error) { throw error }
                 }
             }
         }

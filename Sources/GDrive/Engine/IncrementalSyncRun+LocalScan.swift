@@ -332,6 +332,7 @@ extension IncrementalSyncRun {
                         itemId: existing.itemId, parentItemId: parentItemId, name: name,
                         remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
                 } catch {
+                    if DatabaseFailure.isSQLite(error) { throw error }
                     engine.logger.error(
                         "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
                     return
@@ -341,6 +342,7 @@ extension IncrementalSyncRun {
                 let remoteParentId = try remoteParentID(parentItemID: parentItemId, relPath: relPath)
                 var intent: DurableCreateIntent?
                 do {
+                    try self.actionTracker.throwIfDatabaseFailure()
                     let candidateRemoteID = try await engine.idPool.nextId()
                     let prepared = try await DurableCreateIntentStore.prepareDirectory(
                         store: engine.store,
@@ -382,6 +384,7 @@ extension IncrementalSyncRun {
                     seenDirTracker.markSeen(parentId: parentItemId, name: name)
                     scanProgress.incDirs()
                 } catch {
+                    if DatabaseFailure.isSQLite(error) { throw error }
                     if let intent {
                         try await DurableCreateIntentStore.markUnknownOutcome(
                             store: engine.store,
@@ -479,6 +482,7 @@ extension IncrementalSyncRun {
                     }
                     seenTracker.markSeen(parentId: parentItemId, name: name)
                 } catch {
+                    if DatabaseFailure.isSQLite(error) { throw error }
                     engine.logger.error(
                         "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)")
                     return
@@ -547,6 +551,7 @@ extension IncrementalSyncRun {
             var pendingObservations: [IncrementalLocalObservation] = []
             var firstObservationSent = sentFirstObservation.withLock { $0 }
             for record in records {
+                try self.actionTracker.throwIfDatabaseFailure()
                 let fullPath = record.fullPath
                 let relPath: String
                 if fullPath.hasPrefix(staticPrefix) {
@@ -573,6 +578,7 @@ extension IncrementalSyncRun {
                     continue
                 }
                 if record.type == .directory, !pendingObservations.isEmpty {
+                    try self.actionTracker.throwIfDatabaseFailure()
                     try await commitObservations(pendingObservations)
                     pendingObservations.removeAll(keepingCapacity: true)
                     firstObservationSent = true
@@ -587,6 +593,7 @@ extension IncrementalSyncRun {
                         firstObservationSent: &firstObservationSent)
                 }
             }
+            try self.actionTracker.throwIfDatabaseFailure()
             try await commitObservations(pendingObservations)
             let sent = firstObservationSent || !pendingObservations.isEmpty
             sentFirstObservation.withLock { $0 = sent }
@@ -743,9 +750,11 @@ extension IncrementalSyncRun {
         } catch {
             // No transfer may escape a failed/cancelled scan and mutate state after return.
             await self.drainTransfers()
+            try self.actionTracker.throwIfDatabaseFailure()
             throw error
         }
         await self.drainTransfers()
+        try self.actionTracker.throwIfDatabaseFailure()
 
     }
 }

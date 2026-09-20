@@ -186,6 +186,7 @@ extension IncrementalSyncRun {
     func execute() async throws -> SyncStats {
         defer { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
         try await scanLocal()
+        try actionTracker.throwIfDatabaseFailure()
         try await markMissingAfterSuccessfulScan()
         let dirtyItems = try await loadDirtyItems()
         let eligibleItems = dirtyItems.filter { item in
@@ -200,9 +201,11 @@ extension IncrementalSyncRun {
             try await scheduleFiles(fileItems, duringScan: false)
         } catch {
             await drainTransfers()
+            try actionTracker.throwIfDatabaseFailure()
             throw error
         }
         await drainTransfers()
+        try actionTracker.throwIfDatabaseFailure()
         try await engine.store.flush()
         try await reconcileDirectories(dirItems)
         return try await finish()

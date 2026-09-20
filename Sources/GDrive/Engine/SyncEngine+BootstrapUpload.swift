@@ -105,7 +105,25 @@ extension SyncEngine {
             remoteID: remoteRootId,
             itemID: rootItemId
         ))
+        let databaseError = OSAllocatedUnfairLock<Error?>(initialState: nil)
 
+        @Sendable func recordDatabaseError(_ error: Error) {
+            guard DatabaseFailure.isSQLite(error) else { return }
+            databaseError.withLock { if $0 == nil { $0 = error } }
+        }
+
+        @Sendable func recordUnknownOutcome(
+            _ error: Error, createIntent: DurableCreateIntent?
+        ) async {
+            recordDatabaseError(error)
+            guard let createIntent else { return }
+            do {
+                try await DurableCreateIntentStore.markUnknownOutcome(
+                    store: self.store, operationID: createIntent.operationID, error: error)
+            } catch {
+                recordDatabaseError(error)
+            }
+        }
         func restoreKnownDirectories() async throws {
             // in advance from SQLite Load all known subdirectory mappings, restore bootstrap Or reuse it resolutely when re-running to avoid blindly re-creating
             struct ExistingDirectory: Sendable {
@@ -286,6 +304,7 @@ extension SyncEngine {
                 await uploadSemaphore.wait()
                 didAcquireSemaphore = true
                 try Task.checkCancellation()
+                if let error = databaseError.withLock({ $0 }) { throw error }
 
                 let fileURL = URL(fileURLWithPath: fullPath)
                 let limit8MB: Int64 = 8 * 1024 * 1024
@@ -587,25 +606,23 @@ extension SyncEngine {
                 }
                 progress.recordSuccess(bytes: fileSize)
             } catch {
-                if let createIntent {
-                    try? await DurableCreateIntentStore.markUnknownOutcome(
-                        store: self.store,
-                        operationID: createIntent.operationID,
-                        error: error
-                    )
-                }
+                await recordUnknownOutcome(error, createIntent: createIntent)
                 progress.recordFailure()
                 if case DriveError.unsafeOverwrite = error, let parentItemID {
-                    try? await self.store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement("""
-                        UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
-                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
-                        """)
-                        stmt.bindInt64(rootId, at: 1)
-                        stmt.bindInt64(parentItemID, at: 2)
-                        stmt.bindText(name, at: 3)
-                        _ = try stmt.step()
-                        stmt.reset()
+                    do {
+                        try await self.store.batchWrite { conn in
+                            let stmt = try conn.cachedStatement("""
+                            UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
+                            WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                            """)
+                            stmt.bindInt64(rootId, at: 1)
+                            stmt.bindInt64(parentItemID, at: 2)
+                            stmt.bindText(name, at: 3)
+                            _ = try stmt.step()
+                            stmt.reset()
+                        }
+                    } catch {
+                        recordDatabaseError(error)
                     }
                 }
                 self.logger.error("Failed to upload file [\(relPath)]: \(error)")
@@ -621,6 +638,7 @@ extension SyncEngine {
                 await directorySemaphore.wait()
                 defer { directorySemaphore.signal() }
                 try Task.checkCancellation()
+                if let error = databaseError.withLock({ $0 }) { throw error }
                 let candidateRemoteId = try await self.idPool.nextId()
                 let intent = try await DurableCreateIntentStore.prepareDirectory(
                     store: self.store,
@@ -658,12 +676,14 @@ extension SyncEngine {
                 progress.recordDirCreated()
                 return BootstrapDirectoryTarget(remoteID: intent.targetRemoteID, itemID: intent.itemID)
             } catch {
+                recordDatabaseError(error)
                 if let createIntent {
-                    try? await DurableCreateIntentStore.markUnknownOutcome(
-                        store: self.store,
-                        operationID: createIntent.operationID,
-                        error: error
-                    )
+                    do {
+                        try await DurableCreateIntentStore.markUnknownOutcome(
+                            store: self.store, operationID: createIntent.operationID, error: error)
+                    } catch {
+                        recordDatabaseError(error)
+                    }
                 }
                 progress.recordDirectoryFailure()
                 self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
@@ -673,11 +693,13 @@ extension SyncEngine {
 
         @Sendable func processBatch(_ batch: ScanBatch) async throws {
             try Task.checkCancellation()
+            if let error = databaseError.withLock({ $0 }) { throw error }
             try batch.withRawData { rawBuf in
                 guard let basePtr = rawBuf.baseAddress else { return }
 
                 for idx in 0..<batch.count {
                     try Task.checkCancellation()
+                    if let error = databaseError.withLock({ $0 }) { throw error }
                     let record = batch.records[idx]
                     let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
                     let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
@@ -739,6 +761,7 @@ extension SyncEngine {
         } catch {
             taskRegistry.cancelAll()
             await taskRegistry.waitForAll()
+            if let databaseFailure = databaseError.withLock({ $0 }) { throw databaseFailure }
             throw error
         }
 
@@ -749,6 +772,7 @@ extension SyncEngine {
         } onCancel: {
             taskRegistry.cancelAll()
         }
+        if let error = databaseError.withLock({ $0 }) { throw error }
         try Task.checkCancellation()
 
         // 6. Force the buffer to be written to disk and execute WAL checkpoint

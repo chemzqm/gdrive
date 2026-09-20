@@ -176,6 +176,7 @@ extension IncrementalSyncRun {
                         conn: conn, operationID: intent.operationID, now: timestamp)
                 }
             } catch {
+                if DatabaseFailure.isSQLite(error) { throw error }
                 try await DurableCreateIntentStore.markUnknownOutcome(
                     store: engine.store,
                     operationID: intent.operationID,
@@ -323,6 +324,7 @@ extension IncrementalSyncRun {
                         }
                         self.actionTracker.counts.withLock { $0.deleted += 1 }
                     } catch {
+                        if DatabaseFailure.isSQLite(error) { throw error }
                         engine.logger.error(
                             "Failed to delete remote directory [\(relPath)]: \(error)")
                     }
@@ -351,6 +353,7 @@ extension IncrementalSyncRun {
                             stmt.reset()
                         }
                     } catch {
+                        if DatabaseFailure.isSQLite(error) { throw error }
                         engine.logger.error(
                             "Descendant barrier failed to restore remote directory [\(relPath)]: \(error)"
                         )

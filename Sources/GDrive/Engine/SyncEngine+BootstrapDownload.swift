@@ -107,7 +107,16 @@ extension SyncEngine {
         let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
         let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)
         let downloadGroup = DispatchGroup()
+        let databaseError = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
 
+        @Sendable func checkDatabaseFailure() throws {
+            if let error = databaseError.withLock({ $0 }) { throw error }
+        }
+
+        @Sendable func recordDatabaseFailure(_ error: Error) {
+            guard DatabaseFailure.isSQLite(error) else { return }
+            databaseError.withLock { if $0 == nil { $0 = error } }
+        }
         final class DownloadTracker: @unchecked Sendable {
             var filesDownloaded = 0
             var bytesDownloaded: Int64 = 0
@@ -121,6 +130,7 @@ extension SyncEngine {
             try RemoteNameMapping.validateSiblings(children)
 
             for item in children {
+                try checkDatabaseFailure()
                 let itemLocalURL = currentLocalURL.appendingPathComponent(item.name)
                 try RemoteNameMapping.validateDestination(itemLocalURL, root: rootURL)
 
@@ -183,6 +193,7 @@ extension SyncEngine {
                         }
 
                         do {
+                            try checkDatabaseFailure()
                             self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
                             // Streaming download and verification SHA-256
                             let published = try await self.client.downloadFileSafely(
@@ -254,6 +265,7 @@ extension SyncEngine {
                             progress.filesDownloaded += 1
                             progress.bytesDownloaded += fileSize
                         } catch {
+                            recordDatabaseFailure(error)
                             self.logger.error("Failed to download file [\(item.name)]: \(error)")
                         }
                     }
@@ -274,6 +286,7 @@ extension SyncEngine {
             }
         }
 
+        try checkDatabaseFailure()
         try await store.flush()
         if let traversalError {
             // Preserve a durable recovery route for a partially downloaded bootstrap.

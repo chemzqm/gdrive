@@ -18,6 +18,16 @@ final class ActionTracker: @unchecked Sendable {
     var deleted: Int { counts.withLock { $0.deleted } }
     let conflicts = OSAllocatedUnfairLock(initialState: 0)
     let failures = OSAllocatedUnfairLock(initialState: 0)
+    private let databaseFailure = OSAllocatedUnfairLock<Error?>(initialState: nil)
+
+    func recordDatabaseFailure(_ error: Error) {
+        guard DatabaseFailure.isSQLite(error) else { return }
+        databaseFailure.withLock { if $0 == nil { $0 = error } }
+    }
+
+    func throwIfDatabaseFailure() throws {
+        if let error = databaseFailure.withLock({ $0 }) { throw error }
+    }
 }
 
 extension IncrementalSyncRun {
@@ -36,12 +46,19 @@ extension IncrementalSyncRun {
             syncSemaphore.signal()
             throw CancellationError()
         }
+        do {
+            try actionTracker.throwIfDatabaseFailure()
+        } catch {
+            syncSemaphore.signal()
+            throw error
+        }
         startedTransfers.withLock { $0 = true }
     }
 
     func scheduleFiles(_ fileItems: [DirtyRecord], duringScan: Bool) async throws {
         var receipts: [@Sendable (SQLiteConnection) throws -> Void] = []
         for item in fileItems {
+            try actionTracker.throwIfDatabaseFailure()
             guard let decision = decisionForScheduling(item, duringScan: duringScan) else { continue }
             try Task.checkCancellation()
             try await applyDecision(decision, to: item, receipts: &receipts)
@@ -53,6 +70,7 @@ extension IncrementalSyncRun {
                 receipts.removeAll(keepingCapacity: true)
             }
         }
+        try actionTracker.throwIfDatabaseFailure()
 
         if !receipts.isEmpty {
             let batch = receipts
@@ -60,6 +78,75 @@ extension IncrementalSyncRun {
                 for receipt in batch { try receipt(conn) }
             }
         }
+    }
+
+    private func restoreRemoteParent(for item: DirtyRecord) async {
+        guard let parentRemoteID = directoryContext.getRemoteId(for: item.parentId) else { return }
+        let isParentTrashed: Bool = (try? await engine.store.read { conn in
+            let stmt = try conn.cachedStatement(
+                "SELECT remote_status FROM items WHERE item_id = ?;")
+            stmt.bindInt64(item.parentId, at: 1)
+            defer { stmt.reset() }
+            if try stmt.step(), let parentStatus = stmt.columnText(at: 0) {
+                return parentStatus == "trashed"
+            }
+            return false
+        }) ?? false
+        guard isParentTrashed else { return }
+        do {
+            try await engine.client.untrash(remoteId: parentRemoteID)
+        } catch {
+            engine.logger.error(
+                "Failed to restore remote parent directory [\(parentRemoteID)]: \(error)"
+            )
+            return
+        }
+        do {
+            try await engine.store.write { conn in
+                let stmt = try conn.cachedStatement(
+                    "UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;")
+                stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                stmt.bindInt64(item.parentId, at: 2)
+                _ = try stmt.step()
+            }
+        } catch {
+            engine.logger.error("Failed to record restored remote parent [\(parentRemoteID)]: \(error)")
+        }
+    }
+
+    private func handleUploadFailure(
+        _ error: Error, item: DirtyRecord, createIntent: DurableCreateIntent?
+    ) async {
+        actionTracker.failures.withLock { $0 += 1 }
+        actionTracker.recordDatabaseFailure(error)
+        if let createIntent {
+            do {
+                try await DurableCreateIntentStore.markUnknownOutcome(
+                    store: engine.store, operationID: createIntent.operationID, error: error)
+            } catch {
+                actionTracker.recordDatabaseFailure(error)
+            }
+        }
+        if case DriveError.unsafeOverwrite = error {
+            do {
+                try await engine.store.batchWrite { conn in
+                    let stmt = try conn.cachedStatement(
+                        """
+                        UPDATE items SET phase = 'blocked'
+                        WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                        """)
+                    stmt.bindInt64(item.itemId, at: 1)
+                    stmt.bindInt64(item.localGeneration, at: 2)
+                    stmt.bindInt64(item.remoteGeneration, at: 3)
+                    stmt.bindInt64(item.dirtyGeneration, at: 4)
+                    _ = try stmt.step()
+                    stmt.reset()
+                }
+            } catch {
+                actionTracker.recordDatabaseFailure(error)
+            }
+        }
+        engine.logger.error("Incremental upload failed [\(item.name)]: \(error)")
     }
 
     private func scheduleUpload(_ item: DirtyRecord) async throws {
@@ -88,41 +175,7 @@ extension IncrementalSyncRun {
                     throw DriveError.unsafeOverwrite(fileId: remoteID)
                 }
 
-                // If the remote parent directory has been moved to the recycle bin before, the parent directory will be automatically restored before uploading the child files.
-                func restoreRemoteParent() async {
-                    if let parentRId = directoryContext.getRemoteId(for: item.parentId) {
-                        let isParentTrashed: Bool =
-                            (try? await engine.store.read { conn in
-                                let stmt = try conn.cachedStatement(
-                                    "SELECT remote_status FROM items WHERE item_id = ?;")
-                                stmt.bindInt64(item.parentId, at: 1)
-                                defer { stmt.reset() }
-                                if try stmt.step(), let parentStatus = stmt.columnText(at: 0) {
-                                    return parentStatus == "trashed"
-                                }
-                                return false
-                            }) ?? false
-
-                        if isParentTrashed {
-                            do {
-                                try await engine.client.untrash(remoteId: parentRId)
-                                try await engine.store.write { conn in
-                                    let stmt = try conn.cachedStatement(
-                                        "UPDATE items SET remote_status = 'present', updated_at = ? WHERE item_id = ?;"
-                                    )
-                                    stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                                    stmt.bindInt64(item.parentId, at: 2)
-                                    _ = try stmt.step()
-                                }
-                            } catch {
-                                engine.logger.error(
-                                    "Failed to restore remote parent directory [\(parentRId)]: \(error)"
-                                )
-                            }
-                        }
-                    }
-                }
-                await restoreRemoteParent()
+                await restoreRemoteParent(for: item)
 
                 let fSize: Int64
                 let sha256Hex: String
@@ -318,30 +371,7 @@ extension IncrementalSyncRun {
                     $0.bytesUp += fSize
                 }
             } catch {
-                actionTracker.failures.withLock { $0 += 1 }
-                if let createIntent {
-                    try? await DurableCreateIntentStore.markUnknownOutcome(
-                        store: engine.store,
-                        operationID: createIntent.operationID,
-                        error: error
-                    )
-                }
-                if case DriveError.unsafeOverwrite = error {
-                    try? await engine.store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET phase = 'blocked'
-                            WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
-                            """)
-                        stmt.bindInt64(item.itemId, at: 1)
-                        stmt.bindInt64(item.localGeneration, at: 2)
-                        stmt.bindInt64(item.remoteGeneration, at: 3)
-                        stmt.bindInt64(item.dirtyGeneration, at: 4)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                }
-                engine.logger.error("Incremental upload failed [\(item.name)]: \(error)")
+                await handleUploadFailure(error, item: item, createIntent: createIntent)
             }
         }
     }
@@ -470,6 +500,7 @@ extension IncrementalSyncRun {
                 }
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
+                actionTracker.recordDatabaseFailure(error)
                 engine.logger.error("Incremental download failed [\(item.name)]: \(error)")
             }
         }
@@ -499,6 +530,7 @@ extension IncrementalSyncRun {
                 }
                 actionTracker.counts.withLock { $0.deleted += 1 }
             } catch {
+                actionTracker.recordDatabaseFailure(error)
                 engine.logger.error("Remote file deletion failed [\(item.name)]: \(error)")
             }
         }
@@ -584,6 +616,7 @@ extension IncrementalSyncRun {
                 actionTracker.conflicts.withLock { $0 += 1 }
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
+                actionTracker.recordDatabaseFailure(error)
                 engine.logger.error(
                     "Failed to handle file conflicts [\(item.name)]: \(error)")
             }
