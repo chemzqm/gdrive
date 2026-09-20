@@ -57,6 +57,12 @@ final class DirectoryContext: @unchecked Sendable {
         return readyDirectories.contains(itemID)
     }
 
+    func markReady(_ itemID: Int64) {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        readyDirectories.insert(itemID)
+    }
+
     func getRelPath(for itemId: Int64) -> String? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -175,6 +181,9 @@ extension IncrementalSyncRun {
                     try DurableCreateIntentStore.completeOperation(
                         conn: conn, operationID: intent.operationID, now: timestamp)
                 }
+                directoryContext.register(
+                    itemId: item.itemId, parentItemId: item.parentId, name: item.name,
+                    remoteId: intent.targetRemoteID)
             } catch {
                 if DatabaseFailure.isSQLite(error) { throw error }
                 try await DurableCreateIntentStore.markUnknownOutcome(

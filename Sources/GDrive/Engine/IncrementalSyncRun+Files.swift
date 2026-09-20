@@ -109,6 +109,7 @@ extension IncrementalSyncRun {
                 stmt.bindInt64(item.parentId, at: 2)
                 _ = try stmt.step()
             }
+            directoryContext.markReady(item.parentId)
         } catch {
             engine.logger.error("Failed to record restored remote parent [\(parentRemoteID)]: \(error)")
         }
@@ -168,14 +169,16 @@ extension IncrementalSyncRun {
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
                 let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                 let localFileURL = rootURL.appendingPathComponent(relPath)
-                let remoteParentId =
-                    directoryContext.getRemoteId(for: item.parentId) ?? remoteRootID
-
                 if createIntent == nil, let remoteID = item.remoteFileId {
                     throw DriveError.unsafeOverwrite(fileId: remoteID)
                 }
 
                 await restoreRemoteParent(for: item)
+                guard let remoteParentId = directoryContext.getRemoteId(for: item.parentId),
+                      directoryContext.isReady(item.parentId) else {
+                    throw SyncEngineError.general(
+                        "Incremental upload parent became unavailable: \(item.name)")
+                }
 
                 let fSize: Int64
                 let sha256Hex: String

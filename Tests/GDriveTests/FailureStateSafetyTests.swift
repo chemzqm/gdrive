@@ -85,7 +85,8 @@ struct FailureStateSafetyTests {
 
         let localRootDir = tempDir.appendingPathComponent("local_root")
         let dirA = localRootDir.appendingPathComponent("dir_A")
-        try FileManager.default.createDirectory(at: dirA, withIntermediateDirectories: true)
+        let childDirectory = dirA.appendingPathComponent("sub")
+        try FileManager.default.createDirectory(at: childDirectory, withIntermediateDirectories: true)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -137,6 +138,26 @@ struct FailureStateSafetyTests {
             stmt.bindText(dirARemoteId, at: 3)
             stmt.bindInt64(dirADev, at: 4)
             stmt.bindInt64(dirAIno, at: 5)
+            _ = try stmt.step()
+            return conn.lastInsertRowId
+        }
+        let childAttrs = try FileManager.default.attributesOfItem(atPath: childDirectory.path)
+        let childDev = (childAttrs[.systemNumber] as? NSNumber)?.int64Value ?? 1
+        let childInode = (childAttrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
+        let childItemID = try await store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items (
+                    root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status,
+                    phase, dirty_generation, created_at, updated_at
+                ) VALUES (?, ?, 'sub', 'directory', 'sub_remote_id', ?, ?,
+                    'present', 'present', 'committed', 0, 100, 100);
+                """)
+            stmt.bindInt64(rootId, at: 1)
+            stmt.bindInt64(dirAItemId, at: 2)
+            stmt.bindInt64(childDev, at: 3)
+            stmt.bindInt64(childInode, at: 4)
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
@@ -192,7 +213,13 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while updateMetadata fails
-        try await engine.syncIncremental(localPath: localRootDir.path)
+        var failedMoveBlockedDescendants = false
+        do {
+            _ = try await engine.syncIncremental(localPath: localRootDir.path)
+        } catch {
+            failedMoveBlockedDescendants = true
+        }
+        #expect(failedMoveBlockedDescendants)
 
         // SQLite should NOT be updated to 'dir_B' because remote update failed!
         try await store.read { conn in
@@ -200,6 +227,19 @@ struct FailureStateSafetyTests {
             stmt.bindInt64(dirAItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnText(at: 0) == "dir_A", "Directory name in DB must remain dir_A after failed rename")
+
+            let child = try conn.prepare(
+                "SELECT parent_id FROM items WHERE item_id = ?;")
+            child.bindInt64(childItemID, at: 1)
+            #expect(try child.step())
+            #expect(child.columnInt64(at: 0) == dirAItemId)
+
+            let misplaced = try conn.prepare(
+                "SELECT COUNT(*) FROM items WHERE root_id = ? AND parent_id = ? AND name = 'sub' AND is_tombstone = 0;")
+            misplaced.bindInt64(rootId, at: 1)
+            misplaced.bindInt64(rootDirItemId, at: 2)
+            #expect(try misplaced.step())
+            #expect(misplaced.columnInt64(at: 0) == 0)
         }
 
         // 2. Allow updateMetadata to succeed on retry
@@ -561,7 +601,12 @@ struct FailureStateSafetyTests {
 
         let localRootDir = tempDir.appendingPathComponent("local_root")
         let newFolder = localRootDir.appendingPathComponent("new_folder")
-        try FileManager.default.createDirectory(at: newFolder, withIntermediateDirectories: true)
+        let nestedFolder = newFolder.appendingPathComponent("sub")
+        let nestedFile = nestedFolder.appendingPathComponent("f.txt")
+        try FileManager.default.createDirectory(at: nestedFolder, withIntermediateDirectories: true)
+        let nestedData = Data("nested content".utf8)
+        try nestedData.write(to: nestedFile)
+        let nestedSHA = SyncEngine.computeSha256(of: nestedData)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -593,6 +638,13 @@ struct FailureStateSafetyTests {
         }
 
         let control = FailureControlState()
+        final class CreationRequests: @unchecked Sendable {
+            private let lock = NSLock()
+            private var bodies: [String] = []
+            func append(_ body: String) { lock.withLock { bodies.append(body) } }
+            func snapshot() -> [String] { lock.withLock { bodies } }
+        }
+        let creationRequests = CreationRequests()
 
         context.value.requestHandler = { request in
             let url = try #require(request.url)
@@ -613,19 +665,37 @@ struct FailureStateSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = Data(#"{"ids": ["valid_server_id_1"]}"#.utf8)
+                let json = Data(#"{"ids": ["directory-d", "directory-sub", "nested-file"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
-            if request.httpMethod == "POST" && path.hasSuffix("/drive/v3/files") {
-                if control.shouldFail {
+            if request.httpMethod == "POST" && path.hasSuffix("/drive/v3/files")
+                && !path.contains("/upload/") {
+                let body = String(bytes: request.extractBodyData ?? Data(), encoding: .utf8)
+                    ?? "Invalid UTF-8 data"
+                creationRequests.append(body)
+                let metadata = try #require(
+                    JSONSerialization.jsonObject(with: request.extractBodyData ?? Data())
+                        as? [String: Any])
+                let name = try #require(metadata["name"] as? String)
+                let remoteID = try #require(metadata["id"] as? String)
+                if control.shouldFail && name == "new_folder" {
                     let errJson = Data(#"{"error": {"code": 500, "message": "Simulated Drive folder create error"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
                     let json = Data("""
-                    {"id": "valid_server_id_1", "name": "new_folder", "mimeType": "application/vnd.google-apps.folder"}
+                    {"id": "\(remoteID)", "name": "\(name)", "mimeType": "application/vnd.google-apps.folder"}
                     """.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
+            }
+            if request.httpMethod == "POST" && path.hasSuffix("/upload/drive/v3/files") {
+                let body = String(bytes: request.extractBodyData ?? Data(), encoding: .utf8)
+                    ?? "Invalid UTF-8 data"
+                creationRequests.append(body)
+                let json = Data("""
+                {"id":"nested-file","name":"f.txt","size":"\(nestedData.count)","sha256Checksum":"\(nestedSHA)","version":"1"}
+                """.utf8)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
@@ -638,7 +708,13 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while createDirectory fails
-        try await engine.syncIncremental(localPath: localRootDir.path)
+        var firstRunFailed = false
+        do {
+            _ = try await engine.syncIncremental(localPath: localRootDir.path)
+        } catch {
+            firstRunFailed = true
+        }
+        #expect(firstRunFailed)
 
         // SQLite: new_folder MUST NOT be committed!
         try await store.read { conn in
@@ -650,11 +726,25 @@ struct FailureStateSafetyTests {
                 #expect(phase != "committed", "Directory must NOT be committed when remote create failed")
                 #expect(remoteStatus != "present", "remote_status must NOT be present when remote create failed")
             }
+            let misplaced = try conn.prepare(
+                """
+                SELECT COUNT(*) FROM items child
+                JOIN items parent ON parent.item_id = child.parent_id
+                WHERE child.root_id = ? AND parent.parent_id IS NULL
+                    AND child.name IN ('sub', 'f.txt') AND child.is_tombstone = 0;
+                """)
+            misplaced.bindInt64(rootId, at: 1)
+            #expect(try misplaced.step())
+            #expect(misplaced.columnInt64(at: 0) == 0)
         }
+        #expect(!creationRequests.snapshot().contains { body in
+            body.contains("\"name\":\"sub\"") || body.contains("\"name\":\"f.txt\"")
+        })
 
         // 2. Retry with createDirectory succeeding
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path)
+        let recovered = try await engine.syncIncremental(localPath: localRootDir.path)
+        #expect(recovered.filesUploaded == 1)
 
         // SQLite: new_folder must now be committed
         try await store.read { conn in
@@ -663,6 +753,21 @@ struct FailureStateSafetyTests {
             #expect(try stmt.step(), "new_folder must exist in DB")
             #expect(stmt.columnText(at: 0) == "committed", "Directory must be committed after successful creation")
             #expect(stmt.columnText(at: 1) == "present", "remote_status must be present after successful creation")
+
+            let hierarchy = try conn.prepare(
+                """
+                SELECT COUNT(*)
+                FROM items file
+                JOIN items sub ON sub.item_id = file.parent_id
+                JOIN items directory ON directory.item_id = sub.parent_id
+                WHERE file.root_id = ? AND directory.name = 'new_folder'
+                    AND sub.name = 'sub' AND file.name = 'f.txt'
+                    AND file.is_tombstone = 0 AND sub.is_tombstone = 0
+                    AND directory.is_tombstone = 0;
+                """)
+            hierarchy.bindInt64(rootId, at: 1)
+            #expect(try hierarchy.step())
+            #expect(hierarchy.columnInt64(at: 0) == 1)
         }
     }
 

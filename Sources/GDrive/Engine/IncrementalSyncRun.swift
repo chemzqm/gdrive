@@ -186,6 +186,13 @@ extension IncrementalSyncRun {
 
     func execute() async throws -> SyncStats {
         defer { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
+        let pendingDirectories = try await loadDirtyItems().filter { item in
+            guard item.entryKind == "directory", item.pendingCreate != nil else { return false }
+            let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
+            let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
+            return !remoteGate.blocks(path) && isInLocalScope(path)
+        }
+        try await recoverPendingDirectories(pendingDirectories)
         try await scanLocal()
         try actionTracker.throwIfDatabaseFailure()
         try await markMissingAfterSuccessfulScan()
@@ -197,7 +204,6 @@ extension IncrementalSyncRun {
         }
         let fileItems = eligibleItems.filter { $0.entryKind == "file" }
         let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
-        try await recoverPendingDirectories(dirItems)
         do {
             try await scheduleFiles(fileItems, duringScan: false)
         } catch {

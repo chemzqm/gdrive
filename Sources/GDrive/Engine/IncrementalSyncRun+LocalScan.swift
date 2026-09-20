@@ -206,8 +206,6 @@ extension IncrementalSyncRun {
 
         let engine = self.engine
         let rootID = self.rootID
-        let rootItemID = self.rootItemID
-        let remoteRootID = self.remoteRootID
         let rootURL = self.rootURL
         let now = self.now
         let remoteGate = self.remoteGate
@@ -220,12 +218,10 @@ extension IncrementalSyncRun {
         @Sendable func directoryParentID(
             relPath: String, parentRelPath: String, name: String
         ) async throws -> Int64 {
-            guard localChangeScope != nil else {
-                return directoryContext.getItemId(byRelPath: parentRelPath) ?? rootItemID
-            }
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
             }
+            guard localChangeScope != nil else { return parentItemID }
             let kind: String? = try await engine.store.read { conn in
                 let stmt = try conn.cachedStatement(
                     "SELECT entry_kind FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;")
@@ -243,12 +239,10 @@ extension IncrementalSyncRun {
         }
 
         @Sendable func fileParentID(relPath: String, parentRelPath: String) throws -> Int64 {
-            guard localChangeScope != nil else {
-                return directoryContext.getItemId(byRelPath: parentRelPath) ?? rootItemID
-            }
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
             }
+            guard localChangeScope != nil else { return parentItemID }
             guard directoryContext.getItemId(byRelPath: relPath) == nil else {
                 throw SyncEngineError.general("Local file replaces an existing directory at \(relPath); preserving the baseline")
             }
@@ -256,8 +250,9 @@ extension IncrementalSyncRun {
         }
 
         @Sendable func remoteParentID(parentItemID: Int64, relPath: String) throws -> String {
-            guard localChangeScope != nil else {
-                return directoryContext.getRemoteId(for: parentItemID) ?? remoteRootID
+            guard directoryContext.isReady(parentItemID) else {
+                throw SyncEngineError.general(
+                    "Remote directory parent is not ready while creating \(relPath)")
             }
             guard let remoteID = directoryContext.getRemoteId(for: parentItemID) else {
                 throw SyncEngineError.general("Missing remote directory parent while creating \(relPath)")
