@@ -345,6 +345,13 @@ struct RemoteChanges: Sendable {
             """, [.int(itemID)])
     }
 
+    private static func createDirectoryIfNeeded(
+        file: DriveFile, existing: Item?, destination: URL
+    ) throws {
+        guard file.isDirectory, existing == nil else { return }
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    }
+
     private func apply(_ conn: SQLiteConnection, _ result: Resolved) throws -> Bool {
         let change = result.entry.change
         let existing = try item(conn, remoteID: change.fileId) // identity BEFORE parent classification
@@ -407,9 +414,7 @@ struct RemoteChanges: Sendable {
             return true
         }
         guard try moveExistingItem() else { return false }
-        if file.isDirectory, existing == nil {
-            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        }
+        try Self.createDirectoryIfNeeded(file: file, existing: existing, destination: destination)
         let id: Int64
         if let existing { id = existing.id } else if let localOnlyID { id = localOnlyID } else {
             try Self.execute(conn, """

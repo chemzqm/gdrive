@@ -646,8 +646,10 @@ struct DirectoryTrackerRecoveryTests {
                 #expect(error is ScanFailure)
             }
         }
-        #expect(engine.transferStatus.queuedUploads.isEmpty)
-        #expect(engine.transferStatus.activeUploads.isEmpty)
+        engine.monitor.refreshSnapshot()
+        let status = engine.transferStatus
+        #expect(status.queuedUploads.isEmpty)
+        #expect(status.activeUploads.isEmpty)
         try await store.read { conn in
             let query = try conn.prepare("SELECT bootstrap_state FROM roots;")
             #expect(try query.step())

@@ -125,7 +125,7 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 ## 3. 同步接口调用方法
 
 `SyncEngine` 提供统一入口 `sync`，也提供显式初始化和增量同步入口。
-所有同步入口均为 `async throws -> SyncStats`，支持可选的
+这些执行整轮同步的入口均为 `async throws -> SyncStats`，支持可选的
 `onProgress: (@Sendable (SyncProgress) -> Void)?` 回调，默认 `nil`。
 回调不保证在主线程执行，更新 UI 时应切换到 `MainActor`。
 
@@ -136,9 +136,13 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 | `syncRemoteToLocalEmpty` | `maxDownloadConcurrency` | `64` |
 | `syncIncremental`（两个重载） | `maxConcurrency` | `64` |
 
-所有入口共用进程内根目录锁：同一本地路径（展开 `~` 后）已有同步运行时，后续调用立即抛出
-`SyncEngineError.rootBusy(path:)`，不会排队等待；不同引擎实例也共享这一限制。
-调用方应合并同一根目录的重复触发。不同本地根可独立运行，该锁不提供跨进程互斥。
+上述显式同步入口共用进程内根目录锁：同一本地根已有同步运行时，另一次显式调用立即抛出
+`SyncEngineError.rootBusy(path:)`；不同引擎实例也共享这一限制。不同本地根可独立运行，
+该锁不提供跨进程互斥。文件监听应使用 `notifyLocalChanges(_:)` 提交变化，
+该接口接收并合并变化后返回，在当前整轮同步结束后自动执行。
+pendingTask 执行期间同样持有根锁，显式同步调用仍返回 `rootBusy`；新的变化通知仍可接收。
+显式同步自身成功后，会等待当时及排空期间接收的 pendingTask 逐批执行完毕再返回；返回的
+`SyncStats` 只统计显式同步自身的轮次，不包含随后执行的 pendingTask。
 
 ### 3.1 统一智能同步入口 (`sync`) 【推荐】
 
@@ -228,7 +232,8 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 
 ### 3.3 增量双向同步 (`syncIncremental`)
 
-在完成上述任一初始同步后，日常的双向变更同步全部通过 `syncIncremental` 执行。
+完成初始化后，可通过 `syncIncremental` 主动执行整根双向同步，包括定时拉取远端变化。
+本地文件监听回调使用 `notifyLocalChanges(_:)`，无需提供远端 ID，见第 5 节。
 
 ```swift
 let stats = try await engine.syncIncremental(
@@ -269,7 +274,10 @@ Google Drive 文件夹 ID；通常使用上例按路径和远端 ID 调用的版
 
 ## 4. 统计结果结构 (`SyncStats`)
 
-每次同步调用均返回本轮的 `SyncStats` 值，字段均为可读写的 `public var`，初始值为 `0`：
+显式同步调用返回自身轮次的 `SyncStats` 值，字段均为可读写的 `public var`，初始值为 `0`；
+调用返回前排空的 pendingTask 不计入该值。
+`notifyLocalChanges(_:)` 只确认接收，不返回同步统计；运行状态和待执行通知通过
+`pendingLocalChangeStatus()` 查询，执行失败记录到日志。
 
 ```swift
 public struct SyncStats: Sendable {
@@ -321,62 +329,49 @@ Task {
 }
 ```
 
-### 示例 B：结合 macOS FSEvents 本地文件监听
+### 示例 B：提交本地文件和目录变化
 
-适合需要本地变更即时同步（带有 200ms 防抖 Debounce）的高响应应用：
+宿主负责监听文件系统，将具体变化交给 gdrive。路径使用本地路径字符串，支持展开 `~`；
+移动包含旧、新路径，删除事件也应保留原条目的 `isDirectory` 信息。
 
 ```swift
-import CoreServices
+let changes: [LocalChange] = [
+    .created(path: localDir + "/new.txt", isDirectory: false),
+    .modified(path: localDir + "/notes.txt", isDirectory: false),
+    .deleted(path: localDir + "/old-folder", isDirectory: true),
+    .moved(from: localDir + "/draft.txt", to: localDir + "/final.txt", isDirectory: false)
+]
+try await engine.notifyLocalChanges(changes)
+```
 
-final class DirectoryWatcher {
-    private var stream: FSEventStreamRef?
-    private let onChange: () -> Void
+显式同步 API 在入口检查数据库连接，连接失败直接抛出；`notifyLocalChanges` 解析根绑定时的
+数据库访问失败按其原有 `async throws` 契约直接返回。
+接收后的后台同步中，可能影响后续传输或同步结果的数据库错误会终止本轮；能够在条目级
+隔离的数据库错误只写入 error log。后台任务在边界记录本轮错误，不再提供额外错误事件。
 
-    init(path: String, onChange: @escaping () -> Void) {
-        self.onChange = onChange
-        var context = FSEventStreamContext(
-            version: 0,
-            info: Unmanaged.passRetained(self as AnyObject).toOpaque(),
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
+调用方不需要 `remoteRootId`。库按路径查找所属的已配置同步根，或正在运行的父目录同步任务；
+首次同步尚未写入根记录时也可接收变化。无法找到所属根时抛错，不会猜测远端目标。
 
-        let callback: FSEventStreamCallback = { _, clientCallBackInfo, numEvents, eventPaths, eventFlags, eventIds in
-            guard let info = clientCallBackInfo else { return }
-            let watcher = Unmanaged<AnyObject>.fromOpaque(info).takeUnretainedValue() as! DirectoryWatcher
-            watcher.onChange()
-        }
+每个根只有一个运行任务和一个合并中的 pendingTask：当前整轮同步结束后取出 pendingTask，
+清空待执行槽位，再执行涉及文件和目录的增量同步。期间收到的新变化进入下一批，逐批执行
+直到清空。根当前没有运行任务时，也会创建 pendingTask 并立即启动执行。
+同一根的同步轮次串行，单轮内的传输仍可并发，不同根彼此独立。
 
-        self.stream = FSEventStreamCreate(
-            kCFAllocatorDefault,
-            callback,
-            &context,
-            [path] as CFArray,
-            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
-            0.2, // 200ms 防抖窗口
-            UInt32(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)
-        )
-        FSEventStreamSetDispatchQueue(stream!, DispatchQueue.global())
-        FSEventStreamStart(stream!)
-    }
+执行前重新检查本地状态并与 SQLite 基线比较，淘汰过时操作：重复修改且 SHA-256 未变时
+不传输；新增后已消失的文件不会按旧事件上传；删除后重新出现的路径不会按旧事件删除。
+移动同时核实旧、新位置，目录按当前子树扫描。局部扫描只在覆盖范围内判断缺失，不会将
+未扫描的兄弟目录视为删除。局部观察的文件会重新核实 SHA-256，避免移动或重建后的
+路径误用旧的元数据缓存。
 
-    deinit {
-        if let stream {
-            FSEventStreamStop(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-        }
-    }
-}
-
-// 宿主调用：
-let watcher = DirectoryWatcher(path: localDir) {
-    Task {
-        try? await engine.syncIncremental(localPath: localDir, remoteRootId: remoteRootId)
-    }
+```swift
+for status in await engine.pendingLocalChangeStatus() {
+    print(status.localRootPath,
+          "运行中:", status.isRunning,
+          "待处理变化:", status.pendingChangeCount)
 }
 ```
+一次移动的两个路径必须属于同一个同步根；跨根移动应分别提交源路径删除和目标路径新增。
+队列为进程内状态，不承诺通知的崩溃持久化；重启后应主动执行一次整根同步重新观察状态。
 
 ---
 
@@ -385,7 +380,7 @@ let watcher = DirectoryWatcher(path: localDir) {
 初始化和同步入口使用 `async throws`；`setDownloadTemporaryDirectory(_:)` 为同步 `throws`，
 读取配置和传输快照不抛出异常。可能抛出的主要异常类型包括：
 
-- `SyncEngineError.rootBusy(path:)`：同一本地根在当前进程中已有同步运行，应合并重复触发。
+- `SyncEngineError.rootBusy(path:)`：同一本地根在当前进程中已有同步运行；本地变化使用 `notifyLocalChanges(_:)` 合并提交。
 - `SyncEngineError.localRootNotFound(path:)`：增量同步的本地根消失或不再是目录，停止同步以保护远端数据。
 - `SyncEngineError.remoteRootLost(remoteId:reason:)`：远端同步根丢失、被移入回收站或不再是目录，停止同步以保护本地数据。
 - `SyncEngineError.general(_:)`：配置或同步保护条件不满足，具体原因见错误描述。

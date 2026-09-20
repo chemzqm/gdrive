@@ -201,10 +201,10 @@ extension IncrementalSyncRun {
                     if fSize > 8 * 1024 * 1024 {
                         let target: DurableCreateIntent
                         if let pending = createIntent {
-                            guard let expectedSHA256 = pending.expectedSHA256,
+                            guard pending.totalBytes == fSize,
+                                let expectedSHA256 = pending.expectedSHA256,
                                 expectedSHA256.caseInsensitiveCompare(sha256Hex)
-                                    == .orderedSame,
-                                pending.totalBytes == fSize
+                                    == .orderedSame
                             else {
                                 throw SyncEngineError.general(
                                     "Unfinished large file creation intent input changed: \(item.name)"
@@ -242,9 +242,9 @@ extension IncrementalSyncRun {
                             isUpdate: false
                         )
                     } else if let pending = createIntent {
-                        guard let expectedSHA256 = pending.expectedSHA256,
-                            expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame,
-                            pending.totalBytes == fSize
+                        guard pending.totalBytes == fSize,
+                            let expectedSHA256 = pending.expectedSHA256,
+                            expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame
                         else {
                             throw SyncEngineError.general(
                                 "Unfinished small file creation intent input has changed: \(item.name)"

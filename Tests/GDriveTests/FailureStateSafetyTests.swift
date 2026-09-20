@@ -337,17 +337,7 @@ struct FailureStateSafetyTests {
             if request.httpMethod == "PATCH" && path.contains("/files/\(fileARemoteId)") {
                 if path.contains("/upload/") {
                     #expect(!control.shouldFail)
-                    var body = request.httpBody ?? Data()
-                    if let stream = request.httpBodyStream {
-                        stream.open()
-                        defer { stream.close() }
-                        var buffer = [UInt8](repeating: 0, count: 1024)
-                        while true {
-                            let count = stream.read(&buffer, maxLength: buffer.count)
-                            guard count > 0 else { break }
-                            body.append(contentsOf: buffer.prefix(count))
-                        }
-                    }
+                    let body = request.extractBodyData ?? Data()
                     #expect(body == expectedContent)
                     uploads.recordFilePatch()
                     let json = Data("""
@@ -356,6 +346,8 @@ struct FailureStateSafetyTests {
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
                 renames.recordFilePatch()
+                #expect(!(url.query ?? "").contains("removeParents"))
+                #expect(!(url.query ?? "").contains("addParents"))
                 if control.shouldFail {
                     let errJson = Data(#"{"error": {"code": 400, "message": "Bad Request"}}"#.utf8)
                     return (HTTPURLResponse(url: url, statusCode: 400, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
@@ -366,7 +358,6 @@ struct FailureStateSafetyTests {
                     return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
                 }
             }
-
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
         context.value.requestHandler = handleRequest
