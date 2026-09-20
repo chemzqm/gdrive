@@ -2,6 +2,7 @@ import Foundation
 import CryptoKit
 import Testing
 import DirectoryScanner
+import os
 @testable import GDrive
 
 final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
@@ -93,7 +94,7 @@ struct DirectoryTrackerRecoveryTests {
 
     // MARK: - Unit Tests: DirectoryTracker (Probe P04 & Error Propagation)
 
-    @Test("A bootstrap download receipt database failure escapes the sync call")
+    @Test("A bootstrap download receipt database failure remains recoverable after reopening")
     func downloadReceiptDatabaseFailureThrows() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("download-db-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -147,6 +148,141 @@ struct DirectoryTrackerRecoveryTests {
             return query.columnText(at: 0) == "existingKnown"
         }
         #expect(!completed)
+        let pending = try await store.read { conn in
+            let query = try conn.prepare("SELECT count(*) FROM remote_change_inbox WHERE remote_id = 'file';")
+            defer { query.reset() }
+            return try query.step() ? query.columnInt64(at: 0) : nil
+        }
+        #expect(pending == 1)
+
+        try await store.write { conn in
+            try conn.execute("DROP TRIGGER reject_download_receipt;")
+        }
+        let reopenedStore = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        let reopened = try await SyncEngine(
+            auth: auth, store: reopenedStore, client: createMockClient(auth: auth))
+        let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")
+        #expect(recovered.filesFailed == 0)
+        #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
+        let recoveryState = try await reopenedStore.read { conn in
+            let query = try conn.prepare("""
+                SELECT r.bootstrap_state,
+                    (SELECT count(*) FROM remote_change_inbox WHERE root_id = r.root_id),
+                    (SELECT count(*) FROM items WHERE root_id = r.root_id AND remote_file_id = 'file')
+                FROM roots r;
+                """)
+            defer { query.reset() }
+            #expect(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnInt64(at: 2))
+        }
+        #expect(recoveryState.0 == "existingKnown")
+        #expect(recoveryState.1 == 0)
+        #expect(recoveryState.2 == 1)
+    }
+
+    @Test("Bootstrap download failures remain pending and recover without a new Change")
+    func bootstrapDownloadFailureRecovers() async throws {
+        func run(_ failure: String) async throws {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "download-recovery-\(failure)-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let local = directory.appendingPathComponent("local")
+            try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+            let auth = try createMockAuth(tempDir: directory)
+            let databasePath = directory.appendingPathComponent("state.sqlite").path
+            let store = try await StateStore(path: databasePath)
+            let body = Data("recoverable remote bytes".utf8)
+            let digest = SyncEngine.computeSha256(of: body)
+            let failing = OSAllocatedUnfairLock(initialState: true)
+            context.value.requestHandler = { request in
+                let url = try #require(request.url)
+                func response(_ status: Int = 200) -> HTTPURLResponse {
+                    HTTPURLResponse(
+                        url: url, statusCode: status, httpVersion: nil,
+                        headerFields: ["Content-Type": "application/json"])!
+                }
+                if url.path.hasSuffix("/changes/startPageToken") {
+                    return (response(), Data(#"{"startPageToken":"C0"}"#.utf8))
+                }
+                if url.path.hasSuffix("/changes") {
+                    return (response(), Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
+                }
+                if url.path.hasSuffix("/files/root") {
+                    return (response(), Data(
+                        #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+                }
+                if url.path.hasSuffix("/files/file") {
+                    if failing.withLock({ $0 }) {
+                        if failure == "network" {
+                            return (response(400), Data(#"{"error":{"code":400,"message":"download failed"}}"#.utf8))
+                        }
+                        if failure == "checksum" { return (response(), Data("wrong bytes".utf8)) }
+                    }
+                    return (response(), body)
+                }
+                if url.path.hasSuffix("/files") {
+                    if failure == "publication", failing.withLock({ $0 }) {
+                        try Data("local collision".utf8).write(
+                            to: local.appendingPathComponent("file.txt"))
+                    }
+                    return (response(), try JSONSerialization.data(withJSONObject: ["files": [[
+                        "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                        "size": String(body.count), "sha256Checksum": digest, "parents": ["root"]
+                    ]]]))
+                }
+                throw URLError(.badURL)
+            }
+            defer { context.value.requestHandler = nil }
+
+            let engine = try await SyncEngine(
+                auth: auth, store: store, client: createMockClient(auth: auth))
+            let failed = try await engine.syncRemoteToLocalEmpty(
+                localPath: local.path, remoteRootId: "root")
+            #expect(failed.filesFailed == 1)
+            #expect(failed.remoteWorkPending == 1)
+            let pendingState = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT r.bootstrap_state,
+                    (SELECT count(*) FROM remote_change_inbox WHERE root_id = r.root_id)
+                FROM roots r;
+                """)
+            defer { query.reset() }
+            #expect(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1))
+            }
+            #expect(pendingState.0 == "freshCreated")
+            #expect(pendingState.1 == 1)
+
+            failing.withLock { $0 = false }
+            if failure == "publication" {
+                try FileManager.default.removeItem(at: local.appendingPathComponent("file.txt"))
+            }
+            let reopenedStore = try await StateStore(path: databasePath)
+            let reopened = try await SyncEngine(
+                auth: auth, store: reopenedStore, client: createMockClient(auth: auth))
+            let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")
+            #expect(recovered.filesFailed == 0)
+            #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
+            let finalState = try await reopenedStore.read { conn in
+            let query = try conn.prepare("""
+                SELECT r.bootstrap_state,
+                    (SELECT count(*) FROM remote_change_inbox WHERE root_id = r.root_id),
+                    (SELECT count(*) FROM items WHERE root_id = r.root_id AND remote_file_id = 'file')
+                FROM roots r;
+                """)
+            defer { query.reset() }
+            #expect(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnInt64(at: 2))
+            }
+            #expect(finalState.0 == "existingKnown")
+            #expect(finalState.1 == 0)
+            #expect(finalState.2 == 1)
+        }
+
+        for failure in ["network", "checksum", "publication"] {
+            try await run(failure)
+        }
     }
 
     @Test("P04 probe: Cancelling a task waiting on awaitParentReady resumes with CancellationError in bounded time")

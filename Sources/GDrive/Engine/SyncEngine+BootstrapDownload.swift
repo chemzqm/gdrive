@@ -32,25 +32,31 @@ extension SyncEngine {
         let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
         defer { cleanupDownloadStagingDirectory(downloadDirectory) }
 
-        // Make sure the local directory exists and is empty
+        let rootExists = try await store.read { conn in
+            let queryStatement = try conn.cachedStatement("""
+                SELECT 1 FROM roots
+                WHERE account_id = 'default' AND local_root_path = ? AND remote_root_id = ?
+                    AND initial_sync_direction = 'remoteToLocalEmpty' AND is_active = 1;
+                """)
+            defer { queryStatement.reset() }
+            queryStatement.bindText(resolvedLocalPath, at: 1)
+            queryStatement.bindText(remoteRootId, at: 2)
+            return try queryStatement.step()
+        }
+
+        // A new bootstrap requires an empty target. A retry owns the partial
+        // files recorded under the existing root and resumes in place.
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir) {
             guard isDir.boolValue else {
                 throw NSError(domain: "SyncEngine", code: 11, userInfo: [NSLocalizedDescriptionKey: "The local path already exists and is not a directory: \(resolvedLocalPath)"])
             }
             let contents = try FileManager.default.contentsOfDirectory(atPath: resolvedLocalPath)
-            guard contents.isEmpty else {
+            guard rootExists || contents.isEmpty else {
                 throw NSError(domain: "SyncEngine", code: 12, userInfo: [NSLocalizedDescriptionKey: "The local target directory must be empty: \(resolvedLocalPath)"])
             }
         } else {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        }
-
-        let rootExists = try await store.read { conn in
-            let queryStatement = try conn.cachedStatement("SELECT 1 FROM roots WHERE remote_root_id = ? AND is_active = 1;")
-            defer { queryStatement.reset() }
-            queryStatement.bindText(remoteRootId, at: 1)
-            return try queryStatement.step()
         }
 
         let now = Date().timeIntervalSince1970
@@ -121,8 +127,86 @@ extension SyncEngine {
             var filesDownloaded = 0
             var bytesDownloaded: Int64 = 0
             var dirsCreated = 0
+            let failures = OSAllocatedUnfairLock(initialState: 0)
         }
         let progress = DownloadTracker()
+
+        func commitDownloadedFile(
+            _ item: DriveFile, parentItemId: Int64, localURL: URL, published: LocalFileVersion
+        ) async throws -> Bool {
+            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+            try await self.store.batchWrite { conn in
+                guard (try? LocalFileVersion.read(at: localURL)) == published else { return }
+                let stmt = try conn.cachedStatement("""
+                    INSERT INTO items (
+                        root_id, parent_id, name, entry_kind, remote_file_id,
+                        local_mtime, local_size, local_sha256,
+                        base_sha256, base_size,
+                        remote_sha256, remote_size, remote_status,
+                        local_generation, local_status, phase,
+                        local_device, local_inode,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, 'file', ?,
+                        ?, ?, ?,
+                        ?, ?,
+                        ?, ?, 'present',
+                        1, 'present', 'committed',
+                        ?, ?,
+                        ?, ?
+                    )
+                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                    DO UPDATE SET
+                        remote_file_id = excluded.remote_file_id,
+                        local_mtime = excluded.local_mtime, local_size = excluded.local_size,
+                        local_sha256 = excluded.local_sha256,
+                        base_sha256 = excluded.base_sha256, base_size = excluded.base_size,
+                        remote_sha256 = excluded.remote_sha256, remote_size = excluded.remote_size,
+                        remote_status = 'present', local_status = 'present', phase = 'committed',
+                        local_device = excluded.local_device, local_inode = excluded.local_inode,
+                        updated_at = excluded.updated_at
+                    WHERE items.remote_file_id = excluded.remote_file_id;
+                    """)
+                stmt.bindInt64(rootId, at: 1)
+                stmt.bindInt64(parentItemId, at: 2)
+                stmt.bindText(item.name, at: 3)
+                stmt.bindText(item.id, at: 4)
+                stmt.bindInt64(Int64(published.mtime), at: 5)
+                stmt.bindInt64(published.size, at: 6)
+                stmt.bindText(item.sha256Checksum, at: 7)
+                stmt.bindText(item.sha256Checksum, at: 8)
+                stmt.bindInt64(published.size, at: 9)
+                stmt.bindText(item.sha256Checksum, at: 10)
+                stmt.bindInt64(published.size, at: 11)
+                stmt.bindInt64(published.device, at: 12)
+                stmt.bindInt64(published.inode, at: 13)
+                let timestamp = Date().timeIntervalSince1970
+                stmt.bindDouble(timestamp, at: 14)
+                stmt.bindDouble(timestamp, at: 15)
+                _ = try stmt.step()
+                stmt.reset()
+                guard conn.changes == 1 else { return }
+                let inbox = try conn.cachedStatement(
+                    "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;")
+                inbox.bindInt64(rootId, at: 1)
+                inbox.bindText(item.id, at: 2)
+                _ = try inbox.step()
+                inbox.reset()
+                receiptApplied.withLock { $0 = true }
+            }
+            return receiptApplied.withLock { $0 }
+        }
+
+        func recoverPublishedFile(
+            _ item: DriveFile, parentItemId: Int64, localURL: URL
+        ) async throws -> Bool {
+            guard FileManager.default.fileExists(atPath: localURL.path),
+                  (try? SyncEngine.computeFileSha256(at: localURL).sha256Hex) == item.sha256Checksum,
+                  let published = try LocalFileVersion.read(at: localURL),
+                  published.size == item.sizeBytes else { return false }
+            return try await commitDownloadedFile(
+                item, parentItemId: parentItemId, localURL: localURL, published: published)
+        }
 
         // 2. Recursive enumeration of remote files and streaming download
         func traverseRemote(parentRemoteId: String, currentLocalURL: URL, parentItemId: Int64) async throws {
@@ -178,6 +262,12 @@ extension SyncEngine {
                     // Recurse to the next level
                     try await traverseRemote(parentRemoteId: item.id, currentLocalURL: itemLocalURL, parentItemId: dirItemId)
                 } else {
+                    try await RemoteChanges.retainBootstrapObservation(
+                        store: self.store, rootID: rootId, file: item)
+                    if try await recoverPublishedFile(
+                        item, parentItemId: parentItemId, localURL: itemLocalURL) {
+                        continue
+                    }
                     // File: join concurrent download queue
                     let downloadBytes = item.sizeBytes ?? 0
                     notifier.addDiscovered(files: 1, bytes: downloadBytes)
@@ -209,56 +299,10 @@ extension SyncEngine {
 
                             // Get metadata after local placement
                             let fileSize = published.size
-                            let mtime = published.mtime
 
-                            // write SQLite baseline B
-                            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                            try await self.store.batchWrite { conn in
-                                // A failed check leaves the file to the next scan; it
-                                // must not abort unrelated writes in the group commit.
-                                guard (try? LocalFileVersion.read(at: itemLocalURL)) == published else { return }
-                                let stmt = try conn.cachedStatement("""
-                                INSERT INTO items (
-                                    root_id, parent_id, name, entry_kind, remote_file_id,
-                                    local_mtime, local_size, local_sha256,
-                                    base_sha256, base_size,
-                                    remote_sha256, remote_size, remote_status,
-                                    local_generation, local_status, phase,
-                                    local_device, local_inode,
-                                    created_at, updated_at
-                                ) VALUES (
-                                    ?, ?, ?, 'file', ?,
-                                    ?, ?, ?,
-                                    ?, ?,
-                                    ?, ?, 'present',
-                                    1, 'present', 'committed',
-                                    ?, ?,
-                                    ?, ?
-                                )
-                                ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
-                                DO NOTHING;
-                                """)
-                                stmt.bindInt64(rootId, at: 1)
-                                stmt.bindInt64(parentItemId, at: 2)
-                                stmt.bindText(item.name, at: 3)
-                                stmt.bindText(item.id, at: 4)
-                                stmt.bindInt64(Int64(mtime), at: 5)
-                                stmt.bindInt64(fileSize, at: 6)
-                                stmt.bindText(item.sha256Checksum, at: 7)
-                                stmt.bindText(item.sha256Checksum, at: 8)
-                                stmt.bindInt64(fileSize, at: 9)
-                                stmt.bindText(item.sha256Checksum, at: 10)
-                                stmt.bindInt64(fileSize, at: 11)
-                                let timestamp = Date().timeIntervalSince1970
-                                stmt.bindInt64(published.device, at: 12)
-                                stmt.bindInt64(published.inode, at: 13)
-                                stmt.bindDouble(timestamp, at: 14)
-                                stmt.bindDouble(timestamp, at: 15)
-                                _ = try stmt.step()
-                                stmt.reset()
-                                if conn.changes == 1 { receiptApplied.withLock { $0 = true } }
-                            }
-                            guard receiptApplied.withLock({ $0 }) else {
+                            guard try await commitDownloadedFile(
+                                item, parentItemId: parentItemId,
+                                localURL: itemLocalURL, published: published) else {
                                 throw SyncEngineError.general("The initial download receipt has expired, retain the existing status: \(item.name)")
                             }
 
@@ -266,6 +310,7 @@ extension SyncEngine {
                             progress.bytesDownloaded += fileSize
                         } catch {
                             recordDatabaseFailure(error)
+                            progress.failures.withLock { $0 += 1 }
                             self.logger.error("Failed to download file [\(item.name)]: \(error)")
                         }
                     }
@@ -302,20 +347,25 @@ extension SyncEngine {
         }
         try await store.checkpoint()
 
-        try await store.write { conn in
-            let stmt = try conn.cachedStatement("""
-            UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
-            """)
-            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-            stmt.bindInt64(rootId, at: 2)
-            _ = try stmt.step()
-            stmt.reset()
+        let filesFailed = progress.failures.withLock { $0 }
+        if filesFailed == 0 {
+            try await store.write { conn in
+                let stmt = try conn.cachedStatement("""
+                UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
+                """)
+                stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+                stmt.bindInt64(rootId, at: 2)
+                _ = try stmt.step()
+                stmt.reset()
+            }
         }
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
         stats.directoriesCreated = progress.dirsCreated
         stats.filesDownloaded = progress.filesDownloaded
         stats.bytesDownloaded = progress.bytesDownloaded
+        stats.filesFailed = filesFailed
+        stats.remoteWorkPending = filesFailed
         stats.elapsedSeconds = elapsed
         notifier.finish()
 

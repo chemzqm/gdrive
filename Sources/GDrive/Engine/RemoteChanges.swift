@@ -48,6 +48,21 @@ struct RemoteChanges: Sendable {
         }
     }
 
+    static func retainBootstrapObservation(store: StateStore, rootID: Int64, file: DriveFile) async throws {
+        let change = DriveChange(fileId: file.id, removed: nil, file: file)
+        guard let payload = String(bytes: try JSONEncoder().encode(change), encoding: .utf8) else {
+            throw SyncEngineError.general("Unable to encode bootstrap remote observation: \(file.id)")
+        }
+        try await store.write { conn in
+            try execute(conn, """
+                INSERT INTO remote_change_inbox(root_id, remote_id, payload)
+                VALUES (?, ?, ?)
+                ON CONFLICT(root_id, remote_id) DO UPDATE SET
+                    payload = excluded.payload, scan_id = NULL, attempted_at = 0;
+                """, [.int(rootID), .text(file.id), .text(payload)])
+        }
+    }
+
     private func enqueue(_ conn: SQLiteConnection, change: DriveChange, scanID: String? = nil) throws {
         let payload = (String(bytes: try JSONEncoder().encode(change), encoding: .utf8) ?? "Invalid UTF-8 data")
         try Self.execute(conn, """
