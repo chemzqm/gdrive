@@ -304,7 +304,13 @@ struct RemoteChanges: Sendable {
                     [.text(String(started)), .int(rootID), .text(result.entry.change.fileId)])
                 try conn.execute("SAVEPOINT remote_apply;")
                 do {
-                    if try apply(conn, result) {
+                    let conflict = try Self.statement(conn, """
+                        SELECT 1 FROM sync_conflicts
+                        WHERE root_id = ? AND remote_file_id = ?;
+                        """, [.int(rootID), .text(result.entry.change.fileId)])
+                    let isInitialConflict = try conflict.step()
+                    conflict.reset()
+                    if !isInitialConflict, try apply(conn, result) {
                         try Self.execute(conn, "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;",
                             [.int(rootID), .text(result.entry.change.fileId)])
                     }
@@ -544,8 +550,9 @@ struct RemoteChanges: Sendable {
                     AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name'))
                     AND i.is_tombstone = 0 WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_directory_scans d JOIN items i
-                    ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending';
-                """, Array(repeating: .int(rootID), count: 5))
+                    ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending'
+                UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?;
+                """, Array(repeating: .int(rootID), count: 6))
             var ids: Set<Int64> = []
             while try queryStatement.step() { if let id = queryStatement.columnInt64(at: 0) { ids.insert(id) } }
             queryStatement.reset()

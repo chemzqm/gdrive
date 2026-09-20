@@ -69,6 +69,44 @@ extension URLRequest {
 struct DirectoryTrackerRecoveryTests {
     private let context = TestHTTPContext(TestRequestHandler())
 
+    private static func bootstrapFailureResponse(
+        request: URLRequest, failure: String, failing: OSAllocatedUnfairLock<Bool>,
+        body: Data, digest: String
+    ) throws -> (HTTPURLResponse, Data) {
+        let url = try #require(request.url)
+        func response(_ status: Int = 200) -> HTTPURLResponse {
+            HTTPURLResponse(
+                url: url, statusCode: status, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"])!
+        }
+        if url.path.hasSuffix("/changes/startPageToken") {
+            return (response(), Data(#"{"startPageToken":"C0"}"#.utf8))
+        }
+        if url.path.hasSuffix("/changes") {
+            return (response(), Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
+        }
+        if url.path.hasSuffix("/files/root") {
+            return (response(), Data(
+                #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+        }
+        if url.path.hasSuffix("/files/file") {
+            if failing.withLock({ $0 }) {
+                if failure == "network" {
+                    return (response(400), Data(#"{"error":{"code":400,"message":"download failed"}}"#.utf8))
+                }
+                if failure == "checksum" { return (response(), Data("wrong bytes".utf8)) }
+            }
+            return (response(), body)
+        }
+        if url.path.hasSuffix("/files") {
+            return (response(), try JSONSerialization.data(withJSONObject: ["files": [[
+                "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                "size": String(body.count), "sha256Checksum": digest, "parents": ["root"]
+            ]]]))
+        }
+        throw URLError(.badURL)
+    }
+
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
         let authData = AuthData(
@@ -132,7 +170,10 @@ struct DirectoryTrackerRecoveryTests {
             throw URLError(.badURL)
         }
         defer { context.value.requestHandler = nil }
-        let engine = try await SyncEngine(auth: auth, store: store, client: createMockClient(auth: auth))
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
         do {
             _ = try await engine.syncRemoteToLocalEmpty(localPath: local.path, remoteRootId: "root")
             Issue.record("Expected the database receipt failure to escape")
@@ -160,7 +201,9 @@ struct DirectoryTrackerRecoveryTests {
         }
         let reopenedStore = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
         let reopened = try await SyncEngine(
-            auth: auth, store: reopenedStore, client: createMockClient(auth: auth))
+            auth: auth, store: reopenedStore, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
         let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")
         #expect(recovered.filesFailed == 0)
         #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
@@ -195,51 +238,29 @@ struct DirectoryTrackerRecoveryTests {
             let body = Data("recoverable remote bytes".utf8)
             let digest = SyncEngine.computeSha256(of: body)
             let failing = OSAllocatedUnfairLock(initialState: true)
+            if failure == "publication" {
+                try Data("local collision".utf8).write(to: local.appendingPathComponent("file.txt"))
+            }
             context.value.requestHandler = { request in
-                let url = try #require(request.url)
-                func response(_ status: Int = 200) -> HTTPURLResponse {
-                    HTTPURLResponse(
-                        url: url, statusCode: status, httpVersion: nil,
-                        headerFields: ["Content-Type": "application/json"])!
-                }
-                if url.path.hasSuffix("/changes/startPageToken") {
-                    return (response(), Data(#"{"startPageToken":"C0"}"#.utf8))
-                }
-                if url.path.hasSuffix("/changes") {
-                    return (response(), Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
-                }
-                if url.path.hasSuffix("/files/root") {
-                    return (response(), Data(
-                        #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
-                }
-                if url.path.hasSuffix("/files/file") {
-                    if failing.withLock({ $0 }) {
-                        if failure == "network" {
-                            return (response(400), Data(#"{"error":{"code":400,"message":"download failed"}}"#.utf8))
-                        }
-                        if failure == "checksum" { return (response(), Data("wrong bytes".utf8)) }
-                    }
-                    return (response(), body)
-                }
-                if url.path.hasSuffix("/files") {
-                    if failure == "publication", failing.withLock({ $0 }) {
-                        try Data("local collision".utf8).write(
-                            to: local.appendingPathComponent("file.txt"))
-                    }
-                    return (response(), try JSONSerialization.data(withJSONObject: ["files": [[
-                        "id": "file", "name": "file.txt", "mimeType": "text/plain",
-                        "size": String(body.count), "sha256Checksum": digest, "parents": ["root"]
-                    ]]]))
-                }
-                throw URLError(.badURL)
+                try Self.bootstrapFailureResponse(
+                    request: request, failure: failure, failing: failing,
+                    body: body, digest: digest)
             }
             defer { context.value.requestHandler = nil }
 
             let engine = try await SyncEngine(
-                auth: auth, store: store, client: createMockClient(auth: auth))
+                auth: auth, store: store, client: createMockClient(auth: auth),
+                downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+                conflictDirectory: directory.appendingPathComponent("conflicts"))
             let failed = try await engine.syncRemoteToLocalEmpty(
                 localPath: local.path, remoteRootId: "root")
-            #expect(failed.filesFailed == 1)
+            let expectedFailures = ["network": 1, "checksum": 1, "publication": 0]
+            let expectedStates = [
+                "network": ("freshCreated", Int64(1)),
+                "checksum": ("freshCreated", Int64(1)),
+                "publication": ("existingKnown", Int64(0))
+            ]
+            #expect(failed.filesFailed == expectedFailures[failure]!)
             #expect(failed.remoteWorkPending == 1)
             let pendingState = try await store.read { conn in
             let query = try conn.prepare("""
@@ -251,33 +272,47 @@ struct DirectoryTrackerRecoveryTests {
             #expect(try query.step())
             return (query.columnText(at: 0), query.columnInt64(at: 1))
             }
-            #expect(pendingState.0 == "freshCreated")
-            #expect(pendingState.1 == 1)
+            #expect(pendingState.0 == expectedStates[failure]!.0)
+            #expect(pendingState.1 == expectedStates[failure]!.1)
 
             failing.withLock { $0 = false }
             if failure == "publication" {
-                try FileManager.default.removeItem(at: local.appendingPathComponent("file.txt"))
+                #expect(failed.conflicts.count == 1)
+                #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == Data("local collision".utf8))
+                let conflictPath = try #require(failed.conflicts[0].conflictPath)
+                #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == body)
             }
             let reopenedStore = try await StateStore(path: databasePath)
             let reopened = try await SyncEngine(
-                auth: auth, store: reopenedStore, client: createMockClient(auth: auth))
-            let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")
-            #expect(recovered.filesFailed == 0)
+                auth: auth, store: reopenedStore, client: createMockClient(auth: auth),
+                downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+                conflictDirectory: directory.appendingPathComponent("conflicts"))
+            if failure == "publication" {
+                let conflicts = try await reopened.listConflicts(localPath: local.path)
+                #expect(conflicts == failed.conflicts)
+                try await reopened.resolveConflict(id: conflicts[0].id, resolution: .remote)
+            } else {
+                let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")
+                #expect(recovered.filesFailed == 0)
+            }
             #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
             let finalState = try await reopenedStore.read { conn in
             let query = try conn.prepare("""
                 SELECT r.bootstrap_state,
                     (SELECT count(*) FROM remote_change_inbox WHERE root_id = r.root_id),
-                    (SELECT count(*) FROM items WHERE root_id = r.root_id AND remote_file_id = 'file')
+                    (SELECT count(*) FROM items WHERE root_id = r.root_id AND remote_file_id = 'file'),
+                    (SELECT count(*) FROM sync_conflicts WHERE root_id = r.root_id)
                 FROM roots r;
                 """)
             defer { query.reset() }
             #expect(try query.step())
-            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnInt64(at: 2))
+            return (query.columnText(at: 0), query.columnInt64(at: 1),
+                query.columnInt64(at: 2), query.columnInt64(at: 3))
             }
             #expect(finalState.0 == "existingKnown")
             #expect(finalState.1 == 0)
             #expect(finalState.2 == 1)
+            #expect(finalState.3 == 0)
         }
 
         for failure in ["network", "checksum", "publication"] {

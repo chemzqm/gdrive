@@ -84,6 +84,28 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 ### 2.3 设置下载临时目录
 
 默认下载到 `~/.gdrive/remotes/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
+
+如果同步目录中的同路径文件与远端 SHA-256 不同，远端版本保存在
+`~/.gdrive/conflicts/<remoteRootId>/<relativePath>`。冲突会出现在 `SyncStats.conflicts`，进程重启后
+也可查询并显式解决：
+
+```swift
+let conflicts = try await engine.listConflicts(localPath: localPath)
+for conflict in conflicts {
+    // 保留本地版本；后续增量同步会尝试把它同步到远端。
+    try await engine.resolveConflict(id: conflict.id, resolution: .local)
+
+    // 或者选择已下载并校验的远端版本：
+    // try await engine.resolveConflict(id: conflict.id, resolution: .remote)
+}
+```
+
+未解决期间，远端新版本会更新 conflicts 文件；远端删除只更新冲突状态。该路径不会传播上传或
+删除操作，其他路径继续正常同步。
+
+一侧删除而另一侧仍为已同步基线内容时，删除会直接扩散；另一侧已修改时则进入冲突。
+此时 resolution 表示调用方选择的最终状态：选择已删除的一侧会把删除扩散到另一侧，选择已修改的
+一侧会恢复被删除的一侧。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
 初始化下载、增量下载及冲突恢复都使用此设置；目录按需创建。
 
@@ -207,7 +229,7 @@ print("  - 耗时: \(String(format: "%.2f", stats.elapsedSeconds))s")
 
 #### (2) 远端目录到本地空目录同步 (`syncRemoteToLocalEmpty`)
 
-适用于新设备首次将云端已有目录完整下载至本地空目录。
+适用于新设备首次将云端已有目录完整下载至本地目录。本地独有文件会保留；同路径不同内容会进入冲突目录。
 
 ```swift
 let emptyLocalDir = "/Users/username/Documents/RestoredProject"
@@ -226,7 +248,7 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 ```
 
 - **特性**：流式递归遍历，原子临时文件落地校验 SHA-256 后发布，建立完整的 SQLite 共同基线。
-- **保护**：强制要求本地目标必须为空目录，防止误覆盖本地已有文件。
+- **保护**：不覆盖本地已有的不同内容；远端版本写入 conflicts 目录并等待调用方显式选择。
 - **失败恢复**：首次调用在下载前持久化远端观察。文件下载、校验或发布失败会计入
   `filesFailed`，保留待恢复观察且不把初始化标记为完成；再次调用 `sync()` 会继续已绑定的
   部分初始化目录，无需等待该文件产生新的 Drive Change。

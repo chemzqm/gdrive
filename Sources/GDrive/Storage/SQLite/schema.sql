@@ -209,6 +209,26 @@ CREATE TABLE IF NOT EXISTS remote_directory_scans (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_scans_pending ON remote_directory_scans(root_id) WHERE state = 'pending';
 
+-- Remote files that could not be published during remote-to-local bootstrap
+-- because the destination was occupied by different local content.
+CREATE TABLE IF NOT EXISTS sync_conflicts (
+    conflict_id TEXT PRIMARY KEY NOT NULL,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    item_id INTEGER NOT NULL UNIQUE REFERENCES items(item_id) ON DELETE CASCADE,
+    remote_file_id TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    local_path TEXT NOT NULL,
+    conflict_path TEXT,
+    remote_sha256 TEXT NOT NULL CHECK(length(remote_sha256) = 64),
+    remote_size INTEGER NOT NULL CHECK(remote_size >= 0),
+    remote_version INTEGER,
+    remote_status TEXT NOT NULL CHECK(remote_status IN ('present', 'trashed', 'removed')),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(root_id, remote_file_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_conflicts_root ON sync_conflicts(root_id);
+
 
 -- Nonunique to retain distinct item identities when local names are equivalent.
 CREATE INDEX IF NOT EXISTS idx_items_local_name_key

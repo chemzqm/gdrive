@@ -14,12 +14,34 @@ public struct SyncStats: Sendable {
     public var bytesDownloaded: Int64 = 0
     public var filesDeleted: Int = 0
     public var conflictsResolved: Int = 0
+    public var conflicts: [SyncConflict] = []
     /// Durable remote observations/pages still awaiting a later reconcile round.
     public var remoteWorkPending: Int = 0
     /// Remote identities blocked by equivalent local names; rename remotely to resolve.
     public var remoteNameConflicts: Int = 0
     public var filesFailed: Int = 0
     public var elapsedSeconds: Double = 0
+}
+
+public struct SyncConflict: Sendable, Equatable {
+    public enum RemoteStatus: String, Sendable {
+        case present, trashed, removed
+    }
+
+    public let id: String
+    public let remoteFileId: String
+    public let relativePath: String
+    public let localPath: String
+    public let conflictPath: String?
+    public let remoteSHA256: String
+    public let remoteSize: Int64
+    public let remoteVersion: Int64?
+    public let remoteStatus: RemoteStatus
+}
+
+public enum SyncConflictResolution: Sendable {
+    case local
+    case remote
 }
 
 /// SyncEngine Exception type definition
@@ -69,6 +91,7 @@ public final class SyncEngine: Sendable {
     /// Keep it outside all sync roots and on the destination filesystem.
     public var downloadTemporaryDirectory: URL { downloadTemporaryDirectoryStorage.withLock { $0 } }
     private let downloadTemporaryDirectoryStorage: OSAllocatedUnfairLock<URL>
+    let conflictDirectory: URL
 
     /// Applies to subsequent sync runs. Existing runs keep their selected directory.
     public func setDownloadTemporaryDirectory(_ directory: URL) throws {
@@ -88,19 +111,26 @@ public final class SyncEngine: Sendable {
         store: StateStore? = nil,
         client: DriveClient? = nil,
         idPool: IDPool? = nil,
-        downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory
+        downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
+        conflictDirectory: URL = DriveClient.defaultConflictDirectory
     ) async throws {
         try await self.init(auth: auth, store: store, client: client, idPool: idPool,
-            downloadTemporaryDirectory: downloadTemporaryDirectory, incrementalScan: Self.defaultDirectoryScan)
+            downloadTemporaryDirectory: downloadTemporaryDirectory,
+            conflictDirectory: conflictDirectory, incrementalScan: Self.defaultDirectoryScan)
     }
 
     init(auth: Auth, store: StateStore? = nil, client: DriveClient? = nil, idPool: IDPool? = nil,
          downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
+         conflictDirectory: URL = DriveClient.defaultConflictDirectory,
          incrementalScan: @escaping IncrementalScan) async throws {
         guard downloadTemporaryDirectory.isFileURL else {
             throw SyncEngineError.general("The temporary download directory must be a local file path")
         }
         self.downloadTemporaryDirectoryStorage = OSAllocatedUnfairLock(initialState: downloadTemporaryDirectory)
+        guard conflictDirectory.isFileURL else {
+            throw SyncEngineError.general("The conflict directory must be a local file path")
+        }
+        self.conflictDirectory = conflictDirectory
         self.directoryScan = incrementalScan
         self.auth = auth
         let effectiveClient = client ?? DriveClient(auth: auth)
@@ -235,7 +265,7 @@ public final class SyncEngine: Sendable {
 
     // MARK: - Root synchronization lock
 
-    private func withRootSyncLock<T: Sendable>(
+    func withRootSyncLock<T: Sendable>(
         localPath: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
@@ -264,7 +294,7 @@ public final class SyncEngine: Sendable {
         }
     }
 
-    private static func normalizedPath(_ path: String) -> String {
+    static func normalizedPath(_ path: String) -> String {
         URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
     }
 

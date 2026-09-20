@@ -79,7 +79,7 @@ struct DirectoryBarrierTests {
         return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
-    @Test("Scenario 1: Local directory deleted but remote child modified -> child downloaded, parent directory recreated, remote parent NOT trashed")
+    @Test("Scenario 1: Local directory deleted but remote child modified -> conflict retained, parent directory recreated, remote parent NOT trashed")
     func testLocalDirDeletedRemoteChildModified() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test1_\(UUID().uuidString)")
@@ -217,21 +217,28 @@ struct DirectoryBarrierTests {
         try await store.write { conn in
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
-        let engine = try await SyncEngine(auth: auth, store: store, client: client)
+        let conflictDirectory = tempDir.appendingPathComponent("conflicts")
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: client, conflictDirectory: conflictDirectory)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. The remote parent directory must not be trash
         #expect(!trashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must NOT be trashed due to descendant barrier")
 
-        // 2. The local subdirectory is re-created and the sub-file is downloaded
+        // 2. The directory barrier restores the parent, while the modified remote child is
+        // retained as a conflict instead of overwriting the local deletion.
         let downloadedSubDir = localRootDir.appendingPathComponent("sub")
         let downloadedFile = downloadedSubDir.appendingPathComponent("child.txt")
         #expect(FileManager.default.fileExists(atPath: downloadedSubDir.path), "Local parent directory must be recreated on disk")
-        #expect(FileManager.default.fileExists(atPath: downloadedFile.path), "Local child file must be downloaded and present")
+        #expect(!FileManager.default.fileExists(atPath: downloadedFile.path))
 
-        let contentOnDisk = try? String(contentsOf: downloadedFile, encoding: .utf8)
-        #expect(contentOnDisk == newRemoteContent)
+        let conflicts = try await engine.listConflicts(localPath: localRootDir.path)
+        let conflict = try #require(conflicts.first)
+        #expect(conflict.relativePath == "sub/child.txt")
+        #expect(conflict.remoteStatus == .present)
+        let conflictPath = try #require(conflict.conflictPath)
+        #expect(try String(contentsOfFile: conflictPath, encoding: .utf8) == newRemoteContent)
 
         // 3. Database status:sub of local_status Revert to present,child.txt also for present
         try await store.read { conn in

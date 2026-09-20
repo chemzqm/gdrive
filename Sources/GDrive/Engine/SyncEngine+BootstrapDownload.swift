@@ -44,16 +44,12 @@ extension SyncEngine {
             return try queryStatement.step()
         }
 
-        // A new bootstrap requires an empty target. A retry owns the partial
-        // files recorded under the existing root and resumes in place.
+        // Existing local entries are preserved. Equal content is adopted and
+        // divergent same-path content is recorded as a durable conflict.
         var isDir: ObjCBool = false
         if FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir) {
             guard isDir.boolValue else {
                 throw NSError(domain: "SyncEngine", code: 11, userInfo: [NSLocalizedDescriptionKey: "The local path already exists and is not a directory: \(resolvedLocalPath)"])
-            }
-            let contents = try FileManager.default.contentsOfDirectory(atPath: resolvedLocalPath)
-            guard rootExists || contents.isEmpty else {
-                throw NSError(domain: "SyncEngine", code: 12, userInfo: [NSLocalizedDescriptionKey: "The local target directory must be empty: \(resolvedLocalPath)"])
             }
         } else {
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
@@ -128,6 +124,7 @@ extension SyncEngine {
             var bytesDownloaded: Int64 = 0
             var dirsCreated = 0
             let failures = OSAllocatedUnfairLock(initialState: 0)
+            let conflicts = OSAllocatedUnfairLock(initialState: 0)
         }
         let progress = DownloadTracker()
 
@@ -208,6 +205,26 @@ extension SyncEngine {
                 item, parentItemId: parentItemId, localURL: localURL, published: published)
         }
 
+        let conflictRoot = try SyncConflictStore.directory(
+            base: conflictDirectory, remoteRootID: remoteRootId)
+
+        func stageConflict(
+            _ item: DriveFile, parentItemId: Int64, localURL: URL, relativePath: String
+        ) async throws -> Int64 {
+            let conflictURL = conflictRoot.appendingPathComponent(relativePath)
+            try FileManager.default.createDirectory(
+                at: conflictURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let expected = try LocalFileVersion.read(at: conflictURL)
+            let stored = try await self.client.downloadFileSafely(
+                remoteId: item.id, destinationURL: conflictURL,
+                expectedSha256: item.sha256Checksum, expectedDestination: expected,
+                temporaryDirectory: conflictRoot)
+            try await SyncConflictStore.commitBootstrap(
+                store: self.store, rootID: rootId, parentItemID: parentItemId, file: item,
+                relativePath: relativePath, localURL: localURL, conflictURL: conflictURL)
+            return stored.size
+        }
+
         // 2. Recursive enumeration of remote files and streaming download
         func traverseRemote(parentRemoteId: String, currentLocalURL: URL, parentItemId: Int64) async throws {
             let children = try await self.client.listChildren(parentId: parentRemoteId)
@@ -268,6 +285,7 @@ extension SyncEngine {
                         item, parentItemId: parentItemId, localURL: itemLocalURL) {
                         continue
                     }
+                    let relativePath = String(itemLocalURL.path.dropFirst(rootURL.path.count + 1))
                     // File: join concurrent download queue
                     let downloadBytes = item.sizeBytes ?? 0
                     notifier.addDiscovered(files: 1, bytes: downloadBytes)
@@ -285,17 +303,41 @@ extension SyncEngine {
                         do {
                             try checkDatabaseFailure()
                             self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
-                            // Streaming download and verification SHA-256
-                            let published = try await self.client.downloadFileSafely(
-                                remoteId: item.id,
-                                destinationURL: itemLocalURL,
-                                expectedSha256: item.sha256Checksum,
-                                expectedDestination: nil,
-                                temporaryDirectory: downloadDirectory,
-                                onProgress: { delta in
-                                    self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
+                            if FileManager.default.fileExists(atPath: itemLocalURL.path) {
+                                let fileSize = try await stageConflict(
+                                    item, parentItemId: parentItemId,
+                                    localURL: itemLocalURL, relativePath: relativePath)
+                                progress.conflicts.withLock { $0 += 1 }
+                                progress.filesDownloaded += 1
+                                progress.bytesDownloaded += fileSize
+                                return
+                            }
+                            let published: LocalFileVersion
+                            do {
+                                // Streaming download and verification SHA-256
+                                published = try await self.client.downloadFileSafely(
+                                    remoteId: item.id,
+                                    destinationURL: itemLocalURL,
+                                    expectedSha256: item.sha256Checksum,
+                                    expectedDestination: nil,
+                                    temporaryDirectory: downloadDirectory,
+                                    onProgress: { delta in
+                                        self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
+                                    }
+                                )
+                            } catch {
+                                // A local creator may win after enumeration but before publication.
+                                if FileManager.default.fileExists(atPath: itemLocalURL.path) {
+                                    let fileSize = try await stageConflict(
+                                        item, parentItemId: parentItemId,
+                                        localURL: itemLocalURL, relativePath: relativePath)
+                                    progress.conflicts.withLock { $0 += 1 }
+                                    progress.filesDownloaded += 1
+                                    progress.bytesDownloaded += fileSize
+                                    return
                                 }
-                            )
+                                throw error
+                            }
 
                             // Get metadata after local placement
                             let fileSize = published.size
@@ -365,7 +407,8 @@ extension SyncEngine {
         stats.filesDownloaded = progress.filesDownloaded
         stats.bytesDownloaded = progress.bytesDownloaded
         stats.filesFailed = filesFailed
-        stats.remoteWorkPending = filesFailed
+        stats.conflicts = try await SyncConflictStore.list(store: store, rootID: rootId)
+        stats.remoteWorkPending = filesFailed + stats.conflicts.count
         stats.elapsedSeconds = elapsed
         notifier.finish()
 

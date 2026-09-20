@@ -590,30 +590,41 @@ extension IncrementalSyncRun {
                 syncGroup.leave()
             }
             do {
-                guard winner == .remote, let remoteID = item.remoteFileId,
-                    let localSHA = item.local?.sha256?.lowercased(),
-                    let remoteSHA = item.remote?.sha256?.lowercased()
-                else {
+                guard winner == .remote, let remoteID = item.remoteFileId else {
                     throw SyncEngineError.general(
                         "The conflict lacks valid evidence of the content of both parties")
                 }
+                _ = conflictId
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
-                let original = rootURL.appendingPathComponent(parentRel)
-                    .appendingPathComponent(
-                        item.name)
-                let conflictOperation = try await ConflictOperation.prepare(
-                    store: engine.store,
-                    rootID: rootID, itemID: item.itemId, parentID: item.parentId,
-                    original: original, remoteID: remoteID,
-                    parentRemoteID: directoryContext.getRemoteId(for: item.parentId)
-                        ?? remoteRootID,
-                    copyRemoteID: engine.idPool.nextId(), conflictID: conflictId,
-                    localSHA: localSHA, remoteSHA: remoteSHA,
-                    localGeneration: item.localGeneration,
-                    remoteGeneration: item.remoteGeneration,
-                    dirtyGeneration: item.dirtyGeneration)
-                try await engine.resolveConflict(conflictOperation, temporaryDirectory: downloadDirectory)
-                actionTracker.conflicts.withLock { $0 += 1 }
+                let relativePath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
+                let original = rootURL.appendingPathComponent(relativePath)
+                let remotePresent = item.remote?.status == .present
+                let remoteSHA = remotePresent ? item.remote?.sha256 : item.baseline?.sha256
+                let remoteSize = remotePresent ? item.remote?.size : item.baseline?.size
+                guard let remoteSHA = remoteSHA?.lowercased(), let remoteSize else {
+                    throw SyncEngineError.general(
+                        "The conflict lacks a durable remote content identity: \(relativePath)")
+                }
+                var stored: URL?
+                if remotePresent {
+                    let conflictRoot = try SyncConflictStore.directory(
+                        base: engine.conflictDirectory, remoteRootID: remoteRootID)
+                    let destination = conflictRoot.appendingPathComponent(relativePath)
+                    try FileManager.default.createDirectory(
+                        at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    _ = try await engine.client.downloadFileSafely(
+                        remoteId: remoteID, destinationURL: destination, expectedSha256: remoteSHA,
+                        expectedDestination: try LocalFileVersion.read(at: destination),
+                        temporaryDirectory: conflictRoot)
+                    stored = destination
+                }
+                let status: SyncConflict.RemoteStatus = item.remote?.status == .trashed ? .trashed :
+                    (remotePresent ? .present : .removed)
+                try await SyncConflictStore.commitIncremental(
+                    store: engine.store, rootID: rootID, itemID: item.itemId,
+                    remoteFileID: remoteID, relativePath: relativePath,
+                    localURL: original, conflictURL: stored,
+                    remoteSHA: remoteSHA, remoteSize: remoteSize, remoteStatus: status)
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 actionTracker.recordDatabaseFailure(error)

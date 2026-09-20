@@ -878,6 +878,10 @@ public final class DriveClient: Sendable {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive/remotes", isDirectory: true)
     }
 
+    public static var defaultConflictDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive/conflicts", isDirectory: true)
+    }
+
     /// Download file body and stream checksum SHA-256,Atomic Fall to Target Path
     public func downloadFile(
         remoteId: String,

@@ -132,7 +132,8 @@ public struct Reconciler: Sendable {
 
         if let decision = deletionDecision(localDeleted: localDeleted, remoteDeleted: remoteDeleted,
                                            localChanged: localChanged, remoteChanged: remoteChanged,
-                                           localUnchanged: localUnchanged, remoteUnchanged: remoteUnchanged) {
+                                           localUnchanged: localUnchanged, remoteUnchanged: remoteUnchanged,
+                                           baseSha: baseSha, localSha: localSha, remoteSha: remoteSha) {
             return decision
         }
 
@@ -231,7 +232,8 @@ public struct Reconciler: Sendable {
     private static func deletionDecision(
         localDeleted: Bool, remoteDeleted: Bool,
         localChanged: Bool, remoteChanged: Bool,
-        localUnchanged: Bool, remoteUnchanged: Bool
+        localUnchanged: Bool, remoteUnchanged: Bool,
+        baseSha: String?, localSha: String?, remoteSha: String?
     ) -> ReconcileDecision? {
         // 5.1 Delete on both ends
         if localDeleted && remoteDeleted {
@@ -241,8 +243,8 @@ public struct Reconciler: Sendable {
         // 5.2 Local deleted, remote not deleted
         if localDeleted && !remoteDeleted {
             if remoteChanged {
-                // Deleted locally, but changed remotely -> Keep Modified Version
-                return .keepModified(preferLocal: false)
+                let id = conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
+                return .conflict(winner: .remote, conflictId: id)
             } else if remoteUnchanged {
                 // Local deletion, remote confirmation unchanged -> Safely move to Remote Recycle Bin
                 return .trashRemote
@@ -252,8 +254,8 @@ public struct Reconciler: Sendable {
         // 5.3 Remote deleted, local not deleted
         if remoteDeleted && !localDeleted {
             if localChanged {
-                // Remotely deleted, but new local modifications -> Keep Modified Version
-                return .keepModified(preferLocal: true)
+                let id = conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
+                return .conflict(winner: .remote, conflictId: id)
             } else if localUnchanged {
                 // Remotely deleted, local confirmation unchanged -> Safely delete local files
                 return .deleteLocal

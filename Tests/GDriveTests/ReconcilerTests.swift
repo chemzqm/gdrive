@@ -83,14 +83,17 @@ struct ReconcilerTests {
         #expect(decision == .deleteLocal)
     }
 
-    @Test("One side deleted and other side modified preserves modified content")
+    @Test("One side deleted and other side modified creates a conflict")
     func testDeleteAndModifyConflict() {
         let baseline = ItemBaseline(sha256: baseSha, size: 100)
         let local = LocalObservation(status: .absent)
         let remote = RemoteObservation(status: .present, sha256: modSha1, size: 200)
 
         let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
-        #expect(decision == .keepModified(preferLocal: false))
+        guard case .conflict = decision else {
+            Issue.record("Expected deletion versus modification conflict")
+            return
+        }
     }
 
     @Test("Completely unchanged file produces unchanged")

@@ -159,6 +159,7 @@ extension IncrementalSyncRun {
             store: engine.store, client: engine.client, rootID: rootID, remoteRootID: remoteRootID,
             rootURL: rootURL)
         try await remoteChanges.consume()
+        try await engine.refreshSyncConflicts(rootID: rootID)
         let remoteGate = try await remoteChanges.gate()
         let directoryContext = try await loadDirectoryContext(
             engine: engine, rootID: rootID, rootItemID: rootItemID, remoteRootID: remoteRootID)
@@ -239,6 +240,8 @@ extension IncrementalSyncRun {
         stats.bytesDownloaded = actionTracker.bytesDown
         stats.filesDeleted = actionTracker.deleted
         stats.conflictsResolved = recoveredConflicts + actionTracker.conflicts.withLock { $0 }
+        stats.conflicts = try await SyncConflictStore.list(store: engine.store, rootID: rootID)
+        stats.remoteWorkPending += stats.conflicts.count
         stats.filesFailed = scanProgress.failed + actionTracker.failures.withLock { $0 }
         stats.elapsedSeconds = elapsed
         notifier.finish()
