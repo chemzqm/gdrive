@@ -144,7 +144,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 
 | 文件 | 职责 |
 | --- | --- |
-| `SyncEngine+BootstrapUpload.swift` | 初始化上传：扫描、目录就绪、任务背压、上传回执与初始化收尾 |
+| `SyncEngine+BootstrapUpload.swift` | 初始化上传：扫描、目录就绪、传输并发控制、上传回执与初始化收尾 |
 | `SyncEngine+BootstrapDownload.swift` | 初始化下载：远端递归列举、暂存发布和基线建立 |
 | `SyncEngine+ResumableUpload.swift` | 分块上传、会话恢复、确认偏移和完成状态持久化 |
 | `SyncEngine+Hashing.swift` | 内存和文件流式 SHA-256，保留现有辅助方法名称 |
@@ -181,7 +181,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
   * 对 $\le 8\text{MB}$ 小文件执行单次读盘载入内存，并就地完成 SHA-256 计算，
     彻底消除 8,000+ 次重复磁盘读。
   * Multipart/related 单步直接上传，静态预计算 Boundary，不落任何磁盘临时文件。
-  * scanner 之外最多保留 512 个轻量任务；窗口满时反压扫描消费端。文件正文仍在父目录就绪后才取得最多 64 个传输槽并读取，目录创建使用独立的最多 8 个请求槽。
+  * 扫描发现的目录和文件直接创建任务，不限制排队任务数量。文件正文在父目录就绪后才取得最多 64 个传输槽并读取，目录创建使用独立的最多 8 个请求槽。排队任务占用的内存随待处理条目数量增长。
 * **模式 2：`syncRemoteToLocalEmpty`**：
   * 流式递归列举远端目录树，边扫描边下载并流式计算 SHA-256，临时文件下载完成后
     通过原子操作重命名落盘。

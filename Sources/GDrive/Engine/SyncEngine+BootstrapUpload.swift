@@ -183,10 +183,6 @@ extension SyncEngine {
         // 3. Set up a bounded concurrent upload pipeline (strict upper limit 64 Concurrency)
         let effectiveConcurrency = max(1, min(64, maxUploadConcurrency))
         let uploadSemaphore = AsyncSemaphore(count: effectiveConcurrency)
-        // Bound all bootstrap work admitted beyond the scanner. This window is
-        // deliberately larger than the transfer pool so scanning can stay ahead
-        // of slow requests without retaining one Task per tree entry.
-        let bootstrapTaskWindow = AsyncSemaphore(count: 512)
         // Directory metadata requests do not consume file transfer slots, but
         // they still need their own network concurrency bound.
         let directorySemaphore = AsyncSemaphore(count: max(1, min(8, effectiveConcurrency)))
@@ -277,7 +273,6 @@ extension SyncEngine {
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
         @Sendable func uploadFile(fullPath: String, relPath: String, parentRel: String, name: String, fileSize: Int64) async {
             defer {
-                bootstrapTaskWindow.signal()
                 uploadGroup.leave()
             }
             var createIntent: DurableCreateIntent?
@@ -626,7 +621,6 @@ extension SyncEngine {
 
         @Sendable func createDirectory(relPath: String, parentRel: String, name: String, metadata: FileMetadata?) async {
             defer {
-                bootstrapTaskWindow.signal()
                 uploadGroup.leave()
             }
             var createIntent: DurableCreateIntent?
@@ -729,7 +723,6 @@ extension SyncEngine {
                         if localDirMap.get(relPath) != nil {
                             continue
                         }
-                        await bootstrapTaskWindow.wait()
                         uploadGroup.enter()
                         Task { await createDirectory(relPath: relPath, parentRel: parentRel, name: name, metadata: record.metadata) }
                     } else if record.type == .file {
@@ -744,7 +737,6 @@ extension SyncEngine {
                             continue
                         }
 
-                        await bootstrapTaskWindow.wait()
                         // File handling: wait for its immediate parent directory to be ready and upload immediately
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
