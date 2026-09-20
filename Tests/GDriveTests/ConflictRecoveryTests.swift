@@ -175,7 +175,7 @@ struct ConflictRecoveryTests {
             #expect(try Data(contentsOf: testFixture.local.appendingPathComponent(file.name)) == file.content)
         }
         let before = context.value.state.withLock { ($0.uploads, $0.downloads) }
-        let next = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let next = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(next.conflictsResolved == 0)
         #expect(next.filesFailed == 0)
         #expect(next.filesUploaded == 0)
@@ -197,7 +197,7 @@ struct ConflictRecoveryTests {
     func convergence() async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
-        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(stats.conflictsResolved == 1)
         #expect(stats.filesFailed == 0)
         try await assertConverged(testFixture)
@@ -207,7 +207,7 @@ struct ConflictRecoveryTests {
     func largeConflict() async throws {
         let testFixture = try await fixture(localContent: Data(repeating: 65, count: 9 * 1024 * 1024))
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
-        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(stats.conflictsResolved == 1)
         #expect(stats.filesFailed == 0)
         #expect(context.value.state.withLock { $0.sessions.count } == 1)
@@ -219,11 +219,11 @@ struct ConflictRecoveryTests {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
         context.value.state.withLock { $0.loseResponse = true }
-        let failed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let failed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(failed.conflictsResolved == 0)
         #expect(failed.filesFailed == 1)
         #expect(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).count == 1)
-        let recovered = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let recovered = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(recovered.conflictsResolved == 1)
         #expect(context.value.state.withLock { $0.uploads } == 2) // baseline + one copy
         try await assertConverged(testFixture)
@@ -261,7 +261,7 @@ struct ConflictRecoveryTests {
         #expect(pending.first?.copyRemoteID == "copy-id")
         let engine = try await SyncEngine(auth: testFixture.auth, store: reopened, client: testFixture.client,
             downloadTemporaryDirectory: testFixture.engine.downloadTemporaryDirectory)
-        let resumed = try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let resumed = try await engine.syncIncremental(localPath: testFixture.local.path)
         #expect(resumed.conflictsResolved == 1)
         try await assertConverged(testFixture)
     }
@@ -270,7 +270,7 @@ struct ConflictRecoveryTests {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
         context.value.state.withLock { $0.loseResponse = true }
-        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         let operationStatement = try #require(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).first)
         let newer = Data("newer user data".utf8)
         switch kind {
@@ -284,7 +284,7 @@ struct ConflictRecoveryTests {
         default: context.value.state.withLock { $0.files[operationStatement.copyRemoteID]!.content = newer }
         }
         do {
-            _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+            _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
             Issue.record("Changed conflict inputs must not be marked resolved")
         } catch {}
         #expect(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).count == 1)

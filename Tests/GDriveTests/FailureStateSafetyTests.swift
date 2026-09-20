@@ -192,7 +192,7 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while updateMetadata fails
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // SQLite should NOT be updated to 'dir_B' because remote update failed!
         try await store.read { conn in
@@ -204,7 +204,7 @@ struct FailureStateSafetyTests {
 
         // 2. Allow updateMetadata to succeed on retry
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // SQLite should now be updated to 'dir_B'
         try await store.read { conn in
@@ -370,7 +370,7 @@ struct FailureStateSafetyTests {
 
         // A failed rename must preserve both the mapping and verified content metadata.
         if failRename {
-            try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+            try await engine.syncIncremental(localPath: localRootDir.path)
 
             try await store.read { conn in
                 let stmt = try conn.prepare("SELECT name, local_mtime, local_sha256 FROM items WHERE item_id = ?;")
@@ -385,7 +385,7 @@ struct FailureStateSafetyTests {
 
         // 2. Allow update to succeed on retry
         control.shouldFail = false
-        let stats = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        let stats = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(stats.filesUploaded == 0) // A11 blocks unconditioned remote overwrites.
         #expect(stats.filesFailed == (contentChanged ? 1 : 0))
         #expect(stats.filesSkipped == (contentChanged ? 0 : 1))
@@ -399,7 +399,7 @@ struct FailureStateSafetyTests {
             #expect(stmt.columnText(at: 2) == expectedSHA)
             #expect((stmt.columnInt64(at: 3) ?? 0) == (contentChanged ? 1 : 0))
         }
-        let second = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        let second = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(second.filesUploaded == 0)
         #expect(second.filesSkipped == (contentChanged ? 0 : 1))
         #expect(second.filesFailed == (contentChanged ? 1 : 0))
@@ -525,7 +525,7 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. First sync with trash failing
-        let stats1 = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        let stats1 = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(stats1.filesDeleted == 0, "Failed trash must not be counted in filesDeleted")
 
         // In SQLite: is_tombstone MUST still be 0!
@@ -538,7 +538,7 @@ struct FailureStateSafetyTests {
 
         // 2. Retry with trash succeeding
         control.shouldFail = false
-        let stats2 = try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        let stats2 = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(stats2.filesDeleted == 1, "Successful trash should be counted in filesDeleted")
 
         // In SQLite: is_tombstone should now be 1
@@ -636,7 +636,7 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while createDirectory fails
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // SQLite: new_folder MUST NOT be committed!
         try await store.read { conn in
@@ -652,7 +652,7 @@ struct FailureStateSafetyTests {
 
         // 2. Retry with createDirectory succeeding
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // SQLite: new_folder must now be committed
         try await store.read { conn in
@@ -765,14 +765,14 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync when ID generation fails
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Assert: NO creation request was made with a generated UUID!
         #expect(tracker.requestedCreationIds.isEmpty, "No createDirectory request should be issued when IDPool fails")
 
         // 2. Allow ID generation to succeed on retry
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Assert: Creation was issued with the valid server ID
         #expect(tracker.requestedCreationIds == ["valid_remote_id_42"], "Creation request must use valid pre-generated server ID")

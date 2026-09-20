@@ -270,7 +270,7 @@ struct ChangesRecoveryTests {
     }
     private func converge(_ testFixture: Fixture, limit: Int = 12) async throws {
         for _ in 0..<limit {
-            let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+            let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
             #expect(stats.filesFailed == 0)
             if stats.remoteWorkPending == 0 { return }
         }
@@ -347,7 +347,7 @@ struct ChangesRecoveryTests {
             )
         }
 
-        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
 
         #expect(stats.filesDeleted == 1)
         #expect(!FileManager.default.fileExists(atPath: localDirectory.path))
@@ -372,7 +372,7 @@ struct ChangesRecoveryTests {
             $0.pages["page2"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: parent.id, removed: false, file: parent)])
             $0.failToken = "page2"
         }
-        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected page failure") } catch {}
+        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path); Issue.record("Expected page failure") } catch {}
         #expect(try await token(testFixture) == "page2")
         #expect(!context.value.state.withLock { $0.requests.contains { $0.contains("/upload/") } })
         let reopened = try await StateStore(path: testFixture.store.path)
@@ -382,7 +382,7 @@ struct ChangesRecoveryTests {
         #expect(pending == 1)
         context.value.state.withLock { $0.failToken = nil }
         let engine = try await SyncEngine(auth: testFixture.auth, store: reopened, client: testFixture.client)
-        _ = try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        _ = try await engine.syncIncremental(localPath: testFixture.local.path)
         try await converge(testFixture)
         #expect(try String(contentsOf: testFixture.local.appendingPathComponent("dir/child"), encoding: .utf8) == "remote content")
     }
@@ -399,7 +399,7 @@ struct ChangesRecoveryTests {
         }
         remoteFile("deep", parent: "nested")
         try Data("local new".utf8).write(to: testFixture.local.appendingPathComponent("upload.txt"))
-        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(first.filesUploaded == 1)
         #expect(first.remoteWorkPending > 0)
         let requests = context.value.state.withLock { $0.requests }
@@ -430,7 +430,7 @@ struct ChangesRecoveryTests {
         context.value.state.withLock {
             if incomplete { $0.incompleteFolder = "root" } else { $0.failFolder = "root" }
         }
-        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected listing failure") } catch {}
+        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path); Issue.record("Expected listing failure") } catch {}
         #expect(try await testFixture.changes.pendingCount() > 0)
         context.value.state.withLock { $0.failFolder = nil; $0.incompleteFolder = nil }
         try await converge(testFixture)
@@ -445,7 +445,7 @@ struct ChangesRecoveryTests {
         context.value.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: child.id, removed: false, file: child)])
         }
-        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(first.remoteWorkPending > 0)
         #expect(try await token(testFixture) == "steady")
         context.value.state.withLock { $0.files["unavailable"] = folder("unavailable", "root") }
@@ -476,7 +476,7 @@ struct ChangesRecoveryTests {
                 onProgress: nil, localChanges: [.modified(path: local.path, isDirectory: false)])
         } else {
             stats = try await testFixture.engine.syncIncremental(
-                localPath: testFixture.local.path, remoteRootId: "root")
+                localPath: testFixture.local.path)
         }
         #expect(stats.filesUploaded == 0)
         #expect(stats.filesDeleted == 0)
@@ -540,12 +540,12 @@ struct ChangesRecoveryTests {
             $0.listingPages["root:first"] = firstPage
             $0.listingPages["root:tail"] = secondPage
         }
-        let round = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let round = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(round.remoteWorkPending > 0)
         context.value.state.withLock {
             if rejected { $0.rejectListingToken = "tail" } else { $0.failFolder = "root" }
         }
-        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected tail-page failure") } catch {}
+        do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path); Issue.record("Expected tail-page failure") } catch {}
         let checkpoint = try await testFixture.store.read { conn in
             let queryStatement = try conn.prepare("SELECT page_token FROM remote_directory_scans WHERE remote_id = 'root';"); _ = try queryStatement.step(); return queryStatement.columnText(at: 0)
         }
@@ -586,7 +586,7 @@ struct ChangesRecoveryTests {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: dir.id, removed: false, file: dir)])
         }
         try await converge(testFixture)
-        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("empty").path))
         #expect(!context.value.state.withLock { $0.requests.contains { $0.hasPrefix("PATCH") } })
     }
@@ -608,7 +608,7 @@ struct ChangesRecoveryTests {
             $0.files["dir"] = moved
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "after-move", changes: [DriveChange(fileId: moved.id, removed: false, file: moved)])
         }
-        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         try FileManager.default.moveItem(at: testFixture.local.appendingPathComponent("dir"), to: testFixture.local.appendingPathComponent("renamed"))
         try Data("local new".utf8).write(to: testFixture.local.appendingPathComponent("renamed/new.txt"))
         let stats: SyncStats
@@ -619,7 +619,7 @@ struct ChangesRecoveryTests {
                 onProgress: nil, localChanges: [.modified(path: testFixture.local.path, isDirectory: true)])
         } else {
             stats = try await testFixture.engine.syncIncremental(
-                localPath: testFixture.local.path, remoteRootId: "root")
+                localPath: testFixture.local.path)
         }
         #expect(stats.filesFailed == 0)
         #expect(stats.filesUploaded == 0)
@@ -640,7 +640,7 @@ struct ChangesRecoveryTests {
             queryStatement.bindInt64(testFixture.rootID, at: 1); queryStatement.bindText(payload, at: 2); _ = try queryStatement.step()
         }
         context.value.state.withLock { _ = $0.files.removeValue(forKey: "stale") }
-        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(stats.remoteWorkPending > 0)
         #expect(stats.filesDownloaded == 0)
         #expect(!FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("stale").path))
@@ -651,10 +651,10 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture(cursor: false)
         defer { testFixture.cleanup() }
         try Data("local new".utf8).write(to: testFixture.local.appendingPathComponent("local.txt"))
-        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(first.filesUploaded == 0)
         #expect(first.remoteWorkPending > 0)
-        let second = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let second = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(second.filesUploaded == 1)
         #expect(second.remoteWorkPending == 0)
     }
@@ -707,7 +707,7 @@ struct ChangesRecoveryTests {
                 DriveChange(fileId: one.id, removed: false, file: one),
                 DriveChange(fileId: two.id, removed: false, file: two)])
         }
-        let blocked = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let blocked = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(blocked.remoteWorkPending > 0)
         #expect(blocked.remoteNameConflicts == 1)
         #expect(blocked.filesDownloaded == 0)
@@ -1208,7 +1208,7 @@ struct ChangesRecoveryTests {
                 try await consume(batch)
             })
 
-        let stats = try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await engine.syncIncremental(localPath: testFixture.local.path)
 
         #expect(stats.filesFailed == 1)
         #expect(stats.filesUploaded == 1)
@@ -1270,7 +1270,7 @@ struct ChangesRecoveryTests {
             try engine.setDownloadTemporaryDirectory(URL(string: "https://example.invalid/downloads")!)
         }
         #expect(engine.downloadTemporaryDirectory == stagingBase)
-        let stats = try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let stats = try await engine.syncIncremental(localPath: testFixture.local.path)
         #expect(stats.filesDownloaded == 1)
         #expect(stats.filesUploaded == 0)
         #expect(stats.filesFailed == 0)
@@ -1317,7 +1317,7 @@ struct ChangesRecoveryTests {
                 }
                 try await consume(tailBatch)
             })
-        let run = Task { try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root") }
+        let run = Task { try await engine.syncIncremental(localPath: testFixture.local.path) }
         if ending == "error" {
             await #expect(throws: POSIXError.self) { try await run.value }
         } else if ending == "cancel" {
@@ -1366,7 +1366,7 @@ struct ChangesRecoveryTests {
             }
         }
         let before = await testFixture.store.getWriterStats()
-        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         let after = await testFixture.store.getWriterStats()
         #expect(result.filesScanned == 1000)
         #expect(result.filesUploaded == 0)
@@ -1391,7 +1391,7 @@ struct ChangesRecoveryTests {
         defer { testFixture.cleanup() }
         for itemIndex in 0..<80 { try Data("body".utf8).write(to: testFixture.local.appendingPathComponent("file-\(itemIndex)")) }
         context.value.state.withLock { $0.uploadDelay = 0.02 }
-        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 2)
+        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, maxConcurrency: 2)
         #expect(result.filesUploaded == 80)
         #expect(result.filesFailed == 0)
         #expect(context.value.state.withLock { $0.peakUploads } == 2)
@@ -1409,7 +1409,7 @@ struct ChangesRecoveryTests {
         for _ in 0..<9 { try handle.write(contentsOf: mebibyte) }
         try handle.close()
 
-        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1)
+        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, maxConcurrency: 1)
         #expect(result.filesUploaded == 1)
         #expect(result.filesFailed == 0)
         let requests = context.value.state.withLock { $0.requests }
@@ -1438,7 +1438,7 @@ struct ChangesRecoveryTests {
             rootID: testFixture.rootID, parentItemID: testFixture.rootItemID, name: "pending-parent",
             targetParentRemoteID: "root", candidateRemoteID: "pending-id",
             device: Int64(version.st_dev), inode: Int64(version.st_ino))
-        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
+        let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(result.filesUploaded == 1)
         #expect(result.filesFailed == 0)
         let requests = context.value.state.withLock { $0.requests }

@@ -276,7 +276,7 @@ struct SyncEngineTests {
         try "Newly added local file".write(to: fourthFile, atomically: true, encoding: .utf8)
 
         // 3. Perform incremental bidirectional synchronization
-        let incStats = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
+        let incStats = try await engine.syncIncremental(localPath: tempDir.path)
         print("✅ Incremental synchronization completed:")
         print("   Number of uploaded files: \(incStats.filesUploaded)")
         print("   Number of deleted files: \(incStats.filesDeleted)")
@@ -310,7 +310,7 @@ struct SyncEngineTests {
         for attempt in 1...10 {
             try await Task.sleep(nanoseconds: 1_500_000_000)
             print("🚀 No. \(attempt) Attempts to incrementally pull remote changes...")
-            dlIncStats = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
+            dlIncStats = try await engine.syncIncremental(localPath: tempDir.path)
             if dlIncStats.filesDownloaded > 0 {
                 break
             }
@@ -386,7 +386,7 @@ struct SyncEngineTests {
         try FileManager.default.moveItem(at: folder1, to: folderRenamed)
 
         // 4. Perform incremental synchronization
-        let renameStats = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
+        let renameStats = try await engine.syncIncremental(localPath: tempDir.path)
         print("✅ [Lifecycle] Local rename incremental synchronization completed:")
         print("   Number of uploaded files: \(renameStats.filesUploaded)")
         print("   Skip invariants: \(renameStats.filesSkipped)")
@@ -404,7 +404,7 @@ struct SyncEngineTests {
         print("🚀 [Lifecycle] Delete directory locally: folder_renamed...")
         try FileManager.default.removeItem(at: folderRenamed)
 
-        let deleteStats = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
+        let deleteStats = try await engine.syncIncremental(localPath: tempDir.path)
         print("✅ [Lifecycle] Local deletion incremental synchronization completed:")
         print("   Delete items: \(deleteStats.filesDeleted)")
         #expect(deleteStats.filesDeleted >= 1)
@@ -422,7 +422,7 @@ struct SyncEngineTests {
         for attempt in 1...10 {
             try await Task.sleep(nanoseconds: 1_500_000_000)
             print("🚀 [Lifecycle] No. \(attempt) Pull remote changes...")
-            _ = try await engine.syncIncremental(localPath: tempDir.path, remoteRootId: remoteRoot.id)
+            _ = try await engine.syncIncremental(localPath: tempDir.path)
             let fRemoteRenamed = tempDir.appendingPathComponent("remote_renamed.txt")
             if FileManager.default.fileExists(atPath: fRemoteRenamed.path) {
                 break

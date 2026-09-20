@@ -9,6 +9,7 @@ import os
 extension SyncEngine {
     private struct ExistingSyncRoot: Sendable {
         let rootId: Int64
+        let rootItemId: Int64
         let bootstrapState: String
         let initialDir: String
     }
@@ -26,8 +27,11 @@ extension SyncEngine {
         // 1. Check SQLite Whether there is already an active synchronization root
         let existingRoot: ExistingSyncRoot? = try await store.read { conn in
             let stmt = try conn.cachedStatement("""
-            SELECT root_id, bootstrap_state, initial_sync_direction FROM roots
-            WHERE local_root_path = ? AND remote_root_id = ? AND is_active = 1;
+            SELECT roots.root_id, items.item_id, roots.bootstrap_state, roots.initial_sync_direction
+            FROM roots
+            JOIN items ON items.root_id = roots.root_id
+                AND items.parent_id IS NULL AND items.is_tombstone = 0
+            WHERE roots.local_root_path = ? AND roots.remote_root_id = ? AND roots.is_active = 1;
             """)
             stmt.bindText(resolvedLocalPath, at: 1)
             stmt.bindText(remoteFolderId, at: 2)
@@ -35,8 +39,9 @@ extension SyncEngine {
             if try stmt.step() {
                 return ExistingSyncRoot(
                     rootId: stmt.columnInt64(at: 0) ?? 0,
-                    bootstrapState: stmt.columnText(at: 1) ?? "freshCreated",
-                    initialDir: stmt.columnText(at: 2) ?? "localToRemoteEmpty"
+                    rootItemId: stmt.columnInt64(at: 1) ?? 0,
+                    bootstrapState: stmt.columnText(at: 2) ?? "freshCreated",
+                    initialDir: stmt.columnText(at: 3) ?? "localToRemoteEmpty"
                 )
             }
             return nil
@@ -45,7 +50,14 @@ extension SyncEngine {
         if let existing = existingRoot {
             if existing.bootstrapState == "existingKnown" {
                 logger.info("[Sync] Found a shared baseline; starting incremental bidirectional sync: \(resolvedLocalPath) <-> \(remoteFolderId)")
-                return try await syncIncrementalUnlocked(localPath: resolvedLocalPath, remoteRootId: remoteFolderId, maxConcurrency: concurrency, onProgress: onProgress)
+                return try await syncIncrementalUnlocked(
+                    rootId: existing.rootId,
+                    rootItemId: existing.rootItemId,
+                    localPath: resolvedLocalPath,
+                    remoteRootId: remoteFolderId,
+                    maxConcurrency: concurrency,
+                    onProgress: onProgress
+                )
             } else {
                 logger.info("[Sync] Found an unfinished initialization baseline (bootstrapState: \(existing.bootstrapState)); resuming initialization...")
                 if existing.initialDir == "remoteToLocalEmpty" {
@@ -163,8 +175,6 @@ extension SyncEngine {
         }
     }
 
-    // MARK: - mode 3:Existing root directory incremental bidirectional synchronization (syncIncremental)
-
     private static func isDirectoryEntry(
         _ entry: UnsafeMutablePointer<dirent>, named name: String, in directory: UnsafeMutablePointer<DIR>
     ) throws -> Bool {
@@ -177,48 +187,6 @@ extension SyncEngine {
             if metadata.st_mode & S_IFMT == S_IFDIR { type = UInt8(DT_DIR) }
         }
         return type == UInt8(DT_DIR)
-    }
-
-    func syncIncrementalUnlocked(
-        localPath: String,
-        remoteRootId: String,
-        maxConcurrency: Int,
-        onProgress: (@Sendable (SyncProgress) -> Void)?
-    ) async throws -> SyncStats {
-        let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
-
-        // Find rootId with rootItemId
-        let rootInfo: (rootId: Int64, rootItemId: Int64)? = try await store.read { conn in
-            let stmt = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
-            stmt.bindText(remoteRootId, at: 1)
-            guard try stmt.step(), let rId = stmt.columnInt64(at: 0) else {
-                stmt.reset()
-                return nil
-            }
-            stmt.reset()
-
-            let itemStmt = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
-            itemStmt.bindInt64(rId, at: 1)
-            guard try itemStmt.step(), let rItemId = itemStmt.columnInt64(at: 0) else {
-                itemStmt.reset()
-                return nil
-            }
-            itemStmt.reset()
-            return (rId, rItemId)
-        }
-
-        guard let rootInfo else {
-            throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "No matching sync root was found. Run initial sync first: \(remoteRootId)"])
-        }
-
-        return try await syncIncrementalUnlocked(
-            rootId: rootInfo.rootId,
-            rootItemId: rootInfo.rootItemId,
-            localPath: resolvedLocalPath,
-            remoteRootId: remoteRootId,
-            maxConcurrency: maxConcurrency,
-            onProgress: onProgress
-        )
     }
 
 }

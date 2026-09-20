@@ -193,15 +193,21 @@ public final class SyncEngine: Sendable {
     @discardableResult
     public func syncIncremental(
         localPath: String,
-        remoteRootId: String,
         maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let normalizedLocalPath = Self.normalizedPath(localPath)
         return try await withRootSyncLock(localPath: normalizedLocalPath) {
-            try await self.syncIncrementalUnlocked(
+            guard let root = try await self.activeRootBinding(localRootPath: normalizedLocalPath) else {
+                throw SyncEngineError.general(
+                    "Directory has no available remote root ID: \(normalizedLocalPath)"
+                )
+            }
+            return try await self.syncIncrementalUnlocked(
+                rootId: root.id,
+                rootItemId: root.item,
                 localPath: normalizedLocalPath,
-                remoteRootId: remoteRootId,
+                remoteRootId: root.remote,
                 maxConcurrency: maxConcurrency,
                 onProgress: onProgress
             )
@@ -225,29 +231,6 @@ public final class SyncEngine: Sendable {
     /// Returns process-local watcher queue state.
     public func pendingLocalChangeStatus() async -> [PendingLocalChangeStatus] {
         await RootSyncCoordinator.shared.statuses()
-    }
-
-    /// Perform bidirectional incremental synchronization
-    @discardableResult
-    public func syncIncremental(
-        rootId: Int64,
-        rootItemId: Int64,
-        localPath: String,
-        remoteRootId: String,
-        maxConcurrency: Int = 64,
-        onProgress: (@Sendable (SyncProgress) -> Void)? = nil
-    ) async throws -> SyncStats {
-        let normalizedLocalPath = Self.normalizedPath(localPath)
-        return try await withRootSyncLock(localPath: normalizedLocalPath) {
-            try await self.syncIncrementalUnlocked(
-                rootId: rootId,
-                rootItemId: rootItemId,
-                localPath: normalizedLocalPath,
-                remoteRootId: remoteRootId,
-                maxConcurrency: maxConcurrency,
-                onProgress: onProgress
-            )
-        }
     }
 
     // MARK: - Root synchronization lock
@@ -336,7 +319,7 @@ public final class SyncEngine: Sendable {
     }
 
     private func runPendingLocalChanges(_ changes: [LocalChange], localRootPath: String) async throws {
-        guard let root = try await pendingRoot(localRootPath: localRootPath) else {
+        guard let root = try await activeRootBinding(localRootPath: localRootPath) else {
             logger.warning(
                 "Discard pending local changes because no active root binding exists [\(localRootPath), changes=\(changes.count)]")
             return
@@ -345,24 +328,24 @@ public final class SyncEngine: Sendable {
             remoteRootId: root.remote, maxConcurrency: 64, onProgress: nil, localChanges: changes)
     }
 
-    private func pendingRoot(localRootPath: String) async throws -> PendingRoot? {
+    private func activeRootBinding(localRootPath: String) async throws -> PendingRoot? {
         let root: PendingRoot? = try await store.read { conn in
-            let stmt = try conn.cachedStatement("SELECT root_id, remote_root_id, local_root_path FROM roots WHERE is_active = 1;")
+            let stmt = try conn.cachedStatement(
+                """
+                SELECT root_id, remote_root_id
+                FROM roots
+                WHERE account_id = 'default' AND local_root_path = ? AND is_active = 1;
+                """
+            )
+            stmt.bindText(localRootPath, at: 1)
             defer { stmt.reset() }
-            var record: (Int64, String)?
-            while try stmt.step() {
-                if let id = stmt.columnInt64(at: 0), let remote = stmt.columnText(at: 1),
-                   let path = stmt.columnText(at: 2), Self.normalizedPath(path) == localRootPath {
-                    record = (id, remote)
-                    break
-                }
-            }
-            guard let record else { return nil }
+            guard try stmt.step(), let rootID = stmt.columnInt64(at: 0),
+                  let remoteRootID = stmt.columnText(at: 1) else { return nil }
             let item = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
-            item.bindInt64(record.0, at: 1)
+            item.bindInt64(rootID, at: 1)
             defer { item.reset() }
             guard try item.step(), let rootItem = item.columnInt64(at: 0) else { return nil }
-            return PendingRoot(id: record.0, item: rootItem, remote: record.1)
+            return PendingRoot(id: rootID, item: rootItem, remote: remoteRootID)
         }
         return root
     }

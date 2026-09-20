@@ -134,7 +134,7 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 | `sync` | `concurrency` | `64` |
 | `syncLocalToRemoteEmpty` | `maxUploadConcurrency` | `64` |
 | `syncRemoteToLocalEmpty` | `maxDownloadConcurrency` | `64` |
-| `syncIncremental`（两个重载） | `maxConcurrency` | `64` |
+| `syncIncremental` | `maxConcurrency` | `64` |
 
 上述显式同步入口共用进程内根目录锁：同一本地根已有同步运行时，另一次显式调用立即抛出
 `SyncEngineError.rootBusy(path:)`；不同引擎实例也共享这一限制。不同本地根可独立运行，
@@ -238,7 +238,6 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 ```swift
 let stats = try await engine.syncIncremental(
     localPath: localDir,
-    remoteRootId: remoteRootId,
     maxConcurrency: 16 // 并发数，默认 64
 )
 
@@ -250,10 +249,9 @@ print("  - 已解决冲突: \(stats.conflictsResolved)")
 print("  - 跳过未变: \(stats.filesSkipped)")
 ```
 
-已有 SQLite 根记录的调用方也可使用
-`syncIncremental(rootId:rootItemId:localPath:remoteRootId:maxConcurrency:onProgress:)` 重载。
-其中 `rootId` 和 `rootItemId` 为同一同步根的 SQLite 数字 ID，`remoteRootId` 为对应的
-Google Drive 文件夹 ID；通常使用上例按路径和远端 ID 调用的版本即可。
+调用方只传本地根路径。GDrive 从 SQLite 中查询该路径对应的 active 根、根 item 和
+Google Drive 文件夹 ID；找不到完整绑定时会在扫描和任何远端操作前抛出
+`Directory has no available remote root ID: <localPath>`。
 
 - **三方仲裁（Reconciler）行为规范**：
   1. **文件修改**：云端修改经校验后原子下载至本地。本地新文件可上传；已有远端文件的正文覆盖
@@ -316,10 +314,7 @@ public struct SyncStats: Sendable {
 Task {
     while !Task.isCancelled {
         do {
-            try await engine.syncIncremental(
-                localPath: localDir,
-                remoteRootId: remoteRootId
-            )
+            try await engine.syncIncremental(localPath: localDir)
         } catch {
             print("增量同步出错: \(error)")
         }

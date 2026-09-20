@@ -125,6 +125,8 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
   * 定义公共 `SyncEngine`、`SyncStats` 和 `SyncEngineError`，集中初始化、配置、传输状态
     查询及所有同步入口。显式同步入口取得根目录锁后调用核心实现；整轮结束后自动接续
     期间收到的本地变化任务。类的存储属性与初始化保留在此文件，供核心扩展使用。
+    公开增量入口只接收本地根路径，并从 SQLite 的 active 绑定查询 root、根 item 和远端根 ID；
+    查不到完整绑定时在扫描、Changes 应用和远端请求前失败。
   * **下载暂存目录**：通过初始化参数 `downloadTemporaryDirectory` 或
     `setDownloadTemporaryDirectory(_:)` 配置基目录，默认 `~/.gdrive/remotes`，按远程根 ID
     使用 `<基目录>/<remoteRootId>/`。初始化、增量和冲突恢复统一使用同步目录外的暂存路径，

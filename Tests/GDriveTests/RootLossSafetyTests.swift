@@ -56,6 +56,62 @@ struct RootLossSafetyTests {
         return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
+    @Test(
+        "Incremental sync requires a complete active binding for the local path",
+        arguments: ["missing", "inactive", "missingRootItem"]
+    )
+    func incrementalSyncRequiresLocalBinding(_ scenario: String) async throws {
+        defer { context.value.requestHandler = nil }
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "incremental-binding-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let localRoot = tempDir.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        let auth = try createMockAuth(tempDir: tempDir)
+        let store = try await StateStore(path: tempDir.appendingPathComponent("state.sqlite").path)
+
+        if scenario != "missing" {
+            let rootID = try await store.write { conn in
+                let statement = try conn.prepare("""
+                    INSERT INTO roots (
+                        account_id, local_root_path, local_root_device, local_root_inode,
+                        remote_root_id, initial_sync_direction, bootstrap_state, is_active,
+                        created_at, updated_at
+                    ) VALUES ('default', ?, 1, 1, 'remote-root', 'localToRemoteEmpty',
+                        'existingKnown', ?, 1, 1);
+                    """)
+                statement.bindText(localRoot.path, at: 1)
+                statement.bindInt64(scenario == "inactive" ? 0 : 1, at: 2)
+                _ = try statement.step()
+                return conn.lastInsertRowId
+            }
+            if scenario == "inactive" {
+                try await store.write { conn in
+                    let statement = try conn.prepare("""
+                        INSERT INTO items (
+                            root_id, name, entry_kind, remote_file_id, phase, created_at, updated_at
+                        ) VALUES (?, 'local', 'directory', 'remote-root', 'committed', 1, 1);
+                        """)
+                    statement.bindInt64(rootID, at: 1)
+                    _ = try statement.step()
+                }
+            }
+        }
+
+        context.value.requestHandler = { _ in
+            Issue.record("Incremental binding failure must happen before any remote request")
+            throw URLError(.badURL)
+        }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth))
+        let error = await #expect(throws: SyncEngineError.self) {
+            _ = try await engine.syncIncremental(localPath: localRoot.path)
+        }
+        #expect(error?.localizedDescription ==
+            "Directory has no available remote root ID: \(localRoot.path)")
+    }
+
     @Test("Local root missing throws localRootNotFound error without trashing remote files or clearing DB")
     func testLocalRootMissingThrowsError() async throws {
         defer { context.value.requestHandler = nil }
@@ -117,7 +173,7 @@ struct RootLossSafetyTests {
         // Attempt syncIncremental: should throw SyncEngineError.localRootNotFound
         var threwExpectedError = false
         do {
-            try await engine.syncIncremental(localPath: nonExistentPath, remoteRootId: "remote_root_123")
+            try await engine.syncIncremental(localPath: nonExistentPath)
         } catch let error as SyncEngineError {
             if case .localRootNotFound = error {
                 threwExpectedError = true
@@ -225,7 +281,7 @@ struct RootLossSafetyTests {
 
         var threwExpectedError = false
         do {
-            try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: "remote_root_trashed")
+            try await engine.syncIncremental(localPath: localRootDir.path)
         } catch let error as SyncEngineError {
             if case .remoteRootLost(let id, let reason) = error {
                 #expect(id == "remote_root_trashed")
@@ -296,7 +352,7 @@ struct RootLossSafetyTests {
 
         var threwExpectedError = false
         do {
-            try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: "remote_root_404")
+            try await engine.syncIncremental(localPath: localRootDir.path)
         } catch let error as SyncEngineError {
             if case .remoteRootLost(let id, let reason) = error {
                 #expect(id == "remote_root_404")
@@ -399,7 +455,7 @@ struct RootLossSafetyTests {
 
         var threwExpectedError = false
         do {
-            try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: "remote_root_change_test")
+            try await engine.syncIncremental(localPath: localRootDir.path)
         } catch let error as SyncEngineError {
             if case .remoteRootLost(let id, let reason) = error {
                 #expect(id == "remote_root_change_test")

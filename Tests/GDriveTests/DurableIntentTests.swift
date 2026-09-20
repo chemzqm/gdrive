@@ -279,7 +279,7 @@ struct DurableIntentTests {
         let stats: SyncStats
         if incremental {
             _ = try await seedRoot(store: store, localPath: localRoot.path, remoteID: "remote-root")
-            stats = try await engine.syncIncremental(localPath: localRoot.path, remoteRootId: "remote-root", maxConcurrency: 8)
+            stats = try await engine.syncIncremental(localPath: localRoot.path, maxConcurrency: 8)
         } else {
             stats = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "remote-root", maxUploadConcurrency: 8)
         }
@@ -416,7 +416,6 @@ struct DurableIntentTests {
         )
         let stats = try await engine.syncIncremental(
             localPath: localRoot.path,
-            remoteRootId: "remote-root",
             maxConcurrency: 4
         )
         #expect(stats.filesUploaded == 1)

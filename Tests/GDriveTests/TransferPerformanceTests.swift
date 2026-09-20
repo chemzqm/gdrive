@@ -86,7 +86,7 @@ struct TransferPerformanceTests {
             PerformanceURLProtocol.firstUpload.withLock { $0 = 0 }
             let started = DispatchTime.now().uptimeNanoseconds
             let first = incremental
-                ? try await engine.syncIncremental(localPath: local.path, remoteRootId: "root", maxConcurrency: unpaced ? 1 : 64)
+                ? try await engine.syncIncremental(localPath: local.path, maxConcurrency: unpaced ? 1 : 64)
                 : try await engine.syncLocalToRemoteEmpty(localPath: local.path, remoteRootId: "root", maxUploadConcurrency: 64)
             let firstRequest = PerformanceURLProtocol.firstUpload.withLock { $0 }
             #expect(firstRequest > started)
@@ -96,7 +96,7 @@ struct TransferPerformanceTests {
             #expect(first.filesUploaded == 128)
             #expect(first.filesFailed == 0)
             for _ in 0..<scanCount {
-                let second = try await engine.syncIncremental(localPath: local.path, remoteRootId: "root")
+                let second = try await engine.syncIncremental(localPath: local.path)
                 #expect(second.filesSkipped == 128)
                 #expect(second.filesUploaded == 0)
                 skips.append(second.elapsedSeconds)

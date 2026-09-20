@@ -198,7 +198,6 @@ struct LocalChangesLiveTests {
             await #expect(throws: SyncEngineError.rootBusy(path: trackedRootPath)) {
                 _ = try await engine.syncIncremental(
                     localPath: localRoot.path,
-                    remoteRootId: remoteRoot.id
                 )
             }
             await #expect(throws: SyncEngineError.rootBusy(path: trackedRootPath)) {

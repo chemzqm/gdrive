@@ -218,7 +218,7 @@ struct DirectoryBarrierTests {
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. The remote parent directory must not be trash
@@ -369,7 +369,7 @@ struct DirectoryBarrierTests {
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. The local directory and new files are still intact on the disk and have never been deleted.
@@ -545,7 +545,7 @@ struct DirectoryBarrierTests {
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. Delete the file first, then press bottom-up (level2 depth greater than level1)Delete remote directories sequentially
@@ -713,7 +713,7 @@ struct DirectoryBarrierTests {
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. The remote parent directory is never trash
@@ -875,7 +875,7 @@ struct DirectoryBarrierTests {
             try conn.execute("INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) SELECT root_id, 'default', 'drive_changes', 'token_123', 100 FROM roots;")
         }
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        try await engine.syncIncremental(localPath: localRootDir.path, remoteRootId: rootRemoteId)
+        try await engine.syncIncremental(localPath: localRootDir.path)
 
         // Verification:
         // 1. Local file removed (moved to Trash)
