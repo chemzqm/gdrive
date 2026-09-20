@@ -83,7 +83,7 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
 ### 2.3 设置下载临时目录
 
-默认下载到 `~/.gdrive/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
+默认下载到 `~/.gdrive/remotes/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
 初始化下载、增量下载及冲突恢复都使用此设置；目录按需创建。
 
@@ -114,10 +114,11 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 
 普通失败会清理未发布的下载临时文件。替换本地文件时的恢复文件也保留在该临时目录：
 成功后旧版本移至废纸篓，若无法移入废纸篓或检测到发布竞态，则保留恢复文件。
+同步结束（包括失败或取消）后删除空的远程根暂存目录；含有残留或恢复文件的目录保留。
 进程异常终止留下的临时文件不会在启动时自动清扫。
 
 直接调用 `DriveClient.downloadFile` 时，可用 `temporaryDirectory:` 指定完整暂存目录；
-该底层方法不知道同步根 ID，不会自动追加根 ID，省略时使用 `~/.gdrive`。
+该底层方法不知道同步根 ID，不会自动追加根 ID，省略时使用 `~/.gdrive/remotes`。
 
 ---
 

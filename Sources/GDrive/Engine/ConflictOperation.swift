@@ -158,6 +158,9 @@ extension SyncEngine {
             downloadDirectory = try await downloadStagingDirectory(remoteRootID: root.0,
                 localRoot: URL(fileURLWithPath: (root.1 as NSString).expandingTildeInPath))
         }
+        defer {
+            if temporaryDirectory == nil { cleanupDownloadStagingDirectory(downloadDirectory) }
+        }
         let original = URL(fileURLWithPath: conflictOperation.originalPath)
         let copy = URL(fileURLWithPath: conflictOperation.copyPath)
         try await store.read { try conflictOperation.validatePlan($0) }

@@ -2,6 +2,18 @@ import Darwin
 import Foundation
 
 enum DownloadStaging {
+    /// Atomically removes only an empty directory; never removes recovery files.
+    static func removeIfEmpty(_ directory: URL) throws {
+        guard directory.withUnsafeFileSystemRepresentation({ path in
+            guard let path else { return false }
+            return rmdir(path) == 0
+        }) else {
+            let code = errno
+            if code == ENOENT || code == ENOTEMPTY || code == EEXIST { return }
+            throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+        }
+    }
+
     private static func resolved(_ url: URL) -> URL {
         var ancestor = url.standardizedFileURL
         var missing: [String] = []
@@ -49,6 +61,14 @@ enum DownloadStaging {
 }
 
 extension SyncEngine {
+    func cleanupDownloadStagingDirectory(_ directory: URL) {
+        do {
+            try DownloadStaging.removeIfEmpty(directory)
+        } catch {
+            logger.warning("Failed to remove empty download staging directory \(directory.path): \(error)")
+        }
+    }
+
     func downloadStagingDirectory(remoteRootID: String, localRoot: URL) async throws -> URL {
         let roots = try await store.read { conn in
             let query = try conn.cachedStatement("SELECT local_root_path FROM roots WHERE is_active = 1;")

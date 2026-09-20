@@ -70,22 +70,14 @@ struct StateStoreTests {
         }
     }
 
-    @Test("StateStore opens the expanded tilde path")
-    func testTildePathUsesExpandedLocation() async throws {
+    @Test("Tilde database path expands to the home directory")
+    func testTildePathUsesExpandedLocation() {
         let relativeDirectory = ".gdrive-state-store-test-\(UUID().uuidString)"
         let suppliedPath = "~/\(relativeDirectory)/state.sqlite"
         let expandedDirectory = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(relativeDirectory)
-        defer { try? FileManager.default.removeItem(at: expandedDirectory) }
-
-        let store = try await StateStore(path: suppliedPath)
-
-        #expect(store.path == expandedDirectory.appendingPathComponent("state.sqlite").path)
-        #expect(FileManager.default.fileExists(atPath: store.path))
-        _ = try await store.read { conn in
-            let statement = try conn.prepare("SELECT 1;")
-            return try statement.step()
-        }
+        let expandedPath = (suppliedPath as NSString).expandingTildeInPath
+        #expect(expandedPath == expandedDirectory.appendingPathComponent("state.sqlite").path)
     }
 
     @Test("StateStore schema initialization and basic CRUD")

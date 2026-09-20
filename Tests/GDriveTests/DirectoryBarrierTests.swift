@@ -72,6 +72,7 @@ struct DirectoryBarrierTests {
         let store = try await StateStore(path: dbPath)
 
         let rootRemoteId = "remote_root_1"
+        defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_sub"
         let childFileRemoteId = "remote_file_child"
 
@@ -241,6 +242,7 @@ struct DirectoryBarrierTests {
         let store = try await StateStore(path: dbPath)
 
         let rootRemoteId = "remote_root_2"
+        defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_sub_2"
 
         let rootId = try await store.write { conn in
@@ -381,6 +383,7 @@ struct DirectoryBarrierTests {
         let store = try await StateStore(path: dbPath)
 
         let rootRemoteId = "remote_root_3"
+        defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_level1"
         let childDirRemoteId = "remote_folder_level2"
         let fileRemoteId = "remote_file_level3"
@@ -566,6 +569,7 @@ struct DirectoryBarrierTests {
         let store = try await StateStore(path: dbPath)
 
         let rootRemoteId = "remote_root_4"
+        defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_sub_4"
         let newChildRemoteId = "remote_new_child_file_4"
 
@@ -743,6 +747,7 @@ struct DirectoryBarrierTests {
         let store = try await StateStore(path: dbPath)
 
         let rootRemoteId = "remote_root_5"
+        defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_sub_5"
         let childFileRemoteId = "remote_file_child_5"
 

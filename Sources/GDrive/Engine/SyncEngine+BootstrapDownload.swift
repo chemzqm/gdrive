@@ -30,6 +30,7 @@ extension SyncEngine {
         }
 
         let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
+        defer { cleanupDownloadStagingDirectory(downloadDirectory) }
 
         // Make sure the local directory exists and is empty
         var isDir: ObjCBool = false

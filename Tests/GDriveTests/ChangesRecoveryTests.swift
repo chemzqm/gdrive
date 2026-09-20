@@ -191,6 +191,10 @@ struct ChangesRecoveryTests {
         let engine: SyncEngine
         let rootID: Int64
         let rootItemID: Int64
+        func cleanup() {
+            removeTestDownloadDirectory(remoteRootID: "root")
+            try? FileManager.default.removeItem(at: directory)
+        }
         var changes: RemoteChanges { RemoteChanges(store: store, client: client, rootID: rootID, remoteRootID: "root", rootURL: local) }
     }
     private func folder(_ id: String, _ parent: String?, name: String? = nil) -> DriveFile {
@@ -248,7 +252,7 @@ struct ChangesRecoveryTests {
     @Test("A known remote directory event preserves a local deletion for reconciliation")
     func knownDirectoryEventPreservesLocalDeletion() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let localDirectory = testFixture.local.appendingPathComponent("deleted")
         try FileManager.default.createDirectory(at: localDirectory, withIntermediateDirectories: true)
         let attrs = try FileManager.default.attributesOfItem(atPath: localDirectory.path)
@@ -295,7 +299,7 @@ struct ChangesRecoveryTests {
     @Test("Child before parent across pages survives a page failure and database reopen")
     func childBeforeParent() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try Data("ready upload".utf8).write(to: testFixture.local.appendingPathComponent("ready.txt"))
         let parent = folder("dir", "root")
         let child = remoteFile("child", parent: "dir")
@@ -323,7 +327,7 @@ struct ChangesRecoveryTests {
     @Test("Moved-in directory enumerates an existing deep subtree; ready uploads precede listing")
     func movedSubtree() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let parent = folder("incoming", "root")
         let nested = folder("nested", "incoming")
         ChangesProtocol.state.withLock {
@@ -346,7 +350,7 @@ struct ChangesRecoveryTests {
     @Test("Missing and explicitly rejected cursors reconstruct pre-existing remote files", arguments: ["missing", "rejected", "invalid"])
     func missingCursor(kind: String) async throws {
         let testFixture = try await fixture(cursor: kind != "missing")
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         remoteFile("before-token", parent: "root")
         if kind == "rejected" { ChangesProtocol.state.withLock { $0.rejectToken = "start" } }
         if kind == "invalid" { try await testFixture.store.write { try $0.execute("UPDATE cursors SET is_valid = 0;") } }
@@ -358,7 +362,7 @@ struct ChangesRecoveryTests {
     @Test("An incomplete or failed directory listing retains its job", arguments: [false, true])
     func listingFailure(incomplete: Bool) async throws {
         let testFixture = try await fixture(cursor: false)
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         remoteFile("retained", parent: "root")
         ChangesProtocol.state.withLock {
             if incomplete { $0.incompleteFolder = "root" } else { $0.failFolder = "root" }
@@ -373,7 +377,7 @@ struct ChangesRecoveryTests {
     @Test("Missing ancestor metadata stays durable after the final Changes token")
     func unknownParent() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let child = remoteFile("child", parent: "unavailable")
         ChangesProtocol.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: child.id, removed: false, file: child)])
@@ -389,7 +393,7 @@ struct ChangesRecoveryTests {
     @Test("Known file moved outside preserves local bytes and cannot be written back")
     func movedOutside() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let file = remoteFile("known", parent: "root")
         ChangesProtocol.state.withLock { $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)]) }
         try await converge(testFixture)
@@ -414,7 +418,7 @@ struct ChangesRecoveryTests {
     @Test("Bootstrap token failures propagate; retries preserve an existing cursor")
     func bootstrapCursor() async throws {
         let testFixture = try await fixture(cursor: false)
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         do {
             try await RemoteChanges.saveInitialCursor(store: testFixture.store, client: testFixture.client, rootID: testFixture.rootID, requireExisting: true)
             Issue.record("Existing roots must reconstruct missing cursor history")
@@ -432,7 +436,7 @@ struct ChangesRecoveryTests {
     @Test("Cursor commit failure rolls back the page observations")
     func atomicPage() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let file = remoteFile("atomic", parent: "root")
         ChangesProtocol.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)])
@@ -454,7 +458,7 @@ struct ChangesRecoveryTests {
     @Test("Listing page checkpoint survives failure without losing earlier children", arguments: [false, true])
     func directoryPages(rejected: Bool) async throws {
         let testFixture = try await fixture(cursor: false)
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let first = remoteFile("first", parent: "root")
         let second = remoteFile("second", parent: "root")
         let encoder = JSONEncoder()
@@ -483,7 +487,7 @@ struct ChangesRecoveryTests {
     @Test("A thousand known-parent observations use page-sized commits")
     func pageBatching() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let changes = (0..<1000).map { index -> DriveChange in
             let file = DriveFile(id: "id-\(index)", name: "file-\(index)", parents: ["root"], size: "1", sha256Checksum: String(repeating: "a", count: 64))
             return DriveChange(fileId: file.id, removed: false, file: file)
@@ -503,7 +507,7 @@ struct ChangesRecoveryTests {
     @Test("An empty incoming directory is not mistaken for a local deletion while listing")
     func emptyIncomingDirectory() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let dir = folder("empty", "root")
         ChangesProtocol.state.withLock {
             $0.files[dir.id] = dir
@@ -518,7 +522,7 @@ struct ChangesRecoveryTests {
     @Test("Moved-out directories also block new children after a local rename")
     func movedOutsideDirectory() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let dir = folder("dir", "root")
         ChangesProtocol.state.withLock {
             $0.files[dir.id] = dir
@@ -546,7 +550,7 @@ struct ChangesRecoveryTests {
     @Test("Rebuilding a lost cursor re-probes old queued payloads")
     func staleQueuedObservation() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let old = remoteFile("stale", parent: "root")
         let payload = (String(bytes: try JSONEncoder().encode(DriveChange(fileId: old.id, removed: false, file: old)), encoding: .utf8) ?? "Invalid UTF-8 data")
         try await testFixture.store.write { conn in
@@ -564,7 +568,7 @@ struct ChangesRecoveryTests {
     @Test("Empty root reconstruction still reports the deferred local upload round")
     func emptyRebuildWithLocalFiles() async throws {
         let testFixture = try await fixture(cursor: false)
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try Data("local new".utf8).write(to: testFixture.local.appendingPathComponent("local.txt"))
         let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(first.filesUploaded == 0)
@@ -579,7 +583,7 @@ struct ChangesRecoveryTests {
     ])
     func bootstrapNameCollision(names: [String]) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         _ = remoteFile("one", parent: "root", content: "first", name: names[0])
         _ = remoteFile("two", parent: "root", content: "second", name: names[1])
         await #expect(throws: (any Error).self) {
@@ -593,7 +597,7 @@ struct ChangesRecoveryTests {
     @Test("A14 directory identities cannot collapse on bootstrap", arguments: [false, true])
     func bootstrapDirectoryCollision(mixed: Bool) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         ChangesProtocol.state.withLock {
             $0.files["one"] = folder("one", "root", name: "same")
             $0.files["two"] = mixed ? DriveFile(id: "two", name: "same", parents: ["root"]) : folder("two", "root", name: "same")
@@ -614,7 +618,7 @@ struct ChangesRecoveryTests {
     ])
     func changesNameCollision(names: [String]) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let one = remoteFile("one", parent: "root", content: "first", name: names[0])
         let two = remoteFile("two", parent: "root", content: "second", name: names[1])
         ChangesProtocol.state.withLock {
@@ -639,7 +643,7 @@ struct ChangesRecoveryTests {
     @Test("A14 unsafe names cannot escape the bootstrap root", arguments: ["../escape", "/absolute", ".", "..", "nul\0name"])
     func unsafeBootstrapName(name: String) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         _ = remoteFile("bad", parent: "root", name: name)
         await #expect(throws: (any Error).self) {
             _ = try await testFixture.engine.syncRemoteToLocalEmpty(localPath: testFixture.local.path, remoteRootId: "root")
@@ -652,7 +656,7 @@ struct ChangesRecoveryTests {
     @Test("A14 Changes block symlinked parents without writing outside root")
     func symlinkedRemoteParent() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let parent = folder("parent", "root")
         ChangesProtocol.state.withLock {
             $0.files[parent.id] = parent
@@ -679,7 +683,7 @@ struct ChangesRecoveryTests {
     @Test("A14 name lookup uses index and equivalent names retain distinct item identities")
     func nameIndex() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write { conn in
             for name in ["a", "A"] {
                 let queryStatement = try conn.prepare("INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,created_at,updated_at) VALUES (?,? ,?,'file',?,1,1);")
@@ -698,7 +702,7 @@ struct ChangesRecoveryTests {
     @Test("A15 empty binding is complete and accepts additions on either side", arguments: [false, true])
     func emptyBinding(remoteAddition: Bool) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
         let before = await testFixture.store.getWriterStats()
         _ = try await testFixture.engine.sync(localPath: testFixture.local.path, remoteFolderId: "root")
@@ -732,7 +736,7 @@ struct ChangesRecoveryTests {
     @Test("A15 hidden file initializes upload")
     func hiddenInitialUpload() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
         try Data("secret".utf8).write(to: testFixture.local.appendingPathComponent(".env"))
         let result = try await testFixture.engine.sync(localPath: testFixture.local.path, remoteFolderId: "root")
@@ -759,7 +763,7 @@ struct ChangesRecoveryTests {
     @Test("A15 unreadable local root never commits an empty baseline")
     func unreadableInitialRoot() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
         try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: testFixture.local.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: testFixture.local.path) }
@@ -776,7 +780,7 @@ struct ChangesRecoveryTests {
     @Test("A15 cursor insert failure rolls back root and item")
     func emptyBindingRollback() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write {
             try $0.execute("DELETE FROM roots;")
             try $0.execute("CREATE TRIGGER reject_cursor BEFORE INSERT ON cursors BEGIN SELECT RAISE(ABORT, 'injected'); END;")
@@ -794,7 +798,7 @@ struct ChangesRecoveryTests {
     @Test("A15 absent local directory is created for an empty binding")
     func absentLocalEmptyBinding() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
         try FileManager.default.removeItem(at: testFixture.local)
         _ = try await testFixture.engine.sync(localPath: testFixture.local.path, remoteFolderId: "root")
@@ -805,7 +809,7 @@ struct ChangesRecoveryTests {
     @Test("A15 download bootstrap reuses the routing cursor")
     func downloadReusesCursor() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let staging = testFixture.directory.appendingPathComponent("bootstrap-downloads")
         try testFixture.engine.setDownloadTemporaryDirectory(staging)
         try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
@@ -813,7 +817,7 @@ struct ChangesRecoveryTests {
         let result = try await testFixture.engine.sync(localPath: testFixture.local.path, remoteFolderId: "root")
         #expect(result.filesDownloaded == 1)
         #expect(result.filesFailed == 0)
-        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.appendingPathComponent("root").path).isEmpty)
+        #expect(!FileManager.default.fileExists(atPath: staging.appendingPathComponent("root").path))
         #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("startPageToken") }.count } == 1)
     }
 
@@ -850,7 +854,7 @@ struct ChangesRecoveryTests {
     @Test("A vanished observation does not abort later files or become a deletion")
     func vanishedObservationIsolated() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let vanished = testFixture.local.appendingPathComponent("vanished")
         let healthy = testFixture.local.appendingPathComponent("healthy")
         let old = Data("old baseline".utf8)
@@ -910,7 +914,7 @@ struct ChangesRecoveryTests {
     @Test("Streaming downloads stay outside the active scan and use the configured remote-root folder")
     func downloadOutsideScan() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let first = testFixture.local.appendingPathComponent("first")
         let old = Data("old".utf8)
         try old.write(to: first)
@@ -960,13 +964,13 @@ struct ChangesRecoveryTests {
         #expect(try Data(contentsOf: first) == Data(String(repeating: "R", count: 131072).utf8))
         #expect(ChangesProtocol.state.withLock { !$0.files.values.contains { $0.name.hasPrefix(".tmp_") } })
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path) == ["first"])
-        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).allSatisfy { !$0.hasPrefix(".tmp_") || $0.contains(".local-conflict-") })
+        #expect(!FileManager.default.fileExists(atPath: staging.path))
     }
 
     @Test("A16 first upload completes while the scanner's tail is paused", arguments: ["complete", "error", "cancel"])
     func uploadBeforeScanEnd(ending: String) async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let first = testFixture.local.appendingPathComponent("first")
         try Data("first body".utf8).write(to: first)
         let batch = try oneEntry(first)
@@ -1026,7 +1030,7 @@ struct ChangesRecoveryTests {
     @Test("A16 1000 observations and matching receipts commit in bounded batches")
     func naturalObservationCommits() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let data = Data("same body".utf8)
         let sha = SyncEngine.computeSha256(of: data)
         for itemIndex in 0..<1000 { try data.write(to: testFixture.local.appendingPathComponent("file-\(itemIndex)")) }
@@ -1071,7 +1075,7 @@ struct ChangesRecoveryTests {
     @Test("A16 transfer scheduling applies backpressure before creating tasks")
     func boundedIncrementalUploads() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         for itemIndex in 0..<80 { try Data("body".utf8).write(to: testFixture.local.appendingPathComponent("file-\(itemIndex)")) }
         ChangesProtocol.state.withLock { $0.uploadDelay = 0.02 }
         let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 2)
@@ -1084,7 +1088,7 @@ struct ChangesRecoveryTests {
     @Test("A17 incremental large files use bounded resumable chunks")
     func incrementalLargeFileUsesResumableChunks() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let file = testFixture.local.appendingPathComponent("large.bin")
         let mebibyte = Data(repeating: 0x5a, count: 1024 * 1024)
         FileManager.default.createFile(atPath: file.path, contents: nil)
@@ -1111,7 +1115,7 @@ struct ChangesRecoveryTests {
     @Test("A16 early child upload waits for a pending parent create to recover")
     func pendingParentBeforeChild() async throws {
         let testFixture = try await fixture()
-        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        defer { testFixture.cleanup() }
         let directory = testFixture.local.appendingPathComponent("pending-parent")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         try Data("child body".utf8).write(to: directory.appendingPathComponent("child"))

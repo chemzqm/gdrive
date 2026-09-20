@@ -185,7 +185,7 @@ struct ConflictRecoveryTests {
             return queryStatement.columnInt64(at: 0)
         }
         #expect(committed == 2)
-        #expect(FileManager.default.fileExists(atPath: testFixture.directory.appendingPathComponent("downloads/root").path))
+        #expect(!FileManager.default.fileExists(atPath: testFixture.directory.appendingPathComponent("downloads/root").path))
     }
 
     @Test("One incremental round publishes both versions; next round transfers nothing")

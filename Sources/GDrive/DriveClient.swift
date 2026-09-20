@@ -869,7 +869,7 @@ public final class DriveClient: Sendable {
     // MARK: - File Download (Download)
 
     public static var defaultDownloadTemporaryDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive", isDirectory: true)
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gdrive/remotes", isDirectory: true)
     }
 
     /// Download file body and stream checksum SHA-256,Atomic Fall to Target Path

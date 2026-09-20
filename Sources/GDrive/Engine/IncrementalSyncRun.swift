@@ -130,6 +130,10 @@ extension IncrementalSyncRun {
         try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
             remoteRootID: remoteRootID, localRoot: rootURL)
+        var prepared = false
+        defer {
+            if !prepared { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
+        }
         let pendingConflicts = try await ConflictOperation.pending(
             store: engine.store, rootID: rootID)
         let recoveredConflicts = pendingConflicts.count
@@ -153,7 +157,7 @@ extension IncrementalSyncRun {
         let directoryContext = try await loadDirectoryContext(
             engine: engine, rootID: rootID, rootItemID: rootItemID, remoteRootID: remoteRootID)
         let effectiveSyncConcurrency = max(1, min(64, maxConcurrency))
-        return IncrementalSyncRun(
+        let run = IncrementalSyncRun(
             engine: engine, rootID: rootID, rootItemID: rootItemID,
             localPath: resolvedLocalPath, rootURL: rootURL, remoteRootID: remoteRootID,
             downloadDirectory: downloadDirectory, now: now, maxConcurrency: maxConcurrency,
@@ -168,9 +172,12 @@ extension IncrementalSyncRun {
             scanProgress: ScanProgress(),
             startTime: startTime, recoveredConflicts: recoveredConflicts
         )
+        prepared = true
+        return run
     }
 
     func execute() async throws -> SyncStats {
+        defer { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
         try await scanLocal()
         try await markMissingAfterSuccessfulScan()
         let dirtyItems = try await loadDirtyItems()
