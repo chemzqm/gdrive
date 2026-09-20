@@ -223,6 +223,11 @@ struct ChangesRecoveryTests {
         }
         var changes: RemoteChanges { RemoteChanges(store: store, client: client, rootID: rootID, remoteRootID: "root", rootURL: local) }
     }
+    private struct StoredBaseline {
+        let kind: String?
+        let remoteID: String?
+        let dirtyGeneration: Int64?
+    }
     private func folder(_ id: String, _ parent: String?, name: String? = nil) -> DriveFile {
         DriveFile(id: id, name: name ?? id, mimeType: "application/vnd.google-apps.folder", parents: parent.map { [$0] }, version: "1")
     }
@@ -934,6 +939,68 @@ struct ChangesRecoveryTests {
             try await Task.sleep(for: .milliseconds(10))
         }
         return false
+    }
+
+    @Test(
+        "File and directory replacements preserve the baseline in full and scoped scans",
+        arguments: [false, true], [false, true])
+    func typeReplacementPreservesBaseline(
+        replacementIsDirectory: Bool, scoped: Bool
+    ) async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let name = "replaced"
+        let local = testFixture.local.appendingPathComponent(name)
+        let originalKind = replacementIsDirectory ? "file" : "directory"
+        let remoteID = "remote-replaced"
+        if replacementIsDirectory {
+            try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+            try Data("child".utf8).write(to: local.appendingPathComponent("child.txt"))
+            _ = remoteFile(remoteID, parent: "root", name: name)
+        } else {
+            try Data("replacement".utf8).write(to: local)
+            context.value.state.withLock {
+                $0.files[remoteID] = folder(remoteID, "root", name: name)
+            }
+        }
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+                INSERT INTO items(
+                    root_id,parent_id,name,entry_kind,remote_file_id,
+                    local_status,remote_status,phase,dirty_generation,created_at,updated_at)
+                VALUES (
+                    \(testFixture.rootID),\(testFixture.rootItemID),'\(name)','\(originalKind)','\(remoteID)',
+                    'present','present','committed',0,1,1);
+                """)
+        }
+        let requestsBefore = context.value.state.withLock { $0.requests.count }
+        let changes: [LocalChange]? = scoped
+            ? [.modified(path: local.path, isDirectory: replacementIsDirectory)]
+            : nil
+
+        await #expect(throws: (any Error).self) {
+            try await testFixture.engine.syncIncrementalUnlocked(
+                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+                onProgress: nil, localChanges: changes)
+        }
+
+        let baseline = try await testFixture.store.read { conn -> StoredBaseline in
+            let stmt = try conn.prepare(
+                "SELECT entry_kind, remote_file_id, dirty_generation FROM items WHERE root_id = \(testFixture.rootID) AND parent_id = \(testFixture.rootItemID) AND name = '\(name)' AND is_tombstone = 0;")
+            defer { stmt.reset() }
+            #expect(try stmt.step())
+            return StoredBaseline(
+                kind: stmt.columnText(at: 0), remoteID: stmt.columnText(at: 1),
+                dirtyGeneration: stmt.columnInt64(at: 2))
+        }
+        #expect(baseline.kind == originalKind)
+        #expect(baseline.remoteID == remoteID)
+        #expect(baseline.dirtyGeneration == 0)
+        let newRequests = context.value.state.withLock {
+            Array($0.requests.dropFirst(requestsBefore))
+        }
+        #expect(!newRequests.contains { $0.hasPrefix("POST ") || $0.hasPrefix("PUT ") || $0.hasPrefix("PATCH ") })
     }
 
     @Test("A file watcher event observes only the file and never scans or deletes its sibling")

@@ -54,6 +54,18 @@ final class ScanProgress: @unchecked Sendable {
 extension IncrementalSyncRun {
     func scanLocal() async throws {
         let baselineCache = try await LocalBaselineCache.load(store: engine.store, rootId: rootID)
+        let baselineFilePaths = try await engine.store.read { conn -> Set<String> in
+            let stmt = try conn.cachedStatement(
+                "SELECT parent_id, name FROM items WHERE root_id = ? AND entry_kind = 'file' AND is_tombstone = 0 AND parent_id IS NOT NULL;")
+            stmt.bindInt64(self.rootID, at: 1)
+            defer { stmt.reset() }
+            var paths = Set<String>()
+            while try stmt.step(), let parentID = stmt.columnInt64(at: 0),
+                  let name = stmt.columnText(at: 1) {
+                paths.insert("\(parentID):\(name)")
+            }
+            return paths
+        }
         let staticPrefix = localPath.hasSuffix("/") ? localPath : localPath + "/"
         let prefixBytes = Array(staticPrefix.utf8)
 
@@ -144,6 +156,7 @@ extension IncrementalSyncRun {
                             dirty_generation = items.dirty_generation + 1,
                             phase = 'ready',
                             updated_at = excluded.updated_at
+                        WHERE items.entry_kind = 'file'
                         RETURNING item_id;
                         """)
                     stmt.bindInt64(rootID, at: 1)
@@ -156,7 +169,11 @@ extension IncrementalSyncRun {
                     stmt.bindText(sha256Hex, at: 8)
                     stmt.bindDouble(now, at: 9)
                     stmt.bindDouble(now, at: 10)
-                    if try stmt.step(), let id = stmt.columnInt64(at: 0) { ids.append(id) }
+                    guard try stmt.step(), let id = stmt.columnInt64(at: 0) else {
+                        throw SyncEngineError.general(
+                            "Local file replaces an existing directory at \(observation.url.path); preserving the baseline")
+                    }
+                    ids.append(id)
                     _ = try stmt.step()
                     stmt.reset()
                 }
@@ -181,7 +198,8 @@ extension IncrementalSyncRun {
                             local_generation = items.local_generation + 1,
                             dirty_generation = items.dirty_generation + 1,
                             phase = 'waitingEvidence',
-                            updated_at = excluded.updated_at;
+                            updated_at = excluded.updated_at
+                        WHERE items.entry_kind = 'file';
                         """)
                     stmt.bindInt64(rootID, at: 1)
                     stmt.bindInt64(observation.parentID, at: 2)
@@ -193,6 +211,10 @@ extension IncrementalSyncRun {
                     stmt.bindDouble(now, at: 8)
                     stmt.bindDouble(now, at: 9)
                     _ = try stmt.step()
+                    guard conn.changes == 1 else {
+                        throw SyncEngineError.general(
+                            "Local file replaces an existing directory at \(observation.url.path); preserving the baseline")
+                    }
                     stmt.reset()
                 }
                 return ids
@@ -217,33 +239,23 @@ extension IncrementalSyncRun {
 
         @Sendable func directoryParentID(
             relPath: String, parentRelPath: String, name: String
-        ) async throws -> Int64 {
+        ) throws -> Int64 {
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
             }
-            guard localChangeScope != nil else { return parentItemID }
-            let kind: String? = try await engine.store.read { conn in
-                let stmt = try conn.cachedStatement(
-                    "SELECT entry_kind FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;")
-                stmt.bindInt64(rootID, at: 1)
-                stmt.bindInt64(parentItemID, at: 2)
-                stmt.bindText(name, at: 3)
-                defer { stmt.reset() }
-                guard try stmt.step() else { return nil }
-                return stmt.columnText(at: 0)
-            }
-            if kind == "file" {
+            if baselineFilePaths.contains("\(parentItemID):\(name)") {
                 throw SyncEngineError.general("Local directory replaces an existing file at \(relPath); preserving the baseline")
             }
             return parentItemID
         }
 
-        @Sendable func fileParentID(relPath: String, parentRelPath: String) throws -> Int64 {
+        @Sendable func fileParentID(
+            relPath: String, parentRelPath: String, name: String
+        ) throws -> Int64 {
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
             }
-            guard localChangeScope != nil else { return parentItemID }
-            guard directoryContext.getItemId(byRelPath: relPath) == nil else {
+            if directoryContext.getItemId(byRelPath: relPath) != nil {
                 throw SyncEngineError.general("Local file replaces an existing directory at \(relPath); preserving the baseline")
             }
             return parentItemID
@@ -261,7 +273,7 @@ extension IncrementalSyncRun {
         }
 
         @Sendable func observeDirectory(_ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String) async throws {
-            let parentItemId = try await directoryParentID(
+            let parentItemId = try directoryParentID(
                 relPath: relPath, parentRelPath: parentRelNormalized, name: name)
             let dev = record.dev
             let ino = record.ino
@@ -400,7 +412,7 @@ extension IncrementalSyncRun {
             scanProgress.incScanned()
             let relativePath = parentRelNormalized.isEmpty ? name : "\(parentRelNormalized)/\(name)"
             let parentItemId = try fileParentID(
-                relPath: relativePath, parentRelPath: parentRelNormalized)
+                relPath: relativePath, parentRelPath: parentRelNormalized, name: name)
             let dev = record.dev
             let ino = record.ino
             let mtime = record.mtime

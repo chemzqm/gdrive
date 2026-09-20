@@ -246,7 +246,8 @@ enum DurableCreateIntentStore {
             local_status = 'present',
             phase = CASE WHEN items.phase = 'committed' AND items.remote_status = 'present' THEN items.phase ELSE 'inFlight' END,
             dirty_generation = CASE WHEN items.phase = 'committed' AND items.remote_status = 'present' THEN items.dirty_generation ELSE MAX(items.dirty_generation, 1) END,
-            updated_at = excluded.updated_at;
+            updated_at = excluded.updated_at
+        WHERE items.entry_kind = 'directory';
         """)
         stmt.bindInt64(rootID, at: 1)
         stmt.bindInt64(parentItemID, at: 2)
@@ -258,7 +259,12 @@ enum DurableCreateIntentStore {
         stmt.bindDouble(now, at: 8)
         _ = try stmt.step()
         stmt.reset()
-        return try loadItemIdentity(conn: conn, rootID: rootID, parentItemID: parentItemID, name: name)
+        guard conn.changes == 1 else {
+            throw SyncEngineError.general("Local directory replaces an existing file at \(name); preserving the baseline")
+        }
+        return try loadItemIdentity(
+            conn: conn, rootID: rootID, parentItemID: parentItemID, name: name,
+            expectedKind: "directory")
     }
 
     private static func upsertFileItem(
@@ -282,7 +288,7 @@ enum DurableCreateIntentStore {
                 remote_file_id = COALESCE(remote_file_id, ?),
                 local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?, local_sha256 = ?,
                 local_status = 'present', phase = 'inFlight', dirty_generation = MAX(dirty_generation, 1), updated_at = ?
-            WHERE item_id = ? AND root_id = ? AND is_tombstone = 0;
+            WHERE item_id = ? AND root_id = ? AND entry_kind = 'file' AND is_tombstone = 0;
             """)
             update.bindText(candidateRemoteID, at: 1)
             update.bindInt64(device, at: 2)
@@ -295,6 +301,9 @@ enum DurableCreateIntentStore {
             update.bindInt64(rootID, at: 9)
             _ = try update.step()
             update.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general("Unable to update the corresponding file creation intent: \(name)")
+            }
         } else {
             let insert = try conn.cachedStatement("""
             INSERT INTO items (
@@ -314,7 +323,8 @@ enum DurableCreateIntentStore {
                 local_status = 'present',
                 phase = 'inFlight',
                 dirty_generation = MAX(items.dirty_generation, 1),
-                updated_at = excluded.updated_at;
+                updated_at = excluded.updated_at
+            WHERE items.entry_kind = 'file';
             """)
             insert.bindInt64(rootID, at: 1)
             insert.bindInt64(parentItemID, at: 2)
@@ -329,9 +339,14 @@ enum DurableCreateIntentStore {
             insert.bindDouble(now, at: 11)
             _ = try insert.step()
             insert.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general("Local file replaces an existing directory at \(name); preserving the baseline")
+            }
         }
 
-        let item = try loadItemIdentity(conn: conn, rootID: rootID, parentItemID: parentItemID, name: name)
+        let item = try loadItemIdentity(
+            conn: conn, rootID: rootID, parentItemID: parentItemID, name: name,
+            expectedKind: "file")
         let pending = try loadActiveOperation(conn: conn, itemID: item.itemID, operationType: operationType)
         if let pending, let persistedSHA = pending.expectedSHA256,
            persistedSHA.caseInsensitiveCompare(sha256) != .orderedSame {
@@ -344,10 +359,11 @@ enum DurableCreateIntentStore {
         conn: SQLiteConnection,
         rootID: Int64,
         parentItemID: Int64,
-        name: String
+        name: String,
+        expectedKind: String
     ) throws -> ItemIdentity {
         let query = try conn.cachedStatement("""
-        SELECT item_id, remote_file_id, local_generation
+        SELECT item_id, remote_file_id, local_generation, entry_kind
         FROM items
         WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
         """)
@@ -357,7 +373,8 @@ enum DurableCreateIntentStore {
         defer { query.reset() }
         guard try query.step(),
               let itemID = query.columnInt64(at: 0),
-              let remoteID = query.columnText(at: 1) else {
+              let remoteID = query.columnText(at: 1),
+              query.columnText(at: 3) == expectedKind else {
             throw SyncEngineError.general("Unable to read the corresponding creation intent item: \(name)")
         }
         return ItemIdentity(itemID: itemID, remoteID: remoteID, localGeneration: query.columnInt64(at: 2) ?? 0)
