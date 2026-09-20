@@ -60,8 +60,9 @@ public enum ResumableUploadResult: Sendable {
 }
 
 /// Google Drive API Error type
-public enum DriveError: Error, Sendable, CustomStringConvertible {
-    case rateLimited(retryAfter: TimeInterval?)
+public enum DriveError: Error, Sendable, CustomStringConvertible, Equatable {
+    case rateLimited429(retryAfter: TimeInterval?)
+    case rateLimited403(reason: String, retryAfter: TimeInterval?)
     case notFound(fileId: String)
     case conflict(fileId: String, message: String)
     case checksumMismatch(expected: String, actual: String?)
@@ -74,8 +75,10 @@ public enum DriveError: Error, Sendable, CustomStringConvertible {
 
     public var description: String {
         switch self {
-        case .rateLimited(let delay):
-            return "Google Drive API Current limiting (429/403),Suggest waiting: \(delay ?? 1.0)s"
+        case .rateLimited429(let delay):
+            return "Google Drive API 429 请求过多 (Too Many Requests)，建议等待: \(delay ?? 1.0)s"
+        case .rateLimited403(let reason, let delay):
+            return "Google Drive API 403 配额/频次超限 (\(reason))，建议等待: \(delay ?? 2.0)s"
         case .notFound(let id):
             return "File or directory not found (404): ID \(id)"
         case .conflict(let id, let msg):
@@ -110,6 +113,37 @@ public struct DriveChangesPage: Codable, Sendable {
     public let nextPageToken: String?
     public let newStartPageToken: String?
     public let changes: [DriveChange]
+}
+
+private enum RateLimitEncounter: Sendable {
+    case rateLimited429(retryAfter: Double?)
+    case rateLimited403(reason: String, retryAfter: Double?)
+    case transientServer503(retryAfter: Double?)
+
+    var retryDelay: Double? {
+        switch self {
+        case .rateLimited429(let delay),
+             .rateLimited403(_, let delay),
+             .transientServer503(let delay):
+            return delay
+        }
+    }
+}
+
+private struct GoogleAPIErrorDetail: Decodable, Sendable {
+    let domain: String?
+    let reason: String?
+    let message: String?
+}
+
+private struct GoogleAPIErrorBody: Decodable, Sendable {
+    let code: Int?
+    let message: String?
+    let errors: [GoogleAPIErrorDetail]?
+}
+
+private struct GoogleAPIErrorEnvelope: Decodable, Sendable {
+    let error: GoogleAPIErrorBody?
 }
 
 /// Google Drive Core communication and transport client
@@ -194,6 +228,50 @@ public final class DriveClient: Sendable {
 
     // MARK: - Core Actuators (Adaptive current limiting and resilient retries)
 
+    private enum RetryDecision {
+        case shouldRetry
+        case notHandled
+    }
+
+    private func handleRateLimitOrTransientError(
+        data: Data,
+        http: HTTPURLResponse,
+        attempt: Int,
+        retryLimit: Int
+    ) async throws -> RetryDecision {
+        if let encounter = parseRateLimit(data: data, response: http) {
+            guard attempt <= retryLimit else {
+                switch encounter {
+                case .rateLimited429(let delay):
+                    throw DriveError.rateLimited429(retryAfter: delay)
+                case .rateLimited403(let reason, let delay):
+                    throw DriveError.rateLimited403(reason: reason, retryAfter: delay)
+                case .transientServer503:
+                    let detail = String(bytes: data, encoding: .utf8) ?? "Service Unavailable"
+                    throw DriveError.serverError(statusCode: 503, message: detail)
+                }
+            }
+
+            let jitter = Double.random(in: 0.2...0.8)
+            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+            let backoff = max(encounter.retryDelay ?? 0, exponential)
+            await rateLimiter.reportRateLimit(retryAfter: backoff)
+            try await retrySleep(backoff)
+            return .shouldRetry
+        }
+
+        if [500, 502, 504].contains(http.statusCode), attempt <= retryLimit {
+            let retryDelay = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+            let jitter = Double.random(in: 0.2...0.8)
+            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+            let backoff = max(retryDelay ?? 0, exponential)
+            try await retrySleep(backoff)
+            return .shouldRetry
+        }
+
+        return .notHandled
+    }
+
     /// Unified Execution HTTP Request, with smooth current limiting scheduling, global withdrawal coordination,401 Auto Refresh vs. 429/503/403 Exponential back-off retry
     public func executeRequest(
         _ request: URLRequest,
@@ -215,81 +293,88 @@ public final class DriveClient: Sendable {
                 (data, response) = try await session.data(for: currentReq)
             } catch {
                 try Task.checkCancellation()
-                if attempt <= retryLimit {
-                    let jitter = Double.random(in: 0.1...0.5)
-                    let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
-                    await rateLimiter.reportRateLimit(retryAfter: delay)
-                    try await retrySleep(delay)
-                    continue
-                }
-                throw error
+                guard attempt <= retryLimit else { throw error }
+                let jitter = Double.random(in: 0.1...0.5)
+                let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
+                await rateLimiter.reportRateLimit(retryAfter: delay)
+                try await retrySleep(delay)
+                continue
             }
 
             guard let http = response as? HTTPURLResponse else {
                 throw DriveError.invalidResponse(message: "Response is not HTTP")
             }
 
-            // A rejected token must bypass both cache layers. Refresh only once for this request.
             if http.statusCode == 401 && !didRefreshAfterUnauthorized {
                 didRefreshAfterUnauthorized = true
                 try await refreshAuthorization(in: &currentReq)
                 continue
             }
 
-            // Check current limiting (429, 503, or 403 Contains rateLimitExceeded / userRateLimitExceeded / quotaExceeded)
-            let (isRateLimit, retryDelay) = rateLimitStatus(data: data, response: http)
-
-            if isRateLimit {
-                if attempt <= retryLimit {
-                    let jitter = Double.random(in: 0.2...0.8)
-                    let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-                    let backoff = max(retryDelay ?? 0, exponential)
-                    await rateLimiter.reportRateLimit(retryAfter: backoff)
-                    try await retrySleep(backoff)
-                    continue
-                }
-                throw DriveError.rateLimited(retryAfter: retryDelay)
-            }
-
-            if [500, 502, 504].contains(http.statusCode), attempt <= retryLimit {
-                let jitter = Double.random(in: 0.2...0.8)
-                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-                let backoff = max(retryDelay ?? 0, exponential)
-                try await retrySleep(backoff)
+            let decision = try await handleRateLimitOrTransientError(
+                data: data, http: http, attempt: attempt, retryLimit: retryLimit
+            )
+            if decision == .shouldRetry {
                 continue
             }
 
-            // Encounter 409(Often verified as existing in the business) or 308(Resumable chunking incomplete), returning directly to the upper level for processing
             if http.statusCode == 409 || http.statusCode == 308 || acceptableStatusCodes.contains(http.statusCode) {
                 await rateLimiter.reportSuccess()
                 return (data, http)
             }
 
-            // Other HTTP Error Status
             let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: detail)
         }
     }
 
-    private func rateLimitStatus(data: Data, response http: HTTPURLResponse) -> (Bool, Double?) {
-        let isRateLimit: Bool
-        var retryDelay: Double? = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+    private func parseRateLimit(data: Data, response http: HTTPURLResponse) -> RateLimitEncounter? {
+        let retryDelay = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
 
-        if http.statusCode == 429 || http.statusCode == 503 {
-            isRateLimit = true
-        } else if http.statusCode == 403 {
-            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
-            if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") || detail.contains("quotaExceeded") {
-                isRateLimit = true
-                if retryDelay == nil { retryDelay = 2.0 }
-            } else {
-                isRateLimit = false
-            }
-        } else {
-            isRateLimit = false
+        if http.statusCode == 429 {
+            return .rateLimited429(retryAfter: retryDelay)
         }
 
-        return (isRateLimit, retryDelay)
+        if http.statusCode == 503 {
+            return .transientServer503(retryAfter: retryDelay)
+        }
+
+        if http.statusCode == 403 {
+            let envelope = try? JSONDecoder().decode(GoogleAPIErrorEnvelope.self, from: data)
+            let parsedReason = envelope?.error?.errors?.first?.reason
+            let detail = (String(bytes: data, encoding: .utf8) ?? "")
+
+            let rateLimitReasons = [
+                "userRateLimitExceeded",
+                "rateLimitExceeded",
+                "quotaExceeded",
+                "sharingRateLimitExceeded",
+                "dailyLimitExceeded"
+            ]
+
+            let reason: String?
+            if let parsedReason, rateLimitReasons.contains(parsedReason) {
+                reason = parsedReason
+            } else if detail.contains("userRateLimitExceeded") {
+                reason = "userRateLimitExceeded"
+            } else if detail.contains("rateLimitExceeded") {
+                reason = "rateLimitExceeded"
+            } else if detail.contains("quotaExceeded") {
+                reason = "quotaExceeded"
+            } else if detail.contains("sharingRateLimitExceeded") {
+                reason = "sharingRateLimitExceeded"
+            } else if detail.contains("dailyLimitExceeded") {
+                reason = "dailyLimitExceeded"
+            } else {
+                reason = nil
+            }
+
+            if let reason {
+                return .rateLimited403(reason: reason, retryAfter: retryDelay ?? 2.0)
+            }
+        }
+
+        return nil
     }
 
     private func refreshAuthorization(in request: inout URLRequest) async throws {
@@ -301,6 +386,63 @@ public final class DriveClient: Sendable {
         let expiry = authData.expiresAt ?? Date(timeIntervalSinceNow: 3500)
         tokenState.withLock { $0 = CachedToken(token: freshToken, expiresAt: expiry) }
         request.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
+    }
+
+    private func handleStreamingError(
+        http: HTTPURLResponse,
+        bytes: URLSession.AsyncBytes,
+        attempt: Int,
+        retryLimit: Int
+    ) async throws {
+        let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+        if http.statusCode == 429 {
+            guard attempt <= retryLimit else {
+                throw DriveError.rateLimited429(retryAfter: retryAfter)
+            }
+            let jitter = Double.random(in: 0.2...0.8)
+            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+            let backoff = max(retryAfter ?? 0, exponential)
+            await rateLimiter.reportRateLimit(retryAfter: backoff)
+            try await retrySleep(backoff)
+            return
+        }
+
+        if [500, 502, 503, 504].contains(http.statusCode) {
+            guard attempt <= retryLimit else {
+                throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
+            }
+            let jitter = Double.random(in: 0.2...0.8)
+            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+            let backoff = max(retryAfter ?? 0, exponential)
+            if http.statusCode == 503 {
+                await rateLimiter.reportRateLimit(retryAfter: backoff)
+            }
+            try await retrySleep(backoff)
+            return
+        }
+
+        if http.statusCode == 403 {
+            var errorBuffer = [UInt8]()
+            for try await byte in bytes {
+                errorBuffer.append(byte)
+                if errorBuffer.count >= 4096 { break }
+            }
+            let errorData = Data(errorBuffer)
+            if let encounter = parseRateLimit(data: errorData, response: http),
+               case .rateLimited403(let reason, let delay) = encounter {
+                guard attempt <= retryLimit else {
+                    throw DriveError.rateLimited403(reason: reason, retryAfter: delay)
+                }
+                let jitter = Double.random(in: 0.2...0.8)
+                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
+                let backoff = max(delay ?? 0, exponential)
+                await rateLimiter.reportRateLimit(retryAfter: backoff)
+                try await retrySleep(backoff)
+                return
+            }
+            let detail = (String(bytes: errorData, encoding: .utf8) ?? "Invalid UTF-8 data")
+            throw DriveError.serverError(statusCode: 403, message: detail)
+        }
     }
 
     private func executeStreamingRequest(
@@ -339,19 +481,10 @@ public final class DriveClient: Sendable {
                 continue
             }
 
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-            let rateLimited = http.statusCode == 429 || http.statusCode == 503
-            let transientServerError = [500, 502, 504].contains(http.statusCode)
-            if rateLimited || transientServerError {
-                guard attempt <= retryLimit else {
-                    if rateLimited { throw DriveError.rateLimited(retryAfter: retryAfter) }
-                    throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
-                }
-                let jitter = Double.random(in: 0.2...0.8)
-                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-                let backoff = max(retryAfter ?? 0, exponential)
-                if rateLimited { await rateLimiter.reportRateLimit(retryAfter: backoff) }
-                try await retrySleep(backoff)
+            if http.statusCode == 429 || http.statusCode == 403 || [500, 502, 503, 504].contains(http.statusCode) {
+                try await handleStreamingError(
+                    http: http, bytes: bytes, attempt: attempt, retryLimit: retryLimit
+                )
                 continue
             }
 
@@ -954,16 +1087,16 @@ public final class DriveClient: Sendable {
         guard let http = response as? HTTPURLResponse else {
             throw DriveError.invalidResponse(message: "Response is not HTTP")
         }
-        if http.statusCode == 429 {
-            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-            throw DriveError.rateLimited(retryAfter: retryAfter)
-        }
-        if http.statusCode == 403 {
-            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
-            if detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded") {
-                throw DriveError.rateLimited(retryAfter: 1.0)
+        if let encounter = parseRateLimit(data: data, response: http) {
+            switch encounter {
+            case .rateLimited429(let delay):
+                throw DriveError.rateLimited429(retryAfter: delay)
+            case .rateLimited403(let reason, let delay):
+                throw DriveError.rateLimited403(reason: reason, retryAfter: delay)
+            case .transientServer503:
+                let detail = (String(bytes: data, encoding: .utf8) ?? "Service Unavailable")
+                throw DriveError.serverError(statusCode: 503, message: detail)
             }
-            throw DriveError.serverError(statusCode: 403, message: detail)
         }
         if !(200..<300).contains(http.statusCode) {
             let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")

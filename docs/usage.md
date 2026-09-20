@@ -388,7 +388,8 @@ let watcher = DirectoryWatcher(path: localDir) {
 - `SyncEngineError.localRootNotFound(path:)`：增量同步的本地根消失或不再是目录，停止同步以保护远端数据。
 - `SyncEngineError.remoteRootLost(remoteId:reason:)`：远端同步根丢失、被移入回收站或不再是目录，停止同步以保护本地数据。
 - `SyncEngineError.general(_:)`：配置或同步保护条件不满足，具体原因见错误描述。
-- `DriveError.rateLimited(retryAfter:)`: Google Drive API 429 限流，包含建议退避等待时间。
+- `DriveError.rateLimited429(retryAfter:)`: Google Drive API 429 请求过多（Too Many Requests），包含建议退避等待时间。
+- `DriveError.rateLimited403(reason:retryAfter:)`: Google Drive API 403 用户配额或频次超限（如 `userRateLimitExceeded`、`rateLimitExceeded`），包含具体超限原因与建议退避等待时间。
 - `DriveError.checksumMismatch(expected:actual:)`: 数据下载或上传的 SHA-256 校验不匹配。
 - `DriveError.notFound(fileId:)`: 远端目录或文件不存在（404）。
 - `DriveError.unsafeOverwrite(fileId:)`：已有远端文件的正文覆盖被保护机制阻止。

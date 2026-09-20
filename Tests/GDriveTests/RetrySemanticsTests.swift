@@ -196,4 +196,149 @@ struct RetrySemanticsTests {
         #expect(requestCount.withLock { $0 } == 2)
         #expect(try Data(contentsOf: destination) == body)
     }
+
+    @Test("executeRequest throws distinct rateLimited429 error when retries are exhausted")
+    func executeRequestThrowsRateLimited429() async throws {
+        RetrySemanticsURLProtocol.handler.withLock { handler in
+            handler = { request in
+                (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 429, httpVersion: nil,
+                        headerFields: ["Retry-After": "3"])!,
+                    Data(#"{"error":{"code":429,"message":"Too Many Requests"}}"#.utf8)
+                )
+            }
+        }
+        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+
+        await #expect(throws: DriveError.rateLimited429(retryAfter: 3.0)) {
+            try await client.executeRequest(request)
+        }
+    }
+
+    @Test("executeRequest throws distinct rateLimited403 error for userRateLimitExceeded")
+    func executeRequestThrowsRateLimited403UserQuota() async throws {
+        let errorBody = """
+        {
+          "error": {
+            "code": 403,
+            "message": "User Rate Limit Exceeded",
+            "errors": [
+              {
+                "domain": "usageLimits",
+                "reason": "userRateLimitExceeded",
+                "message": "User Rate Limit Exceeded"
+              }
+            ]
+          }
+        }
+        """
+        RetrySemanticsURLProtocol.handler.withLock { handler in
+            handler = { request in
+                (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 403, httpVersion: nil,
+                        headerFields: ["Retry-After": "5"])!,
+                    Data(errorBody.utf8)
+                )
+            }
+        }
+        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+
+        await #expect(throws: DriveError.rateLimited403(reason: "userRateLimitExceeded", retryAfter: 5.0)) {
+            try await client.executeRequest(request)
+        }
+    }
+
+    @Test("executeRequest throws distinct rateLimited403 error for rateLimitExceeded")
+    func executeRequestThrowsRateLimited403ProjectLimit() async throws {
+        let errorBody = """
+        {
+          "error": {
+            "code": 403,
+            "message": "Rate Limit Exceeded",
+            "errors": [
+              {
+                "domain": "usageLimits",
+                "reason": "rateLimitExceeded",
+                "message": "Rate Limit Exceeded"
+              }
+            ]
+          }
+        }
+        """
+        RetrySemanticsURLProtocol.handler.withLock { handler in
+            handler = { request in
+                (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 403, httpVersion: nil,
+                        headerFields: nil)!,
+                    Data(errorBody.utf8)
+                )
+            }
+        }
+        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+
+        await #expect(throws: DriveError.rateLimited403(reason: "rateLimitExceeded", retryAfter: 2.0)) {
+            try await client.executeRequest(request)
+        }
+    }
+
+    @Test("executeRequest non-rate-limit 403 throws serverError immediately without rate limiting")
+    func executeRequestThrowsServerErrorForPermissionDenied() async throws {
+        let errorBody = """
+        {
+          "error": {
+            "code": 403,
+            "message": "The user does not have sufficient permissions for this file.",
+            "errors": [
+              {
+                "domain": "global",
+                "reason": "insufficientFilePermissions",
+                "message": "The user does not have sufficient permissions for this file."
+              }
+            ]
+          }
+        }
+        """
+        RetrySemanticsURLProtocol.handler.withLock { handler in
+            handler = { request in
+                (
+                    HTTPURLResponse(
+                        url: request.url!, statusCode: 403, httpVersion: nil,
+                        headerFields: nil)!,
+                    Data(errorBody.utf8)
+                )
+            }
+        }
+        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session, maxRetries: 3, retrySleep: { _ in })
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+
+        await #expect(throws: DriveError.serverError(statusCode: 403, message: errorBody)) {
+            try await client.executeRequest(request)
+        }
+    }
 }
