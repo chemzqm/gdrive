@@ -410,6 +410,77 @@ struct DurableIntentTests {
         #expect(result.1 == "persisted-file-id")
     }
 
+    @Test("Bootstrap retries an unfinished directory before creating its children")
+    func bootstrapRecoversUnfinishedDirectory() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("bootstrap-directory-\(UUID().uuidString)")
+        let localRoot = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: localRoot.appendingPathComponent("parent/child"), withIntermediateDirectories: true)
+        defer {
+            DurableIntentURLProtocol.requestHandler = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        let (rootID, rootItemID) = try await seedRoot(store: store, localPath: localRoot.path, remoteID: "remote-root")
+        let intent = try await DurableCreateIntentStore.prepareDirectory(
+            store: store, rootID: rootID, parentItemID: rootItemID, name: "parent",
+            targetParentRemoteID: "remote-root", candidateRemoteID: "persisted-parent", device: 1, inode: 2
+        )
+        await DurableCreateIntentStore.markUnknownOutcome(
+            store: store, operationID: intent.operationID, error: URLError(.networkConnectionLost)
+        )
+        let requests = SafeCounter(0)
+        DurableIntentURLProtocol.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if request.httpMethod == "GET", url.path.hasSuffix("/files/remote-root") {
+                return (response, Data(#"{"id":"remote-root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if request.httpMethod == "POST", url.path.hasSuffix("/files") {
+                let data = try #require(request.extractBodyData)
+                let body = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+                let ordinal = requests.next()
+                if ordinal <= 1 {
+                    #expect(body["id"] as? String == "persisted-parent")
+                    #expect(body["parents"] as? [String] == ["remote-root"])
+                } else {
+                    #expect(ordinal == 2)
+                    #expect(body["name"] as? String == "child")
+                    #expect(body["parents"] as? [String] == ["persisted-parent"])
+                }
+                if ordinal == 0 {
+                    return (HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: nil)!, Data())
+                }
+                return (response, data)
+            }
+            throw SyncEngineError.general("Unexpected request: \(url)")
+        }
+        let auth = try makeAuth(in: directory)
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [DurableIntentURLProtocol.self]
+        let engine = try await SyncEngine(auth: auth, store: store,
+            client: DriveClient(auth: auth, session: URLSession(configuration: config)),
+            idPool: IDPool(initialIds: ["candidate-one", "candidate-two", "candidate-three"]))
+        let failed = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "remote-root")
+        #expect(failed.directoriesCreated == 0)
+        try await store.read { conn in
+            let query = try conn.prepare("SELECT bootstrap_state FROM roots;")
+            #expect(try query.step())
+            #expect(query.columnText(at: 0) == "freshCreated")
+        }
+        let stats = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "remote-root")
+        #expect(stats.directoriesCreated == 2)
+        #expect(requests.next() == 3)
+        try await store.read { conn in
+            let query = try conn.prepare("SELECT parent_id FROM items WHERE name = 'child';")
+            #expect(try query.step())
+            #expect(query.columnInt64(at: 0) == intent.itemID)
+            let operation = try conn.prepare("SELECT state FROM operations WHERE operation_id = ?;")
+            operation.bindText(intent.operationID, at: 1)
+            #expect(try operation.step())
+            #expect(operation.columnText(at: 0) == "completed")
+        }
+    }
+
     @Test("Concurrent intents use group commit instead of one fsync per small file")
     func intentsRemainBatched() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-batch-\(UUID().uuidString)")

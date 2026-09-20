@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import Testing
+import DirectoryScanner
 @testable import GDrive
 
 final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
@@ -527,4 +528,71 @@ struct DirectoryTrackerRecoveryTests {
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
         #expect(elapsed < 3.0, "Cancelled sync should terminate promptly without deadlock")
     }
+    @Test("Bootstrap drains admitted tasks after scan failure or cancellation", arguments: [false, true])
+    func scanInterruptionDrainsTasks(cancel: Bool) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("bootstrap-scan-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local.appendingPathComponent("parent"), withIntermediateDirectories: true)
+        let file = local.appendingPathComponent("parent/file.txt")
+        try Data("content".utf8).write(to: file)
+        defer {
+            MockDirectoryRecoveryURLProtocol.requestHandler = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+        MockDirectoryRecoveryURLProtocol.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"start"}"#.utf8))
+            }
+            if request.httpMethod == "GET", url.path.hasSuffix("/files/root") {
+                return (response, Data(#"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if request.httpMethod == "GET", url.path.hasSuffix("/files") {
+                return (response, Data(#"{"files":[]}"#.utf8))
+            }
+            return (HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: nil)!, Data())
+        }
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        enum ScanFailure: Error { case injected }
+        let engine = try await SyncEngine(auth: auth, store: store, client: createMockClient(auth: auth),
+            idPool: IDPool(initialIds: ["directory-id", "file-id"]), incrementalScan: { _, consume in
+                var bytes: [UInt8] = []
+                var records: [ScanBatch.Record] = []
+                for (url, type) in [(local.appendingPathComponent("parent"), EntryType.directory), (file, EntryType.file)] {
+                    let path = Array(url.path.utf8)
+                    records.append(.init(offset: UInt32(bytes.count), length: UInt32(path.count), type: type, metadata: nil))
+                    bytes.append(contentsOf: path)
+                    bytes.append(0)
+                }
+                try await consume(ScanBatch(pathData: bytes, records: records))
+                if cancel {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                    try Task.checkCancellation()
+                }
+                throw ScanFailure.injected
+            })
+        let task = Task {
+            try await engine.syncLocalToRemoteEmpty(localPath: local.path, remoteRootId: "root")
+        }
+        do {
+            _ = try await task.value
+            Issue.record("Interrupted scan should throw")
+        } catch {
+            if cancel {
+                #expect(error is CancellationError)
+            } else {
+                #expect(error is ScanFailure)
+            }
+        }
+        #expect(engine.transferStatus.queuedUploads.isEmpty)
+        #expect(engine.transferStatus.activeUploads.isEmpty)
+        try await store.read { conn in
+            let query = try conn.prepare("SELECT bootstrap_state FROM roots;")
+            #expect(try query.step())
+            #expect(query.columnText(at: 0) == "freshCreated")
+        }
+    }
+
 }

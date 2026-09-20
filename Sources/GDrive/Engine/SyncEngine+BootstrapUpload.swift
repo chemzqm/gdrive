@@ -99,31 +99,12 @@ extension SyncEngine {
 
         try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
 
-        // 2. Initialize the directory asynchronous wake-up scheduler (the root directory is defaulted to ready)
-        let directoryTracker = DirectoryTracker(remoteRootId: remoteRootId)
-
-        // Record the relative path of the local directory and its database itemId
-        final class LocalDirMap: @unchecked Sendable {
-            private var map: [String: Int64] = [:]
-            private var lock = os_unfair_lock()
-
-            init(rootItemId: Int64) {
-                map[""] = rootItemId
-            }
-
-            func set(_ path: String, id: Int64) {
-                os_unfair_lock_lock(&lock)
-                map[path] = id
-                os_unfair_lock_unlock(&lock)
-            }
-
-            func get(_ path: String) -> Int64? {
-                os_unfair_lock_lock(&lock)
-                defer { os_unfair_lock_unlock(&lock) }
-                return map[path]
-            }
-        }
-        let localDirMap = LocalDirMap(rootItemId: rootItemId)
+        // A directory is registered in this table before its children can be emitted.
+        // Its value becomes available only after remote creation and the local commit succeed.
+        let taskRegistry = BootstrapTaskRegistry(root: BootstrapDirectoryTarget(
+            remoteID: remoteRootId,
+            itemID: rootItemId
+        ))
 
         func restoreKnownDirectories() async throws {
             // in advance from SQLite Load all known subdirectory mappings, restore bootstrap Or reuse it resolutely when re-running to avoid blindly re-creating
@@ -137,7 +118,8 @@ extension SyncEngine {
                 let stmt = try conn.cachedStatement("""
                 SELECT item_id, parent_id, name, remote_file_id
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
+                WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0
+                    AND parent_id IS NOT NULL AND phase = 'committed' AND remote_status = 'present';
                 """)
                 stmt.bindInt64(rootId, at: 1)
                 defer { stmt.reset() }
@@ -163,18 +145,15 @@ extension SyncEngine {
                     if registered.contains(dir.parentId), let parentPath = dirPathsById[dir.parentId] {
                         let relPath = parentPath.isEmpty ? dir.name : "\(parentPath)/\(dir.name)"
                         dirPathsById[dir.id] = relPath
-                        localDirMap.set(relPath, id: dir.id)
+                        taskRegistry.registerReady(
+                            BootstrapDirectoryTarget(remoteID: dir.remoteId, itemID: dir.id),
+                            for: relPath
+                        )
                         registered.insert(dir.id)
                         topoProgress = true
                         return true
                     }
                     return false
-                }
-            }
-
-            for (id, relPath) in dirPathsById where id != rootItemId {
-                if let dir = existingDirs.first(where: { $0.id == id }) {
-                    await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: dir.remoteId)
                 }
             }
         }
@@ -186,7 +165,6 @@ extension SyncEngine {
         // Directory metadata requests do not consume file transfer slots, but
         // they still need their own network concurrency bound.
         let directorySemaphore = AsyncSemaphore(count: max(1, min(8, effectiveConcurrency)))
-        let uploadGroup = DispatchGroup()
 
         // Load fast change comparison baseline cache (§6.2)
         let baselineCache = try await LocalBaselineCache.load(store: store, rootId: rootId)
@@ -197,6 +175,7 @@ extension SyncEngine {
             private var _filesFailed = 0
             private var _bytesUploaded: Int64 = 0
             private var _dirsCreated = 0
+            private var _directoryFailures = 0
             private var lock = os_unfair_lock()
 
             var filesUploaded: Int {
@@ -229,6 +208,12 @@ extension SyncEngine {
                 return _dirsCreated
             }
 
+            var hasDirectoryFailures: Bool {
+                os_unfair_lock_lock(&lock)
+                defer { os_unfair_lock_unlock(&lock) }
+                return _directoryFailures != 0
+            }
+
             func recordSuccess(bytes: Int64) {
                 os_unfair_lock_lock(&lock)
                 _filesUploaded += 1
@@ -253,6 +238,12 @@ extension SyncEngine {
                 _dirsCreated += 1
                 os_unfair_lock_unlock(&lock)
             }
+
+            func recordDirectoryFailure() {
+                os_unfair_lock_lock(&lock)
+                _directoryFailures += 1
+                os_unfair_lock_unlock(&lock)
+            }
         }
         let progress = ProgressTracker()
 
@@ -271,12 +262,10 @@ extension SyncEngine {
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
-        @Sendable func uploadFile(fullPath: String, relPath: String, parentRel: String, name: String, fileSize: Int64) async {
-            defer {
-                uploadGroup.leave()
-            }
+        @Sendable func uploadFile(fullPath: String, relPath: String, parent: BootstrapDirectoryDependency, name: String, fileSize: Int64) async {
             var createIntent: DurableCreateIntent?
             var didAcquireSemaphore = false
+            var parentItemID: Int64?
 
             defer {
                 if didAcquireSemaphore {
@@ -287,11 +276,16 @@ extension SyncEngine {
             }
 
             do {
-                // First wait for the direct parent directory to be in Google Drive The remote end is ready to avoid occupying concurrent upload slots.
-                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                try Task.checkCancellation()
+                // Resolving the parent happens before a transfer slot is acquired.
+                let parentTarget = try await parent.value()
+                try Task.checkCancellation()
+                let remoteParentId = parentTarget.remoteID
+                parentItemID = parentTarget.itemID
 
                 await uploadSemaphore.wait()
                 didAcquireSemaphore = true
+                try Task.checkCancellation()
 
                 let fileURL = URL(fileURLWithPath: fullPath)
                 let limit8MB: Int64 = 8 * 1024 * 1024
@@ -307,7 +301,7 @@ extension SyncEngine {
                 let ino = input.version.inode
                 let mtime = input.version.mtime
 
-                let parentDirItemId = localDirMap.get(parentRel) ?? rootItemId
+                let parentDirItemId = parentTarget.itemID
 
                 // Check whether the file is already in SQLite recorded (whether it has been committed Still unfinished inFlight)
                 struct ExistingFileTarget {
@@ -601,15 +595,14 @@ extension SyncEngine {
                     )
                 }
                 progress.recordFailure()
-                if case DriveError.unsafeOverwrite = error {
-                    let parentID = localDirMap.get(parentRel) ?? rootItemId
+                if case DriveError.unsafeOverwrite = error, let parentItemID {
                     try? await self.store.batchWrite { conn in
                         let stmt = try conn.cachedStatement("""
                         UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
                         WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
                         """)
                         stmt.bindInt64(rootId, at: 1)
-                        stmt.bindInt64(parentID, at: 2)
+                        stmt.bindInt64(parentItemID, at: 2)
                         stmt.bindText(name, at: 3)
                         _ = try stmt.step()
                         stmt.reset()
@@ -619,28 +612,28 @@ extension SyncEngine {
             }
         }
 
-        @Sendable func createDirectory(relPath: String, parentRel: String, name: String, metadata: FileMetadata?) async {
-            defer {
-                uploadGroup.leave()
-            }
+        @Sendable func createDirectory(relPath: String, parent: BootstrapDirectoryDependency, name: String, metadata: FileMetadata?) async throws -> BootstrapDirectoryTarget {
             var createIntent: DurableCreateIntent?
             do {
-                let remoteParentId = try await directoryTracker.awaitParentReady(parentRelPath: parentRel)
+                try Task.checkCancellation()
+                let parentTarget = try await parent.value()
+                try Task.checkCancellation()
                 await directorySemaphore.wait()
                 defer { directorySemaphore.signal() }
+                try Task.checkCancellation()
                 let candidateRemoteId = try await self.idPool.nextId()
-                let grandParentItemId = localDirMap.get(parentRel) ?? rootItemId
                 let intent = try await DurableCreateIntentStore.prepareDirectory(
                     store: self.store,
                     rootID: rootId,
-                    parentItemID: grandParentItemId,
+                    parentItemID: parentTarget.itemID,
                     name: name,
-                    targetParentRemoteID: remoteParentId,
+                    targetParentRemoteID: parentTarget.remoteID,
                     candidateRemoteID: candidateRemoteId,
                     device: Int64(metadata?.identity.device ?? 1),
                     inode: Int64(metadata?.identity.inode ?? 0)
                 )
                 createIntent = intent
+                try Task.checkCancellation()
 
                 // Intent of group-commit Only after confirmation can the remote creation request be issued.
                 _ = try await self.client.createDirectory(
@@ -662,13 +655,9 @@ extension SyncEngine {
                     stmt.reset()
                     try DurableCreateIntentStore.completeOperation(conn: conn, operationID: intent.operationID, now: timestamp)
                 }
-                localDirMap.set(relPath, id: intent.itemID)
-
-                // Broadcast wake-up waiting for all children of the directory
-                await directoryTracker.markDirectoryReady(relPath: relPath, remoteId: intent.targetRemoteID)
                 progress.recordDirCreated()
+                return BootstrapDirectoryTarget(remoteID: intent.targetRemoteID, itemID: intent.itemID)
             } catch {
-                await directoryTracker.markDirectoryFailed(relPath: relPath, error: error)
                 if let createIntent {
                     await DurableCreateIntentStore.markUnknownOutcome(
                         store: self.store,
@@ -676,35 +665,26 @@ extension SyncEngine {
                         error: error
                     )
                 }
+                progress.recordDirectoryFailure()
                 self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
+                throw error
             }
         }
 
         @Sendable func processBatch(_ batch: ScanBatch) async throws {
-            struct BootstrapScanRecord: Sendable {
-                let type: EntryType
-                let metadata: FileMetadata?
-                let fullPath: String
-            }
-            var copiedRecords: [BootstrapScanRecord] = []
-            copiedRecords.reserveCapacity(batch.count)
-            batch.withRawData { rawBuf in
+            try Task.checkCancellation()
+            try batch.withRawData { rawBuf in
                 guard let basePtr = rawBuf.baseAddress else { return }
 
                 for idx in 0..<batch.count {
+                    try Task.checkCancellation()
                     let record = batch.records[idx]
                     let rawPtr = UnsafeRawPointer(basePtr + Int(record.offset))
                     let cPath = rawPtr.assumingMemoryBound(to: CChar.self)
-                    copiedRecords.append(BootstrapScanRecord(
-                        type: record.type,
-                        metadata: record.metadata,
-                        fullPath: String(cString: cPath)
-                    ))
-                }
-            }
-
-            for record in copiedRecords {
-                    let fullPath = record.fullPath
+                    // Copy values needed by the asynchronous task while the batch's raw buffer is valid.
+                    let type = record.type
+                    let metadata = record.metadata
+                    let fullPath = String(cString: cPath)
 
                     let relPath: String
                     if fullPath.hasPrefix(staticPrefix) {
@@ -717,19 +697,21 @@ extension SyncEngine {
 
                     let parentRel = (relPath as NSString).deletingLastPathComponent
                     let name = (relPath as NSString).lastPathComponent
+                    let parent = try taskRegistry.dependency(for: parentRel)
 
-                    if record.type == .directory {
-                        // Directory processing: If the directory already exists and the remote end has been registered ID,Skip remote creation directly to prevent repeated creation
-                        if localDirMap.get(relPath) != nil {
+                    if type == .directory {
+                        if (try? taskRegistry.dependency(for: relPath)) != nil {
                             continue
                         }
-                        uploadGroup.enter()
-                        Task { await createDirectory(relPath: relPath, parentRel: parentRel, name: name, metadata: record.metadata) }
-                    } else if record.type == .file {
-                        let dev = Int64(record.metadata?.identity.device ?? 1)
-                        let ino = Int64(record.metadata?.identity.inode ?? 0)
-                        let mtime = (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
-                        let fileSize = record.metadata?.fileSize ?? 0
+                        let task = Task {
+                            try await createDirectory(relPath: relPath, parent: parent, name: name, metadata: metadata)
+                        }
+                        taskRegistry.registerDirectoryTask(task, for: relPath)
+                    } else if type == .file {
+                        let dev = Int64(metadata?.identity.device ?? 1)
+                        let ino = Int64(metadata?.identity.inode ?? 0)
+                        let mtime = (metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(metadata?.modificationTime.nanoseconds ?? 0)
+                        let fileSize = metadata?.fileSize ?? 0
 
                         // Rapid change detection (§6.2):dev + inode + mtime + size Matching skips content reading and hash calculations
                         if baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) != nil {
@@ -739,32 +721,41 @@ extension SyncEngine {
 
                         // File handling: wait for its immediate parent directory to be ready and upload immediately
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
-                        self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(record.metadata?.fileSize ?? 0))
-                        uploadGroup.enter()
-                        Task { await uploadFile(fullPath: fullPath, relPath: relPath, parentRel: parentRel, name: name, fileSize: Int64(fileSize)) }
+                        self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(fileSize))
+                        let task = Task {
+                            await uploadFile(fullPath: fullPath, relPath: relPath, parent: parent, name: name, fileSize: Int64(fileSize))
+                        }
+                        taskRegistry.registerFileTask(task)
                     }
-            }
-        }
-        try await directoryScan(request, processBatch)
-
-        // 5. Wait for all concurrent directory creation and uploads to complete
-        await withTaskCancellationHandler {
-            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                uploadGroup.notify(queue: .global(qos: .userInitiated)) {
-                    cont.resume()
                 }
             }
-        } onCancel: {
-            Task {
-                await directoryTracker.cancelAll()
-            }
         }
+        do {
+            try await withTaskCancellationHandler {
+                try await directoryScan(request, processBatch)
+            } onCancel: {
+                taskRegistry.cancelAll()
+            }
+        } catch {
+            taskRegistry.cancelAll()
+            await taskRegistry.waitForAll()
+            throw error
+        }
+
+        // 5. Wait for all scheduled work. Cancellation stops and drains both
+        // directory and file tasks, including work registered during scanning.
+        await withTaskCancellationHandler {
+            await taskRegistry.waitForAll()
+        } onCancel: {
+            taskRegistry.cancelAll()
+        }
+        try Task.checkCancellation()
 
         // 6. Force the buffer to be written to disk and execute WAL checkpoint
         try await store.flush()
         try await store.checkpoint()
 
-        if progress.filesFailed == 0 {
+        if progress.filesFailed == 0 && !progress.hasDirectoryFailures {
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
