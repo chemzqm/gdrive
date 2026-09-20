@@ -307,27 +307,27 @@ extension IncrementalSyncRun {
                         stmt.reset()
                     }
                 } else {
-                    // All descendants have been safely deleted and sent to the cloud trashRemote
-                    do {
-                        if let rId = dirItem.remoteFileId {
-                            try await engine.client.trash(remoteId: rId)
-                        }
-                        try await engine.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement(
-                                """
-                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                                """)
-                            stmt.bindDouble(self.now, at: 1)
-                            stmt.bindInt64(dirItem.itemId, at: 2)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                        self.actionTracker.counts.withLock { $0.deleted += 1 }
-                    } catch {
-                        if DatabaseFailure.isSQLite(error) { throw error }
-                        engine.logger.error(
-                            "Failed to delete remote directory [\(relPath)]: \(error)")
+                    // A GET followed by PATCH cannot exclude a concurrent remote child
+                    // or metadata update. Retain the deletion until Drive conditional
+                    // metadata updates have passed the real-service contract test.
+                    try await engine.store.write { conn in
+                        let stmt = try conn.cachedStatement(
+                            """
+                            UPDATE items SET phase = 'blocked', updated_at = ?
+                            WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                                AND dirty_generation = ? AND is_tombstone = 0;
+                            """)
+                        stmt.bindDouble(self.now, at: 1)
+                        stmt.bindInt64(dirItem.itemId, at: 2)
+                        stmt.bindInt64(dirItem.localGeneration, at: 3)
+                        stmt.bindInt64(dirItem.remoteGeneration, at: 4)
+                        stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
+                        _ = try stmt.step()
+                        stmt.reset()
                     }
+                    engine.logger.error(
+                        "Remote directory deletion blocked because Drive conditional metadata updates are unverified [\(relPath)]"
+                    )
                 }
             }
 
@@ -360,50 +360,55 @@ extension IncrementalSyncRun {
                     }
                 } else {
                     // All descendants have been cleaned up. Verify that the local directory is empty and safely move it to the trash.
-                    var trashSucceeded = true
-                    if FileManager.default.fileExists(atPath: localDirURL.path) {
-                        let contents =
-                            (try? FileManager.default.contentsOfDirectory(atPath: localDirURL.path))
-                            ?? []
-                        let nonHidden = contents.filter { !$0.hasPrefix(".") }
-                        if nonHidden.isEmpty {
-                            var trashURL: NSURL?
-                            do {
-                                try FileManager.default.trashItem(
-                                    at: localDirURL, resultingItemURL: &trashURL)
-                            } catch {
-                                trashSucceeded = false
-                                engine.logger.warning(
-                                    "Unable to move local directory to Trash [\(relPath)]: \(error). Keeping it and marking the operation blocked."
-                                )
-                            }
-                        } else {
-                            trashSucceeded = false
+                    let trashSucceeded: Bool
+                    do {
+                        trashSucceeded = try LocalDeletionSafety.trashDirectoryIfEmpty(
+                            at: localDirURL)
+                        if !trashSucceeded {
                             engine.logger.warning(
                                 "Local directory [\(relPath)] is not empty; blocking deletion")
                         }
+                    } catch {
+                        trashSucceeded = false
+                        engine.logger.warning(
+                            "Unable to inspect or move local directory to Trash [\(relPath)]: \(error). Keeping the deletion pending."
+                        )
                     }
 
                     if trashSucceeded {
                         try await engine.store.batchWrite { conn in
                             let stmt = try conn.cachedStatement(
                                 """
-                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ?
+                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                                    AND dirty_generation = ? AND is_tombstone = 0;
                                 """)
                             stmt.bindDouble(self.now, at: 1)
                             stmt.bindInt64(dirItem.itemId, at: 2)
+                            stmt.bindInt64(dirItem.localGeneration, at: 3)
+                            stmt.bindInt64(dirItem.remoteGeneration, at: 4)
+                            stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
                             _ = try stmt.step()
                             stmt.reset()
+                            guard conn.changes == 1 else {
+                                throw SyncEngineError.general(
+                                    "Local directory deletion receipt is stale: \(relPath)")
+                            }
                         }
                         self.actionTracker.counts.withLock { $0.deleted += 1 }
                     } else {
                         try await engine.store.batchWrite { conn in
                             let stmt = try conn.cachedStatement(
                                 """
-                                UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                                UPDATE items SET phase = 'blocked', updated_at = ?
+                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                                    AND dirty_generation = ? AND is_tombstone = 0;
                                 """)
                             stmt.bindDouble(self.now, at: 1)
                             stmt.bindInt64(dirItem.itemId, at: 2)
+                            stmt.bindInt64(dirItem.localGeneration, at: 3)
+                            stmt.bindInt64(dirItem.remoteGeneration, at: 4)
+                            stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
                             _ = try stmt.step()
                             stmt.reset()
                         }

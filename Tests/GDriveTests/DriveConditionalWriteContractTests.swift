@@ -5,6 +5,47 @@ import Testing
 /// Explicit opt-in: operates only on a newly allocated file in the configured root.
 @Suite("Drive conditional write contract", .enabled(if: ProcessInfo.processInfo.environment["GDRIVE_CONDITIONAL_CONTRACT"] == "1"))
 struct DriveConditionalWriteContractTests {
+    @Test("Real Drive conditionally trashes metadata with ETag")
+    func metadataTrashPreconditions() async throws {
+        let auth = try Auth()
+        let config = await auth.authData()
+        let root = try #require(config.rootID)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
+        let id = try #require(try await client.generateIds(count: 1).first)
+        let initial = Data("conditional trash".utf8)
+        _ = try await client.uploadMultipart(
+            name: "trash-contract-\(UUID().uuidString).txt", parentId: root, remoteId: id,
+            content: initial, expectedSha256: SyncEngine.computeSha256(of: initial))
+        defer { Task { try? await client.trash(remoteId: id) } }
+
+        let token = try await client.getValidToken()
+        var read = URLRequest(
+            url: URL(string: "https://www.googleapis.com/drive/v3/files/\(id)?fields=id,version,trashed")!)
+        read.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (_, response) = try await client.executeRequest(read)
+        let etag = try #require(response.value(forHTTPHeaderField: "ETag"))
+
+        var invalid = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(id)")!)
+        invalid.httpMethod = "PATCH"
+        invalid.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        invalid.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        invalid.setValue("\"never-valid\"", forHTTPHeaderField: "If-Match")
+        invalid.httpBody = try JSONSerialization.data(withJSONObject: ["trashed": true])
+        let (_, rejected) = try await client.executeRequest(
+            invalid, maxRetries: 0, acceptableStatusCodes: [200, 412])
+        #expect(rejected.statusCode == 412)
+        #expect(try await client.getFile(remoteId: id).trashed == false)
+
+        var matching = invalid
+        matching.setValue(etag, forHTTPHeaderField: "If-Match")
+        let (_, accepted) = try await client.executeRequest(
+            matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
+        #expect(accepted.statusCode == 200)
+        let (_, stale) = try await client.executeRequest(
+            matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
+        #expect(stale.statusCode == 412)
+    }
+
     @Test("Real Drive rejects stale media writes and accepts a matching ETag")
     func mediaPreconditions() async throws {
         let auth = try Auth()

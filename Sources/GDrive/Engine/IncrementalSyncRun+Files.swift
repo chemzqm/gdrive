@@ -507,74 +507,83 @@ extension IncrementalSyncRun {
     }
 
     private func scheduleRemoteDeletion(_ item: DirtyRecord) async throws {
-        try await acquireTransfer()
-        syncGroup.enter()
-        Task {
-            defer {
-                syncSemaphore.signal()
-                syncGroup.leave()
-            }
-            do {
-                if let rId = item.remoteFileId {
-                    try await engine.client.trash(remoteId: rId)
-                }
-                try await engine.store.batchWrite { conn in
-                    let stmt = try conn.cachedStatement(
-                        """
-                        UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                        """)
-                    stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-                    stmt.bindInt64(item.itemId, at: 2)
-                    _ = try stmt.step()
-                    stmt.reset()
-                }
-                actionTracker.counts.withLock { $0.deleted += 1 }
-            } catch {
-                actionTracker.recordDatabaseFailure(error)
-                engine.logger.error("Remote file deletion failed [\(item.name)]: \(error)")
-            }
+        // Drive's metadata PATCH precondition contract has not been demonstrated by the
+        // real-service contract test. A GET followed by PATCH still permits a newer
+        // remote revision to arrive between the requests, so retain the deletion intent.
+        try await engine.store.write { conn in
+            let stmt = try conn.cachedStatement(
+                """
+                UPDATE items SET phase = 'blocked', updated_at = ?
+                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                    AND dirty_generation = ? AND is_tombstone = 0;
+                """)
+            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
+            stmt.bindInt64(item.itemId, at: 2)
+            stmt.bindInt64(item.localGeneration, at: 3)
+            stmt.bindInt64(item.remoteGeneration, at: 4)
+            stmt.bindInt64(item.dirtyGeneration, at: 5)
+            _ = try stmt.step()
+            stmt.reset()
         }
+        engine.logger.error(
+            "Remote file deletion blocked because Drive conditional metadata updates are unverified [\(item.name)]"
+        )
     }
 
     private func deleteLocalFile(_ item: DirtyRecord) async throws {
         let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
         let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
         let localFileURL = rootURL.appendingPathComponent(relPath)
-        var trashSucceeded = true
-
-        if FileManager.default.fileExists(atPath: localFileURL.path) {
-            var trashURL: NSURL?
-            do {
-                try FileManager.default.trashItem(
-                    at: localFileURL, resultingItemURL: &trashURL)
-            } catch {
-                trashSucceeded = false
-                engine.logger.warning(
-                    "Unable to move local file to Trash [\(relPath)]: \(error). Keeping it locally and marking the operation blocked; permanent deletion is disabled."
-                )
-            }
+        let trashSucceeded: Bool
+        do {
+            trashSucceeded = try LocalDeletionSafety.trashFileIfUnchanged(
+                at: localFileURL,
+                expectedDevice: item.localDevice,
+                expectedInode: item.localInode,
+                expectedMtime: item.localMtime,
+                expectedSize: item.local?.size,
+                expectedSHA256: item.local?.sha256)
+        } catch {
+            engine.logger.warning(
+                "Unable to safely move local file to Trash [\(relPath)]: \(error). Keeping the deletion pending."
+            )
+            trashSucceeded = false
         }
 
         if trashSucceeded {
             try await engine.store.batchWrite { conn in
                 let stmt = try conn.cachedStatement(
                     """
-                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ?
+                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                        AND dirty_generation = ? AND is_tombstone = 0;
                     """)
                 stmt.bindDouble(self.now, at: 1)
                 stmt.bindInt64(item.itemId, at: 2)
+                stmt.bindInt64(item.localGeneration, at: 3)
+                stmt.bindInt64(item.remoteGeneration, at: 4)
+                stmt.bindInt64(item.dirtyGeneration, at: 5)
                 _ = try stmt.step()
                 stmt.reset()
+                guard conn.changes == 1 else {
+                    throw SyncEngineError.general(
+                        "Local deletion receipt is stale; the newer generation remains pending: \(relPath)")
+                }
             }
             actionTracker.counts.withLock { $0.deleted += 1 }
         } else {
             try await engine.store.batchWrite { conn in
                 let stmt = try conn.cachedStatement(
                     """
-                    UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
+                    UPDATE items SET phase = 'blocked', updated_at = ?
+                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
+                        AND dirty_generation = ? AND is_tombstone = 0;
                     """)
                 stmt.bindDouble(self.now, at: 1)
                 stmt.bindInt64(item.itemId, at: 2)
+                stmt.bindInt64(item.localGeneration, at: 3)
+                stmt.bindInt64(item.remoteGeneration, at: 4)
+                stmt.bindInt64(item.dirtyGeneration, at: 5)
                 _ = try stmt.step()
                 stmt.reset()
             }

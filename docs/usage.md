@@ -103,7 +103,9 @@ for conflict in conflicts {
 未解决期间，远端新版本会更新 conflicts 文件；远端删除只更新冲突状态。该路径不会传播上传或
 删除操作，其他路径继续正常同步。
 
-一侧删除而另一侧仍为已同步基线内容时，删除会直接扩散；另一侧已修改时则进入冲突。
+一侧删除而另一侧仍为已同步基线内容时会产生删除意图；本地删除使用原子隔离和版本复核后执行。
+Google Drive 尚未提供本项目已验证的条件元数据 PATCH，因此本地到远端的自动删除会保持 blocked，
+不会发送存在竞态窗口的无条件 Trash 请求。另一侧已修改时则进入冲突。
 此时 resolution 表示调用方选择的最终状态：选择已删除的一侧会把删除扩散到另一侧，选择已修改的
 一侧会恢复被删除的一侧。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
@@ -286,7 +288,7 @@ Google Drive 文件夹 ID；找不到完整绑定时会在扫描和任何远端�
      - 云端重命名或移动：通过 Changes 事件感知，本地直接在磁盘执行原子 `moveItem`，保持两端拓扑对齐。
   3. **删除与废纸篓保护**：
      - 云端删除项：本地优先调用 `FileManager.default.trashItem` 移入 macOS 系统废纸篓，杜绝硬删除丢失数据。
-     - 本地删除项：云端调用 `trash(remoteId:)` 移入 Google Drive 回收站（`trashed: true`），两端皆可安全找回。
+     - 本地删除项：在 Google Drive 条件元数据 PATCH 契约得到真实验证前保留为 blocked，不发送无条件 Trash 请求。
   4. **冲突解决**：
      - 若双端同时修改且 SHA-256 摘要不同，先保留并上传本地冲突副本，再将远端内容发布到原路径；
        两项基线提交后才计入 `conflictsResolved`。失败时保留待恢复操作，见 [A12 验收记录](a12-validation.md)。

@@ -407,7 +407,7 @@ struct FailureStateSafetyTests {
         #expect(renames.filePatchCount == (failRename ? 2 : 1))
     }
 
-    @Test("Remote trash failure does not mark item as tombstone in SQLite; retry succeeds")
+    @Test("Remote trash remains pending without a verified conditional metadata update")
     func testRemoteTrashFailurePreservesItemAndRetries() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_trash_\(UUID().uuidString)")
@@ -536,17 +536,19 @@ struct FailureStateSafetyTests {
             #expect(stmt.columnInt64(at: 0) == 0, "Item must NOT be marked tombstone when trash fails")
         }
 
-        // 2. Retry with trash succeeding
+        // A retry still must not issue an unconditional PATCH.
         control.shouldFail = false
         let stats2 = try await engine.syncIncremental(localPath: localRootDir.path)
-        #expect(stats2.filesDeleted == 1, "Successful trash should be counted in filesDeleted")
+        #expect(stats2.filesDeleted == 0)
 
-        // In SQLite: is_tombstone should now be 1
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare(
+                "SELECT is_tombstone, phase, dirty_generation FROM items WHERE item_id = ?;")
             stmt.bindInt64(fileItemId, at: 1)
             #expect(try stmt.step())
-            #expect(stmt.columnInt64(at: 0) == 1, "Item must be marked tombstone after trash succeeds")
+            #expect(stmt.columnInt64(at: 0) == 0)
+            #expect(stmt.columnText(at: 1) == "blocked")
+            #expect((stmt.columnInt64(at: 2) ?? 0) > 0)
         }
     }
 

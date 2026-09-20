@@ -399,7 +399,7 @@ struct DirectoryBarrierTests {
         }
     }
 
-    @Test("Scenario 3: Bottom-up safe directory clean when all children deleted locally")
+    @Test("Scenario 3: Remote deletion stays blocked until conditional metadata updates are verified")
     func testBottomUpDirectorySafeCleanup() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test3_\(UUID().uuidString)")
@@ -554,35 +554,23 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
-        // Verification:
-        // 1. Delete the file first, then press bottom-up (level2 depth greater than level1)Delete remote directories sequentially
-        #expect(trashedRemoteOrder.contains(fileRemoteId))
-        #expect(trashedRemoteOrder.contains(childDirRemoteId))
-        #expect(trashedRemoteOrder.contains(parentDirRemoteId))
+        #expect(trashedRemoteOrder.isEmpty)
 
-        let fileIdx = trashedRemoteOrder.firstIndex(of: fileRemoteId)!
-        let level2Idx = trashedRemoteOrder.firstIndex(of: childDirRemoteId)!
-        let level1Idx = trashedRemoteOrder.firstIndex(of: parentDirRemoteId)!
-
-        #expect(fileIdx < level2Idx, "File must be deleted before its parent directory")
-        #expect(level2Idx < level1Idx, "Deeper directory level2 must be deleted before shallower level1")
-
-        // 2. All levels in the database are converted to tombstone
+        // No item may be tombstoned. The file deletion intent remains blocked; its
+        // ancestor barriers are restored because that child still exists remotely.
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT is_tombstone, phase FROM items WHERE item_id IN (?, ?, ?);")
-            // level1
-            stmt.bindInt64(level1ItemId, at: 1)
-            // level2
-            stmt.bindInt64(level2ItemId, at: 2)
-            // file
-            stmt.bindInt64(fileItemId, at: 3)
-            var count = 0
-            while try stmt.step() {
-                #expect(stmt.columnInt64(at: 0) == 1, "Must be marked tombstone")
-                #expect(stmt.columnText(at: 1) == "committed")
-                count += 1
-            }
-            #expect(count == 3)
+            let all = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id IN (?, ?, ?) AND is_tombstone = 0;")
+            all.bindInt64(level1ItemId, at: 1)
+            all.bindInt64(level2ItemId, at: 2)
+            all.bindInt64(fileItemId, at: 3)
+            #expect(try all.step())
+            #expect(all.columnInt64(at: 0) == 3)
+
+            let file = try conn.prepare("SELECT phase, dirty_generation FROM items WHERE item_id = ?;")
+            file.bindInt64(fileItemId, at: 1)
+            #expect(try file.step())
+            #expect(file.columnText(at: 0) == "blocked")
+            #expect((file.columnInt64(at: 1) ?? 0) > 0)
         }
     }
 
@@ -774,6 +762,8 @@ struct DirectoryBarrierTests {
         let contentData = Data("Content to delete".utf8)
         try contentData.write(to: childFile)
         let validSha256 = SHA256.hash(data: contentData).map { String(format: "%02x", $0) }.joined()
+        let observedChildVersion = try LocalFileVersion.read(at: childFile)
+        let childVersion = try #require(observedChildVersion)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -834,7 +824,7 @@ struct DirectoryBarrierTests {
                     local_generation, local_status, phase, dirty_generation, created_at, updated_at
                 ) VALUES (
                     ?, ?, 'child.txt', 'file', ?,
-                    1, 2, 100, ?, ?,
+                    ?, ?, ?, ?, ?,
                     ?, ?,
                     ?, ?, 'trashed',
                     1, 'present', 'ready', 1, 100, 100
@@ -843,12 +833,15 @@ struct DirectoryBarrierTests {
             stmt.bindInt64(rootId, at: 1)
             stmt.bindInt64(subDirItemId, at: 2)
             stmt.bindText(childFileRemoteId, at: 3)
-            stmt.bindInt64(Int64(contentData.count), at: 4)
-            stmt.bindText(validSha256, at: 5)
-            stmt.bindText(validSha256, at: 6)
+            stmt.bindInt64(childVersion.device, at: 4)
+            stmt.bindInt64(childVersion.inode, at: 5)
+            stmt.bindInt64(childVersion.mtime, at: 6)
             stmt.bindInt64(Int64(contentData.count), at: 7)
             stmt.bindText(validSha256, at: 8)
-            stmt.bindInt64(Int64(contentData.count), at: 9)
+            stmt.bindText(validSha256, at: 9)
+            stmt.bindInt64(Int64(contentData.count), at: 10)
+            stmt.bindText(validSha256, at: 11)
+            stmt.bindInt64(Int64(contentData.count), at: 12)
             _ = try stmt.step()
             return conn.lastInsertRowId
         }

@@ -349,14 +349,18 @@ struct ChangesRecoveryTests {
 
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
 
-        #expect(stats.filesDeleted == 1)
+        #expect(stats.filesDeleted == 0)
         #expect(!FileManager.default.fileExists(atPath: localDirectory.path))
-        let tombstone = try await testFixture.store.read { conn in
-            let queryStatement = try conn.prepare("SELECT is_tombstone, local_status FROM items WHERE remote_file_id = 'known-directory';")
+        let retained = try await testFixture.store.read { conn in
+            let queryStatement = try conn.prepare(
+                "SELECT is_tombstone, local_status, phase, dirty_generation FROM items WHERE remote_file_id = 'known-directory';")
             guard try queryStatement.step() else { return false }
-            return queryStatement.columnInt64(at: 0) == 1 && queryStatement.columnText(at: 1) == "absent"
+            return queryStatement.columnInt64(at: 0) == 0
+                && queryStatement.columnText(at: 1) == "absent"
+                && queryStatement.columnText(at: 2) == "blocked"
+                && (queryStatement.columnInt64(at: 3) ?? 0) > 0
         }
-        #expect(tombstone)
+        #expect(retained)
     }
 
     @Test("Child before parent across pages survives a page failure and database reopen")

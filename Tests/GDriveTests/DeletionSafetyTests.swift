@@ -5,6 +5,89 @@ import Testing
 @Suite("Deletion Safety Tests (A03)")
 struct DeletionSafetyTests {
 
+    @Test("Local deletion rejects rewrites and atomic replacements after observation")
+    func localDeletionRejectsNewEvidence() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        try Data("baseline".utf8).write(to: file)
+        let observed = try LocalFileVersion.read(at: file)
+        let expected = try #require(observed)
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+
+        try Data("modified".utf8).write(to: file, options: .atomic)
+        let modifiedWasDeleted = try LocalDeletionSafety.trashFileIfUnchanged(
+            at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+            expectedMtime: expected.mtime, expectedSize: expected.size, expectedSHA256: sha)
+        #expect(!modifiedWasDeleted)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "modified")
+    }
+
+    @Test("A file created after deletion isolation remains visible")
+    func localDeletionPreservesPostIsolationFile() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-isolation-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        try Data("baseline".utf8).write(to: file)
+        let observed = try LocalFileVersion.read(at: file)
+        let expected = try #require(observed)
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+
+        let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
+            at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+            expectedMtime: expected.mtime, expectedSize: expected.size, expectedSHA256: sha,
+            afterIsolation: { try Data("new version".utf8).write(to: file) })
+
+        #expect(!deleted)
+        #expect(try String(contentsOf: file, encoding: .utf8) == "new version")
+    }
+
+    @Test("A trash failure restores the isolated local file")
+    func localDeletionRestoresAfterTrashFailure() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-trash-failure-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        try Data("baseline".utf8).write(to: file)
+        let observed = try LocalFileVersion.read(at: file)
+        let expected = try #require(observed)
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+
+        enum TrashFailure: Error { case denied }
+        #expect(throws: TrashFailure.self) {
+            try LocalDeletionSafety.trashFileIfUnchanged(
+                at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+                expectedMtime: expected.mtime, expectedSize: expected.size,
+                expectedSHA256: sha, trash: { _, _ in throw TrashFailure.denied })
+        }
+        #expect(try String(contentsOf: file, encoding: .utf8) == "baseline")
+    }
+
+    @Test("Hidden directory entries and enumeration failures block deletion")
+    func directoryDeletionRequiresConfirmedEmptyDirectory() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("directory-delete-safety-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let hidden = directory.appendingPathComponent(".secret")
+        try Data("keep".utf8).write(to: hidden)
+
+        let hiddenResult = try LocalDeletionSafety.trashDirectoryIfEmpty(at: directory)
+        #expect(!hiddenResult)
+        #expect(FileManager.default.fileExists(atPath: hidden.path))
+
+        enum EnumerationFailure: Error { case denied }
+        let failureResult = try? LocalDeletionSafety.trashDirectoryIfEmpty(
+            at: directory, contents: { _ in throw EnumerationFailure.denied })
+        #expect(failureResult == nil)
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+    }
+
     @Test("change.removed == true does NOT trash or delete local file, sets phase to blocked")
     func testRemovedDoesNotDeleteLocal() async throws {
         let tempDB = FileManager.default.temporaryDirectory

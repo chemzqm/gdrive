@@ -514,9 +514,9 @@ struct LocalChangesLiveTests {
             }
 
             let remainingChildren = try await client.listChildren(parentId: remoteRoot.id)
-            #expect(!remainingChildren.contains(where: { $0.id == guardedRemote.id }))
+            #expect(remainingChildren.contains(where: { $0.id == guardedRemote.id }))
             let trashedGuardedRemote = try await client.getFile(remoteId: guardedRemote.id)
-            #expect(trashedGuardedRemote.trashed == true)
+            #expect(trashedGuardedRemote.trashed == false)
             let healthyAfterDrain = try #require(remainingChildren.first(where: { $0.id == healthyRemote.id }))
             #expect(healthyAfterDrain.sha256Checksum?.lowercased() == SyncEngine.computeSha256(of: healthyData).lowercased())
 
@@ -545,9 +545,9 @@ struct LocalChangesLiveTests {
             }
             #expect(deletedRecord.remoteID == guardedRemote.id)
             #expect(deletedRecord.baseSHA?.lowercased() == originalSHA.lowercased())
-            #expect(deletedRecord.phase == "committed")
-            #expect(deletedRecord.dirtyGeneration == 0)
-            #expect(deletedRecord.isTombstone)
+            #expect(deletedRecord.phase == "blocked")
+            #expect(deletedRecord.dirtyGeneration > 0)
+            #expect(!deletedRecord.isTombstone)
 
             try await client.trash(remoteId: remoteRoot.id)
         } catch {
