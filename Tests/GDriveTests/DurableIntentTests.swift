@@ -330,7 +330,7 @@ struct DurableIntentTests {
             size: Int64(content.count),
             sha256: sha
         )
-        await DurableCreateIntentStore.markUnknownOutcome(
+        try await DurableCreateIntentStore.markUnknownOutcome(
             store: firstStore,
             operationID: intent.operationID,
             error: URLError(.networkConnectionLost)
@@ -431,7 +431,7 @@ struct DurableIntentTests {
             store: store, rootID: rootID, parentItemID: rootItemID, name: "parent",
             targetParentRemoteID: "remote-root", candidateRemoteID: "persisted-parent", device: 1, inode: 2
         )
-        await DurableCreateIntentStore.markUnknownOutcome(
+        try await DurableCreateIntentStore.markUnknownOutcome(
             store: store, operationID: intent.operationID, error: URLError(.networkConnectionLost)
         )
         let requests = SafeCounter(0)

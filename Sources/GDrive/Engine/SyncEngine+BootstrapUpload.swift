@@ -588,7 +588,7 @@ extension SyncEngine {
                 progress.recordSuccess(bytes: fileSize)
             } catch {
                 if let createIntent {
-                    await DurableCreateIntentStore.markUnknownOutcome(
+                    try? await DurableCreateIntentStore.markUnknownOutcome(
                         store: self.store,
                         operationID: createIntent.operationID,
                         error: error
@@ -659,7 +659,7 @@ extension SyncEngine {
                 return BootstrapDirectoryTarget(remoteID: intent.targetRemoteID, itemID: intent.itemID)
             } catch {
                 if let createIntent {
-                    await DurableCreateIntentStore.markUnknownOutcome(
+                    try? await DurableCreateIntentStore.markUnknownOutcome(
                         store: self.store,
                         operationID: createIntent.operationID,
                         error: error

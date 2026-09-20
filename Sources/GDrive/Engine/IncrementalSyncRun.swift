@@ -27,6 +27,7 @@ final class IncrementalSyncRun: Sendable {
     let scanProgress: ScanProgress
     let startTime: DispatchTime
     let recoveredConflicts: Int
+    let localChangeScope: LocalChangeScope?
 
     private init(
         engine: SyncEngine,
@@ -52,7 +53,8 @@ final class IncrementalSyncRun: Sendable {
         seenDirTracker: SeenItemsTracker,
         scanProgress: ScanProgress,
         startTime: DispatchTime,
-        recoveredConflicts: Int
+        recoveredConflicts: Int,
+        localChangeScope: LocalChangeScope?
     ) {
         self.engine = engine
         self.rootID = rootID
@@ -78,6 +80,7 @@ final class IncrementalSyncRun: Sendable {
         self.scanProgress = scanProgress
         self.startTime = startTime
         self.recoveredConflicts = recoveredConflicts
+        self.localChangeScope = localChangeScope
     }
 }
 
@@ -88,7 +91,8 @@ extension SyncEngine {
         localPath: String,
         remoteRootId: String,
         maxConcurrency: Int,
-        onProgress: (@Sendable (SyncProgress) -> Void)?
+        onProgress: (@Sendable (SyncProgress) -> Void)?,
+        localChanges: [LocalChange]? = nil
     ) async throws -> SyncStats {
         let run = try await IncrementalSyncRun.prepare(
             engine: self,
@@ -97,7 +101,8 @@ extension SyncEngine {
             localPath: localPath,
             remoteRootID: remoteRootId,
             maxConcurrency: maxConcurrency,
-            onProgress: onProgress
+            onProgress: onProgress,
+            localChanges: localChanges
         )
         return try await run.execute()
     }
@@ -111,7 +116,8 @@ extension IncrementalSyncRun {
         localPath: String,
         remoteRootID: String,
         maxConcurrency: Int,
-        onProgress: (@Sendable (SyncProgress) -> Void)?
+        onProgress: (@Sendable (SyncProgress) -> Void)?,
+        localChanges: [LocalChange]?
     ) async throws -> IncrementalSyncRun {
         let startTime = DispatchTime.now()
         let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
@@ -170,7 +176,8 @@ extension IncrementalSyncRun {
             startedTransfers: OSAllocatedUnfairLock(initialState: false),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
-            startTime: startTime, recoveredConflicts: recoveredConflicts
+            startTime: startTime, recoveredConflicts: recoveredConflicts,
+            localChangeScope: localChanges.map { LocalChangeScope(rootURL: rootURL, changes: $0) }
         )
         prepared = true
         return run
@@ -184,7 +191,7 @@ extension IncrementalSyncRun {
         let eligibleItems = dirtyItems.filter { item in
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
-            return !remoteGate.blocks(path)
+            return !remoteGate.blocks(path) && isInLocalScope(path)
         }
         let fileItems = eligibleItems.filter { $0.entryKind == "file" }
         let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
@@ -199,6 +206,10 @@ extension IncrementalSyncRun {
         try await engine.store.flush()
         try await reconcileDirectories(dirItems)
         return try await finish()
+    }
+
+    func isInLocalScope(_ relativePath: String) -> Bool {
+        localChangeScope?.includes(relativePath) ?? true
     }
 
     private func finish() async throws -> SyncStats {

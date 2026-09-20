@@ -127,13 +127,14 @@ extension IncrementalSyncRun {
             throw SyncEngineError.localRootNotFound(path: localPath)
         }
 
+        let localStatuses = localChangeScope == nil ? "'present'" : "'present', 'unknown'"
         try await engine.store.write { conn in
             // 1. File deletion detection
             let stmt = try conn.cachedStatement(
                 """
                 SELECT item_id, parent_id, name
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'file' AND local_status = 'present' AND is_tombstone = 0;
+                WHERE root_id = ? AND entry_kind = 'file' AND local_status IN (\(localStatuses)) AND is_tombstone = 0;
                 """)
             stmt.bindInt64(rootID, at: 1)
             var deletedIds: [Int64] = []
@@ -143,7 +144,8 @@ extension IncrementalSyncRun {
                     let name = stmt.columnText(at: 2) {
                     let parent = directoryContext.getRelPath(for: pId) ?? ""
                     let path = parent.isEmpty ? name : "\(parent)/\(name)"
-                    if !remoteGate.blocks(path) && !seenTracker.contains(parentId: pId, name: name) {
+                    if !remoteGate.blocks(path) && (localChangeScope?.coversMissing(path) ?? true)
+                        && !seenTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }
                 }
@@ -164,7 +166,7 @@ extension IncrementalSyncRun {
                     let name = dirStmt.columnText(at: 2) {
                     let parent = directoryContext.getRelPath(for: pId) ?? ""
                     let path = parent.isEmpty ? name : "\(parent)/\(name)"
-                    if !remoteGate.blocks(path)
+                    if !remoteGate.blocks(path) && (localChangeScope?.coversMissing(path) ?? true)
                         && !seenDirTracker.contains(parentId: pId, name: name) {
                         deletedIds.append(iId)
                     }

@@ -320,7 +320,7 @@ extension IncrementalSyncRun {
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 if let createIntent {
-                    await DurableCreateIntentStore.markUnknownOutcome(
+                    try? await DurableCreateIntentStore.markUnknownOutcome(
                         store: engine.store,
                         operationID: createIntent.operationID,
                         error: error

@@ -20,7 +20,7 @@ final class DirectoryContext: @unchecked Sendable {
 
     func register(
         itemId: Int64, parentItemId: Int64, name: String, remoteId: String,
-        remotePresent: Bool = true
+        remotePresent: Bool = true, updateDescendantPaths: Bool = false
     ) {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -31,6 +31,20 @@ final class DirectoryContext: @unchecked Sendable {
         }
         let parentPath = dirPaths[parentItemId] ?? ""
         let relPath = parentPath.isEmpty ? name : "\(parentPath)/\(name)"
+        if updateDescendantPaths, let oldPath = dirPaths[itemId], oldPath != relPath {
+            let affected = dirPaths.reduce(into: [Int64: (old: String, new: String)]()) { result, entry in
+                let (id, path) = entry
+                guard path == oldPath || path.hasPrefix(oldPath + "/") else { return }
+                result[id] = (path, relPath + path.dropFirst(oldPath.count))
+            }
+            for paths in affected.values {
+                dirIdByRelPath.removeValue(forKey: paths.old)
+            }
+            for (id, paths) in affected {
+                dirPaths[id] = paths.new
+                dirIdByRelPath[paths.new] = id
+            }
+        }
         dirPaths[itemId] = relPath
         dirRemoteIds[itemId] = remoteId
         dirIdByRemote[remoteId] = itemId
@@ -162,7 +176,7 @@ extension IncrementalSyncRun {
                         conn: conn, operationID: intent.operationID, now: timestamp)
                 }
             } catch {
-                await DurableCreateIntentStore.markUnknownOutcome(
+                try await DurableCreateIntentStore.markUnknownOutcome(
                     store: engine.store,
                     operationID: intent.operationID,
                     error: error

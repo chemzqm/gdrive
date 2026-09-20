@@ -56,6 +56,11 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
 /// Public entry points for bidirectional synchronization using SQLite baselines and SHA-256.
 /// Synchronization routing and mode implementations are split across SyncEngine extensions.
 public final class SyncEngine: Sendable {
+    private struct PendingRoot: Sendable {
+        let id: Int64
+        let item: Int64
+        let remote: String
+    }
     public let auth: Auth
     public let store: StateStore
     public let client: DriveClient
@@ -71,7 +76,6 @@ public final class SyncEngine: Sendable {
         downloadTemporaryDirectoryStorage.withLock { $0 = directory }
     }
     let logger = Logger(label: "gdrive.engine")
-
     typealias DirectoryScan = @Sendable (ScanRequest, @escaping @Sendable (ScanBatch) async throws -> Void) async throws -> Void
     typealias IncrementalScan = DirectoryScan
     static let defaultDirectoryScan: DirectoryScan = { request, consume in
@@ -139,9 +143,10 @@ public final class SyncEngine: Sendable {
         concurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await withRootSyncLock(localPath: localPath) {
+        let normalizedLocalPath = Self.normalizedPath(localPath)
+        return try await withRootSyncLock(localPath: normalizedLocalPath) {
             try await self.syncUnlocked(
-                localPath: localPath,
+                localPath: normalizedLocalPath,
                 remoteFolderId: remoteFolderId,
                 concurrency: concurrency,
                 onProgress: onProgress
@@ -157,9 +162,10 @@ public final class SyncEngine: Sendable {
         maxUploadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await withRootSyncLock(localPath: localPath) {
+        let normalizedLocalPath = Self.normalizedPath(localPath)
+        return try await withRootSyncLock(localPath: normalizedLocalPath) {
             try await self.syncLocalToRemoteEmptyUnlocked(
-                localPath: localPath,
+                localPath: normalizedLocalPath,
                 remoteRootId: remoteRootId,
                 maxUploadConcurrency: maxUploadConcurrency,
                 onProgress: onProgress
@@ -175,8 +181,9 @@ public final class SyncEngine: Sendable {
         maxDownloadConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await withRootSyncLock(localPath: localPath) {
-            try await self.initializeRemoteToLocalEmpty(localPath: localPath, remoteRootId: remoteRootId,
+        let normalizedLocalPath = Self.normalizedPath(localPath)
+        return try await withRootSyncLock(localPath: normalizedLocalPath) {
+            try await self.initializeRemoteToLocalEmpty(localPath: normalizedLocalPath, remoteRootId: remoteRootId,
                 maxDownloadConcurrency: maxDownloadConcurrency, onProgress: onProgress, initialCursor: nil)
         }
     }
@@ -190,14 +197,34 @@ public final class SyncEngine: Sendable {
         maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await withRootSyncLock(localPath: localPath) {
+        let normalizedLocalPath = Self.normalizedPath(localPath)
+        return try await withRootSyncLock(localPath: normalizedLocalPath) {
             try await self.syncIncrementalUnlocked(
-                localPath: localPath,
+                localPath: normalizedLocalPath,
                 remoteRootId: remoteRootId,
                 maxConcurrency: maxConcurrency,
                 onProgress: onProgress
             )
         }
+    }
+
+    /// Registers watcher observations and returns after admission. Transfers run
+    /// after the current whole-root round, or in a new background round when idle.
+    public func notifyLocalChanges(_ changes: [LocalChange]) async throws {
+        guard !changes.isEmpty else { return }
+        let normalized = changes.map(Self.normalizedLocalChange)
+        let roots = try await resolveNotificationRoots(for: normalized)
+        for (root, rootChanges) in roots {
+            let shouldStart = await RootSyncCoordinator.shared.enqueue(rootChanges, for: root)
+            if shouldStart {
+                Task { await self.drainPendingLocalChanges(localRootPath: root) }
+            }
+        }
+    }
+
+    /// Returns process-local watcher queue state.
+    public func pendingLocalChangeStatus() async -> [PendingLocalChangeStatus] {
+        await RootSyncCoordinator.shared.statuses()
     }
 
     /// Perform bidirectional incremental synchronization
@@ -210,11 +237,12 @@ public final class SyncEngine: Sendable {
         maxConcurrency: Int = 64,
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
-        try await withRootSyncLock(localPath: localPath) {
+        let normalizedLocalPath = Self.normalizedPath(localPath)
+        return try await withRootSyncLock(localPath: normalizedLocalPath) {
             try await self.syncIncrementalUnlocked(
                 rootId: rootId,
                 rootItemId: rootItemId,
-                localPath: localPath,
+                localPath: normalizedLocalPath,
                 remoteRootId: remoteRootId,
                 maxConcurrency: maxConcurrency,
                 onProgress: onProgress
@@ -228,15 +256,103 @@ public final class SyncEngine: Sendable {
         localPath: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
+        let resolvedLocalPath = Self.normalizedPath(localPath)
         try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
         do {
             let result = try await operation()
-            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+            await drainPendingLocalChanges(localRootPath: resolvedLocalPath)
             return result
         } catch {
-            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+            if !(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: resolvedLocalPath)) {
+                Task { await self.drainPendingLocalChanges(localRootPath: resolvedLocalPath) }
+            }
             throw error
         }
+    }
+
+    private static func normalizedPath(_ path: String) -> String {
+        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+    }
+
+    private static func normalizedLocalChange(_ change: LocalChange) -> LocalChange {
+        switch change {
+        case .created(let path, let isDirectory): return .created(path: normalizedPath(path), isDirectory: isDirectory)
+        case .modified(let path, let isDirectory): return .modified(path: normalizedPath(path), isDirectory: isDirectory)
+        case .deleted(let path, let isDirectory): return .deleted(path: normalizedPath(path), isDirectory: isDirectory)
+        case .moved(let from, let destination, let isDirectory):
+            return .moved(from: normalizedPath(from), to: normalizedPath(destination), isDirectory: isDirectory)
+        }
+    }
+
+    private func resolveNotificationRoots(for changes: [LocalChange]) async throws -> [(String, [LocalChange])] {
+        let paths = changes.flatMap(\.paths)
+        let active = await RootSyncCoordinator.shared.activeRoots(containing: paths)
+        let databaseRoots: [String] = try await store.read { conn in
+            let stmt = try conn.cachedStatement("SELECT local_root_path FROM roots WHERE is_active = 1;")
+            defer { stmt.reset() }
+            var result: [String] = []
+            while try stmt.step(), let path = stmt.columnText(at: 0) { result.append(Self.normalizedPath(path)) }
+            return result
+        }
+        let candidates = Set(active + databaseRoots)
+        var routed: [String: [LocalChange]] = [:]
+        for change in changes {
+            let matching = candidates.filter { root in change.paths.allSatisfy { RootSyncCoordinator.contains($0, in: root) } }
+            guard let root = matching.max(by: { $0.count < $1.count }) else {
+                throw SyncEngineError.general("No single configured local root contains local change paths: \(change.paths.joined(separator: ", "))")
+            }
+            routed[root, default: []].append(change)
+        }
+        return routed.map { ($0.key, $0.value) }
+    }
+
+    private func drainPendingLocalChanges(localRootPath: String) async {
+        while true {
+            guard let batch = await RootSyncCoordinator.shared.takePending(for: localRootPath) else {
+                if await RootSyncCoordinator.shared.finishIfIdle(localRootPath: localRootPath) { return }
+                continue
+            }
+            do {
+                try await runPendingLocalChanges(batch.changes, localRootPath: localRootPath)
+            } catch is CancellationError {
+                logger.warning("Discarded cancelled pending local changes for \(localRootPath)")
+                Task { await self.drainPendingLocalChanges(localRootPath: localRootPath) }
+                return
+            } catch {
+                logger.error("Discarded failed pending local changes for \(localRootPath): \(error)")
+            }
+        }
+    }
+
+    private func runPendingLocalChanges(_ changes: [LocalChange], localRootPath: String) async throws {
+        guard let root = try await pendingRoot(localRootPath: localRootPath) else {
+            logger.warning(
+                "Discard pending local changes because no active root binding exists [\(localRootPath), changes=\(changes.count)]")
+            return
+        }
+        _ = try await syncIncrementalUnlocked(rootId: root.id, rootItemId: root.item, localPath: localRootPath,
+            remoteRootId: root.remote, maxConcurrency: 64, onProgress: nil, localChanges: changes)
+    }
+
+    private func pendingRoot(localRootPath: String) async throws -> PendingRoot? {
+        let root: PendingRoot? = try await store.read { conn in
+            let stmt = try conn.cachedStatement("SELECT root_id, remote_root_id, local_root_path FROM roots WHERE is_active = 1;")
+            defer { stmt.reset() }
+            var record: (Int64, String)?
+            while try stmt.step() {
+                if let id = stmt.columnInt64(at: 0), let remote = stmt.columnText(at: 1),
+                   let path = stmt.columnText(at: 2), Self.normalizedPath(path) == localRootPath {
+                    record = (id, remote)
+                    break
+                }
+            }
+            guard let record else { return nil }
+            let item = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
+            item.bindInt64(record.0, at: 1)
+            defer { item.reset() }
+            guard try item.step(), let rootItem = item.columnInt64(at: 0) else { return nil }
+            return PendingRoot(id: record.0, item: rootItem, remote: record.1)
+        }
+        return root
     }
 }

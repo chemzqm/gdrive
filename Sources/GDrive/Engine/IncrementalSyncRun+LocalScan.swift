@@ -1,3 +1,4 @@
+import Darwin
 import DirectoryScanner
 import Foundation
 import os
@@ -66,7 +67,6 @@ extension IncrementalSyncRun {
             pathPrefix: prefixBytes
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
-        let request = ScanRequest(root: localPath, filters: scanFilters, options: scanOptions)
 
         struct ExistingLocalItem: Sendable {
             let itemId: Int64
@@ -215,10 +215,59 @@ extension IncrementalSyncRun {
         let seenTracker = self.seenTracker
         let seenDirTracker = self.seenDirTracker
         let scanProgress = self.scanProgress
+        let localChangeScope = self.localChangeScope
+
+        @Sendable func directoryParentID(
+            relPath: String, parentRelPath: String, name: String
+        ) async throws -> Int64 {
+            guard localChangeScope != nil else {
+                return directoryContext.getItemId(byRelPath: parentRelPath) ?? rootItemID
+            }
+            guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
+                throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
+            }
+            let kind: String? = try await engine.store.read { conn in
+                let stmt = try conn.cachedStatement(
+                    "SELECT entry_kind FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;")
+                stmt.bindInt64(rootID, at: 1)
+                stmt.bindInt64(parentItemID, at: 2)
+                stmt.bindText(name, at: 3)
+                defer { stmt.reset() }
+                guard try stmt.step() else { return nil }
+                return stmt.columnText(at: 0)
+            }
+            if kind == "file" {
+                throw SyncEngineError.general("Local directory replaces an existing file at \(relPath); preserving the baseline")
+            }
+            return parentItemID
+        }
+
+        @Sendable func fileParentID(relPath: String, parentRelPath: String) throws -> Int64 {
+            guard localChangeScope != nil else {
+                return directoryContext.getItemId(byRelPath: parentRelPath) ?? rootItemID
+            }
+            guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
+                throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
+            }
+            guard directoryContext.getItemId(byRelPath: relPath) == nil else {
+                throw SyncEngineError.general("Local file replaces an existing directory at \(relPath); preserving the baseline")
+            }
+            return parentItemID
+        }
+
+        @Sendable func remoteParentID(parentItemID: Int64, relPath: String) throws -> String {
+            guard localChangeScope != nil else {
+                return directoryContext.getRemoteId(for: parentItemID) ?? remoteRootID
+            }
+            guard let remoteID = directoryContext.getRemoteId(for: parentItemID) else {
+                throw SyncEngineError.general("Missing remote directory parent while creating \(relPath)")
+            }
+            return remoteID
+        }
 
         @Sendable func observeDirectory(_ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String) async throws {
-            let parentItemId =
-                directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
+            let parentItemId = try await directoryParentID(
+                relPath: relPath, parentRelPath: parentRelNormalized, name: name)
             let dev = record.dev
             let ino = record.ino
 
@@ -241,7 +290,8 @@ extension IncrementalSyncRun {
                             let pId = stmt.columnInt64(at: 1),
                             let itemName = stmt.columnText(at: 2) {
                             let rId = stmt.columnText(at: 3)
-                            return ExistingLocalItem(itemId: iId, parentId: pId, name: itemName, remoteId: rId)
+                            return ExistingLocalItem(
+                                itemId: iId, parentId: pId, name: itemName, remoteId: rId)
                         }
                         return nil
                     }
@@ -258,43 +308,37 @@ extension IncrementalSyncRun {
                 seenDirTracker.markSeen(
                     parentId: existing.parentId, name: existing.name)
                 do {
-                    if let rId = existing.remoteId {
-                        let oldPRemote = directoryContext.getRemoteId(
-                            for: existing.parentId)
-                        let newPRemote = directoryContext.getRemoteId(for: parentItemId)
-                        let addP =
-                            (parentItemId != existing.parentId) ? newPRemote : nil
-                        let remP =
-                            (parentItemId != existing.parentId) ? oldPRemote : nil
+                    if let remoteID = existing.remoteId {
+                        let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
+                        let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
+                        let moving = parentItemId != existing.parentId
                         _ = try await engine.client.updateMetadata(
-                            remoteId: rId, newName: name, addParentId: addP,
-                            removeParentId: remP)
+                            remoteId: remoteID, newName: name,
+                            addParentId: moving ? newParentRemoteID : nil,
+                            removeParentId: moving ? oldParentRemoteID : nil)
                     }
                     try await engine.store.write { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;
-                            """)
-                        stmt.bindText(name, at: 1)
-                        stmt.bindInt64(parentItemId, at: 2)
-                        stmt.bindDouble(now, at: 3)
-                        stmt.bindInt64(existing.itemId, at: 4)
-                        _ = try stmt.step()
-                        stmt.reset()
+                        let statement = try conn.cachedStatement(
+                            "UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;")
+                        statement.bindText(name, at: 1)
+                        statement.bindInt64(parentItemId, at: 2)
+                        statement.bindDouble(now, at: 3)
+                        statement.bindInt64(existing.itemId, at: 4)
+                        _ = try statement.step()
+                        statement.reset()
                     }
                     seenDirTracker.markSeen(parentId: parentItemId, name: name)
                     directoryContext.register(
                         itemId: existing.itemId, parentItemId: parentItemId, name: name,
-                        remoteId: existing.remoteId ?? "")
+                        remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
                 } catch {
                     engine.logger.error(
-                        "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)"
-                    )
+                        "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
+                    return
                 }
             } else if directoryContext.getItemId(byRelPath: relPath) == nil {
                 // Create a new local directory
-                let remoteParentId =
-                    directoryContext.getRemoteId(for: parentItemId) ?? remoteRootID
+                let remoteParentId = try remoteParentID(parentItemID: parentItemId, relPath: relPath)
                 var intent: DurableCreateIntent?
                 do {
                     let candidateRemoteID = try await engine.idPool.nextId()
@@ -339,7 +383,7 @@ extension IncrementalSyncRun {
                     scanProgress.incDirs()
                 } catch {
                     if let intent {
-                        await DurableCreateIntentStore.markUnknownOutcome(
+                        try await DurableCreateIntentStore.markUnknownOutcome(
                             store: engine.store,
                             operationID: intent.operationID,
                             error: error
@@ -356,8 +400,9 @@ extension IncrementalSyncRun {
         @Sendable func observeFile(_ record: DiscoveredRecord, fullPath: String, parentRelNormalized: String, name: String,
                                    pendingObservations: inout [IncrementalLocalObservation], firstObservationSent: inout Bool) async throws {
             scanProgress.incScanned()
-            let parentItemId =
-                directoryContext.getItemId(byRelPath: parentRelNormalized) ?? rootItemID
+            let relativePath = parentRelNormalized.isEmpty ? name : "\(parentRelNormalized)/\(name)"
+            let parentItemId = try fileParentID(
+                relPath: relativePath, parentRelPath: parentRelNormalized)
             let dev = record.dev
             let ino = record.ino
             let mtime = record.mtime
@@ -366,8 +411,9 @@ extension IncrementalSyncRun {
             // The cache only contains committed, clean remote-present baselines.
             // Matching the path as well as identity preserves the rename path below,
             // while an ordinary unchanged file needs no per-item SQLite round trip.
-            if let cached = baselineCache.lookupUnchanged(
-                device: dev, inode: ino, mtime: mtime, size: fileSize),
+            if !(localChangeScope?.includes(relativePath) ?? false),
+                let cached = baselineCache.lookupUnchanged(
+                    device: dev, inode: ino, mtime: mtime, size: fileSize),
                 cached.parentId == parentItemId, cached.name == name {
                 seenTracker.markSeen(parentId: parentItemId, name: name)
                 scanProgress.incSkipped()
@@ -393,7 +439,8 @@ extension IncrementalSyncRun {
                             let pId = stmt.columnInt64(at: 1),
                             let itemName = stmt.columnText(at: 2) {
                             let rId = stmt.columnText(at: 3)
-                            return ExistingLocalItem(itemId: iId, parentId: pId, name: itemName, remoteId: rId)
+                            return ExistingLocalItem(
+                                itemId: iId, parentId: pId, name: itemName, remoteId: rId)
                         }
                         return nil
                     }
@@ -411,40 +458,29 @@ extension IncrementalSyncRun {
                 // Local files are renamed or moved
                 seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
                 do {
-                    if let rId = existing.remoteId {
-                        let oldPRemote = directoryContext.getRemoteId(
-                            for: existing.parentId)
-                        let newPRemote = directoryContext.getRemoteId(for: parentItemId)
-                        let addP =
-                            (parentItemId != existing.parentId) ? newPRemote : nil
-                        let remP =
-                            (parentItemId != existing.parentId) ? oldPRemote : nil
+                    if let remoteID = existing.remoteId {
+                        let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
+                        let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
+                        let moving = parentItemId != existing.parentId
                         _ = try await engine.client.updateMetadata(
-                            remoteId: rId, newName: name, addParentId: addP,
-                            removeParentId: remP)
+                            remoteId: remoteID, newName: name,
+                            addParentId: moving ? newParentRemoteID : nil,
+                            removeParentId: moving ? oldParentRemoteID : nil)
                     }
-
                     try await engine.store.write { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET
-                                name = ?,
-                                parent_id = ?,
-                                updated_at = ?
-                            WHERE item_id = ?;
-                            """)
-                        stmt.bindText(name, at: 1)
-                        stmt.bindInt64(parentItemId, at: 2)
-                        stmt.bindDouble(now, at: 3)
-                        stmt.bindInt64(existing.itemId, at: 4)
-                        _ = try stmt.step()
-                        stmt.reset()
+                        let statement = try conn.cachedStatement(
+                            "UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;")
+                        statement.bindText(name, at: 1)
+                        statement.bindInt64(parentItemId, at: 2)
+                        statement.bindDouble(now, at: 3)
+                        statement.bindInt64(existing.itemId, at: 4)
+                        _ = try statement.step()
+                        statement.reset()
                     }
                     seenTracker.markSeen(parentId: parentItemId, name: name)
                 } catch {
                     engine.logger.error(
-                        "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)"
-                    )
+                        "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)")
                     return
                 }
                 // Path updates do not mean that the text has been verified; retain the old metadata and continue content comparison.
@@ -454,8 +490,9 @@ extension IncrementalSyncRun {
             seenTracker.markSeen(parentId: parentItemId, name: name)
 
             // Quick change comparison (§6.2)
-            if baselineCache.lookupUnchanged(
-                device: dev, inode: ino, mtime: mtime, size: fileSize)
+            if !(localChangeScope?.includes(relativePath) ?? false),
+                baselineCache.lookupUnchanged(
+                    device: dev, inode: ino, mtime: mtime, size: fileSize)
                 != nil {
                 scanProgress.incSkipped()
                 return
@@ -506,54 +543,202 @@ extension IncrementalSyncRun {
             return itemsInBatch
         }
 
-        do {
-            try await engine.directoryScan(request) { batch in
-                var pendingObservations: [IncrementalLocalObservation] = []
-                var firstObservationSent = sentFirstObservation.withLock { $0 }
-                let itemsInBatch = copyScanRecords(batch)
-
-                for record in itemsInBatch {
-                    let fullPath = record.fullPath
-                    let relPath: String
-                    if fullPath.hasPrefix(staticPrefix) {
-                        relPath = String(fullPath.dropFirst(staticPrefix.count))
-                    } else {
-                        relPath = (fullPath as NSString).lastPathComponent
-                    }
-
-                    if relPath.isEmpty || relPath == ".git" || relPath.hasPrefix(".git/") {
-                        continue
-                    }
-
-                    if remoteGate.blocks(relPath) { continue }
-                    let name = (relPath as NSString).lastPathComponent
-                    let parentRel = (relPath as NSString).deletingLastPathComponent
-                    let parentRelNormalized =
-                        (parentRel == "." || parentRel.isEmpty) ? "" : parentRel
-
-                    if !remoteGate.paths.isEmpty,
-                        directoryContext.getItemId(byRelPath: parentRelNormalized) == nil,
-                        try remoteGate.blocksLocalAncestors(
-                            URL(fileURLWithPath: fullPath).deletingLastPathComponent(),
-                            root: rootURL) {
-                        continue
-                    }
-
-                    if record.type == .directory, !pendingObservations.isEmpty {
-                        try await commitObservations(pendingObservations)
-                        pendingObservations.removeAll(keepingCapacity: true)
-                        firstObservationSent = true
-                    }
-                    if record.type == .directory {
-                        try await observeDirectory(record, relPath: relPath, parentRelNormalized: parentRelNormalized, name: name)
-                    } else if record.type == .file {
-                        try await observeFile(record, fullPath: fullPath, parentRelNormalized: parentRelNormalized, name: name,
-                                              pendingObservations: &pendingObservations, firstObservationSent: &firstObservationSent)
-                    }
+        @Sendable func processRecords(_ records: [DiscoveredRecord]) async throws {
+            var pendingObservations: [IncrementalLocalObservation] = []
+            var firstObservationSent = sentFirstObservation.withLock { $0 }
+            for record in records {
+                let fullPath = record.fullPath
+                let relPath: String
+                if fullPath.hasPrefix(staticPrefix) {
+                    relPath = String(fullPath.dropFirst(staticPrefix.count))
+                } else if localChangeScope == nil {
+                    relPath = (fullPath as NSString).lastPathComponent
+                } else {
+                    continue
                 }
-                try await commitObservations(pendingObservations)
-                let sent = firstObservationSent || !pendingObservations.isEmpty
-                sentFirstObservation.withLock { $0 = sent }
+                guard !relPath.isEmpty,
+                    relPath != ".git", !relPath.hasPrefix(".git/"),
+                    self.isInLocalScope(relPath)
+                else { continue }
+                if remoteGate.blocks(relPath) {
+                    continue
+                }
+                let name = (relPath as NSString).lastPathComponent
+                let parentRel = (relPath as NSString).deletingLastPathComponent
+                let parentRelNormalized = (parentRel == "." || parentRel.isEmpty) ? "" : parentRel
+                if !remoteGate.paths.isEmpty,
+                    directoryContext.getItemId(byRelPath: parentRelNormalized) == nil,
+                    try remoteGate.blocksLocalAncestors(
+                        URL(fileURLWithPath: fullPath).deletingLastPathComponent(), root: rootURL) {
+                    continue
+                }
+                if record.type == .directory, !pendingObservations.isEmpty {
+                    try await commitObservations(pendingObservations)
+                    pendingObservations.removeAll(keepingCapacity: true)
+                    firstObservationSent = true
+                }
+                if record.type == .directory {
+                    try await observeDirectory(record, relPath: relPath,
+                        parentRelNormalized: parentRelNormalized, name: name)
+                } else if record.type == .file {
+                    try await observeFile(record, fullPath: fullPath,
+                        parentRelNormalized: parentRelNormalized, name: name,
+                        pendingObservations: &pendingObservations,
+                        firstObservationSent: &firstObservationSent)
+                }
+            }
+            try await commitObservations(pendingObservations)
+            let sent = firstObservationSent || !pendingObservations.isEmpty
+            sentFirstObservation.withLock { $0 = sent }
+        }
+
+        func validateAncestors(of relativePath: String) throws -> Bool {
+            var ancestor = rootURL
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: true)
+            for component in components.dropLast() {
+                ancestor.appendPathComponent(String(component), isDirectory: true)
+                var ancestorStat = stat()
+                guard lstat(ancestor.path, &ancestorStat) == 0 else {
+                    if errno == ENOENT { return false }
+                    throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                }
+                if ancestorStat.st_mode & S_IFMT == S_IFLNK {
+                    throw SyncEngineError.general("Refusing to observe a changed path through symbolic link: \(ancestor.path)")
+                }
+                guard ancestorStat.st_mode & S_IFMT == S_IFDIR else {
+                    throw SyncEngineError.general("Changed path has a non-directory ancestor: \(ancestor.path)")
+                }
+            }
+            return true
+        }
+
+        func recordAt(relativePath: String) throws -> DiscoveredRecord? {
+            guard try validateAncestors(of: relativePath) else { return nil }
+            let url = rootURL.appendingPathComponent(relativePath)
+            var value = stat()
+            guard lstat(url.path, &value) == 0 else {
+                if errno == ENOENT { return nil }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            let type: EntryType
+            switch value.st_mode & S_IFMT {
+            case S_IFREG: type = .file
+            case S_IFDIR: type = .directory
+            case S_IFLNK: type = .symbolicLink
+            default: type = .other
+            }
+            return DiscoveredRecord(type: type, fullPath: url.path, dev: Int64(value.st_dev),
+                ino: Int64(value.st_ino),
+                mtime: Int64(value.st_mtimespec.tv_sec) * 1_000_000_000
+                    + Int64(value.st_mtimespec.tv_nsec), fileSize: Int64(value.st_size))
+        }
+
+        func planScopedPath(
+            _ rawPath: String, scope: LocalChangeScope,
+            directRecords: inout [String: DiscoveredRecord],
+            directoryRoots: inout [String: DiscoveredRecord]
+        ) throws {
+            guard let relative = scope.relativePath(rawPath) else { return }
+            guard let record = try recordAt(relativePath: relative) else {
+                if directoryContext.getItemId(byRelPath: relative) != nil {
+                    scope.markMissingSubtree(relative)
+                } else {
+                    scope.markMissingExact(relative)
+                }
+                return
+            }
+            if record.type == .directory {
+                scope.markExistingDirectory(relative)
+                directoryRoots[relative] = record
+            } else {
+                scope.markExistingFile(relative)
+                directRecords[relative] = record
+            }
+        }
+
+        func planScopedChanges(
+            _ changes: [LocalChange], scope: LocalChangeScope,
+            directRecords: inout [String: DiscoveredRecord],
+            directoryRoots: inout [String: DiscoveredRecord]
+        ) throws {
+            for change in changes {
+                switch change {
+                case .created(let path, _), .modified(let path, _), .deleted(let path, _):
+                    try planScopedPath(path, scope: scope, directRecords: &directRecords,
+                        directoryRoots: &directoryRoots)
+                case .moved(let from, let destination, _):
+                    try planScopedPath(from, scope: scope, directRecords: &directRecords,
+                        directoryRoots: &directoryRoots)
+                    try planScopedPath(destination, scope: scope, directRecords: &directRecords,
+                        directoryRoots: &directoryRoots)
+                }
+            }
+        }
+
+        func scanScoped(_ scope: LocalChangeScope) async throws {
+            var directRecords: [String: DiscoveredRecord] = [:]
+            var directoryRoots: [String: DiscoveredRecord] = [:]
+            try planScopedChanges(scope.changes, scope: scope, directRecords: &directRecords,
+                directoryRoots: &directoryRoots)
+
+            let subtreeRoots = directoryRoots.keys.filter { candidate in
+                !directoryRoots.keys.contains { other in
+                    other != candidate && (other.isEmpty || candidate.hasPrefix(other + "/"))
+                }
+            }
+            let roots = Set(subtreeRoots)
+            directRecords = directRecords.filter { _, record in
+                guard record.fullPath.hasPrefix(staticPrefix) else { return false }
+                let relative = String(record.fullPath.dropFirst(staticPrefix.count))
+                return !roots.contains { root in root.isEmpty || relative.hasPrefix(root + "/") }
+            }
+
+            var ancestorPaths = Set<String>()
+            for relative in roots.union(Set(directRecords.values.compactMap { record in
+                guard record.fullPath.hasPrefix(staticPrefix) else { return nil }
+                return String(record.fullPath.dropFirst(staticPrefix.count))
+            })) {
+                var current = (relative as NSString).deletingLastPathComponent
+                while current != "." && !current.isEmpty {
+                    ancestorPaths.insert(current)
+                    current = (current as NSString).deletingLastPathComponent
+                }
+            }
+            for relative in ancestorPaths.sorted(by: { $0.split(separator: "/").count < $1.split(separator: "/").count }) {
+                guard let record = try recordAt(relativePath: relative), record.type == .directory else {
+                    throw SyncEngineError.general("Changed path has no readable directory ancestor: \(relative)")
+                }
+                scope.markObservedDirectory(relative)
+                try await processRecords([record])
+            }
+            for relative in subtreeRoots.sorted(by: { $0.split(separator: "/").count < $1.split(separator: "/").count }) {
+                if let record = directoryRoots[relative] {
+                    try await processRecords([record])
+                }
+            }
+            try await processRecords(Array(directRecords.values))
+
+            for relative in subtreeRoots.sorted(by: { $0.split(separator: "/").count < $1.split(separator: "/").count }) {
+                let absolute = relative.isEmpty ? localPath : rootURL.appendingPathComponent(relative).path
+                let prefix = relative.isEmpty ? staticPrefix : absolute + "/"
+                var options = scanOptions
+                options.pathPrefix = Array(prefix.utf8)
+                let request = ScanRequest(root: absolute, filters: scanFilters, options: options)
+                try await engine.directoryScan(request) { batch in
+                    try await processRecords(copyScanRecords(batch))
+                }
+                scope.markScannedSubtree(relative)
+            }
+        }
+
+        do {
+            if let scope = localChangeScope {
+                try await scanScoped(scope)
+            } else {
+                let request = ScanRequest(root: localPath, filters: scanFilters, options: scanOptions)
+                try await engine.directoryScan(request) { batch in
+                    try await processRecords(copyScanRecords(batch))
+                }
             }
         } catch {
             // No transfer may escape a failed/cancelled scan and mutate state after return.

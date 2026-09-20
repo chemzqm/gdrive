@@ -34,6 +34,28 @@ final class MockDirectoryBarrierURLProtocol: URLProtocol, @unchecked Sendable {
 struct DirectoryBarrierTests {
     private let context = TestHTTPContext(TestRequestHandler())
 
+    @Test("Renaming a directory updates every descendant path index")
+    func directoryContextRenameUpdatesDescendants() {
+        let directories = DirectoryContext(rootItemId: 1, remoteRootId: "root")
+        directories.register(itemId: 2, parentItemId: 1, name: "old", remoteId: "parent")
+        directories.register(itemId: 3, parentItemId: 2, name: "child", remoteId: "child")
+        directories.register(itemId: 4, parentItemId: 3, name: "deep", remoteId: "deep")
+
+        directories.register(
+            itemId: 2, parentItemId: 1, name: "new", remoteId: "parent",
+            updateDescendantPaths: true)
+
+        #expect(directories.getRelPath(for: 2) == "new")
+        #expect(directories.getRelPath(for: 3) == "new/child")
+        #expect(directories.getRelPath(for: 4) == "new/child/deep")
+        #expect(directories.getItemId(byRelPath: "old") == nil)
+        #expect(directories.getItemId(byRelPath: "old/child") == nil)
+        #expect(directories.getItemId(byRelPath: "old/child/deep") == nil)
+        #expect(directories.getItemId(byRelPath: "new") == 2)
+        #expect(directories.getItemId(byRelPath: "new/child") == 3)
+        #expect(directories.getItemId(byRelPath: "new/child/deep") == 4)
+    }
+
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
         let authData = AuthData(
