@@ -191,8 +191,8 @@ enum DurableCreateIntentStore {
         store: StateStore,
         operationID: String,
         error: Error
-    ) async {
-        try? await store.batchWrite { conn in
+    ) async throws {
+        try await store.batchWrite { conn in
             let stmt = try conn.cachedStatement("""
             UPDATE operations
             SET state = 'unknownOutcome', last_error_message = ?, updated_at = ?

@@ -159,7 +159,7 @@ extension SyncEngine {
                 if currentDiskSize != fileSize || (initialMtime != nil && currentMtime != initialMtime) {
                     // If the file is modified midway, the upload will be terminated immediately and marked operation for failed,Prevent corrupted data from being spliced and sent to the cloud
                     let now = Date().timeIntervalSince1970
-                    try? await store.write { conn in
+                    try await store.write { conn in
                         let stmt = try conn.cachedStatement("""
                         UPDATE operations SET state = 'failed', updated_at = ? WHERE operation_id = ?;
                         """)
@@ -254,7 +254,7 @@ extension SyncEngine {
         let file = try await (finalDriveFile != nil ? finalDriveFile! : client.getFile(remoteId: remoteId))
         guard file.sizeBytes == fileSize else {
             let now = Date().timeIntervalSince1970
-            try? await store.write { conn in
+            try await store.write { conn in
                 let stmt = try conn.cachedStatement("UPDATE operations SET state = 'failed', updated_at = ? WHERE operation_id = ?;")
                 stmt.bindDouble(now, at: 1)
                 stmt.bindText(opId, at: 2)
@@ -267,7 +267,7 @@ extension SyncEngine {
               checksum.caseInsensitiveCompare(expectedSha256) == .orderedSame else {
             // The hash calculated by the final stitching in the cloud does not match the expected one (indicating tampering or data corruption during transmission)
             let now = Date().timeIntervalSince1970
-            try? await store.write { conn in
+            try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 UPDATE operations SET state = 'failed', updated_at = ? WHERE operation_id = ?;
                 """)

@@ -201,8 +201,9 @@ extension SyncEngine {
             }
         }
         let uploaded = try await uploadConflictCopy()
-        guard uploaded.sha256Checksum?.lowercased() == conflictOperation.localSHA,
-              uploaded.sizeBytes == input.size, uploaded.trashed != true,
+        guard uploaded.sizeBytes == input.size,
+              uploaded.sha256Checksum?.lowercased() == conflictOperation.localSHA,
+              uploaded.trashed != true,
               uploaded.name == copy.lastPathComponent,
               uploaded.parents?.contains(conflictOperation.parentRemoteID) == true else {
             throw SyncEngineError.general("Conflicting remote copy verification failed: \(conflictOperation.copyRemoteID)")
