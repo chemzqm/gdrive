@@ -551,8 +551,10 @@ struct RemoteChanges: Sendable {
                     AND i.is_tombstone = 0 WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_directory_scans d JOIN items i
                     ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending'
-                UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?;
-                """, Array(repeating: .int(rootID), count: 6))
+                UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?
+                UNION SELECT item_id FROM items
+                    WHERE root_id = ? AND phase = 'conflict' AND is_tombstone = 0;
+                """, Array(repeating: .int(rootID), count: 7))
             var ids: Set<Int64> = []
             while try queryStatement.step() { if let id = queryStatement.columnInt64(at: 0) { ids.insert(id) } }
             queryStatement.reset()

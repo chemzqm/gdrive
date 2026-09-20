@@ -109,6 +109,12 @@ struct ConflictOperation: Codable, Sendable {
     }
 
     func validatePlan(_ conn: SQLiteConnection) throws {
+        guard try isPlanCurrent(conn) else {
+            throw SyncEngineError.general("Conflict plan is stale; pending state was preserved")
+        }
+    }
+
+    func isPlanCurrent(_ conn: SQLiteConnection) throws -> Bool {
         let queryStatement = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
                 AND dirty_generation = ? AND is_tombstone = 0 AND conflict_id = ?;
@@ -119,7 +125,7 @@ struct ConflictOperation: Codable, Sendable {
         queryStatement.bindInt64(remoteGeneration, at: 3)
         queryStatement.bindInt64(dirtyGeneration, at: 4)
         queryStatement.bindText(id, at: 5)
-        guard try queryStatement.step() else { throw SyncEngineError.general("Conflict plan is stale; pending state was preserved") }
+        guard try queryStatement.step() else { return false }
         let copy = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND remote_file_id = ? AND root_id = ?
                 AND local_generation = 0 AND remote_generation = 0 AND dirty_generation = 1
@@ -129,7 +135,26 @@ struct ConflictOperation: Codable, Sendable {
         copy.bindInt64(copyItemID, at: 1)
         copy.bindText(copyRemoteID, at: 2)
         copy.bindInt64(rootID, at: 3)
-        guard try copy.step() else { throw SyncEngineError.general("Conflict copy plan is stale; pending state was preserved") }
+        return try copy.step()
+    }
+
+    func canAutomaticallyRecover(store: StateStore) async throws -> Bool {
+        guard try await store.read({ try isPlanCurrent($0) }) else { return false }
+        let original = URL(fileURLWithPath: originalPath)
+        guard let originalVersion = try LocalFileVersion.read(at: original) else { return false }
+        let originalDigest = try SyncEngine.computeFileSha256(at: original)
+        try originalVersion.validate(at: original)
+        guard originalDigest.sha256Hex == localSHA || originalDigest.sha256Hex == remoteSHA else {
+            return false
+        }
+        let copy = URL(fileURLWithPath: copyPath)
+        guard FileManager.default.fileExists(atPath: copy.path) else {
+            return originalDigest.sha256Hex == localSHA
+        }
+        guard let copyVersion = try LocalFileVersion.read(at: copy) else { return false }
+        let copyDigest = try SyncEngine.computeFileSha256(at: copy)
+        try copyVersion.validate(at: copy)
+        return copyDigest.sha256Hex == localSHA
     }
 }
 

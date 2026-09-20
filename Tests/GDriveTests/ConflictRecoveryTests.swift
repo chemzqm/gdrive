@@ -153,6 +153,11 @@ struct ConflictRecoveryTests {
         let itemID: Int64
         let remoteID: String
     }
+    private struct ConflictGenerations {
+        let local: Int64
+        let remote: Int64
+        let dirty: Int64
+    }
     private func fixture(localContent: Data = Data("local edited content".utf8)) async throws -> Fixture {
         context.value.state.withLock { $0 = ConflictServerState() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a12-\(UUID().uuidString)")
@@ -352,6 +357,70 @@ struct ConflictRecoveryTests {
         let resumed = try await engine.syncIncremental(localPath: testFixture.local.path)
         #expect(resumed.conflictsResolved == 1)
         #expect(resumed.filesFailed == 0)
+    }
+
+    @Test(
+        "A stale pending conflict does not block an unrelated healthy file",
+        arguments: ["original", "copy", "remote"])
+    func stalePendingConflictDoesNotBlockRoot(changedInput: String) async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let localSHA = SyncEngine.computeSha256(of: Data("local edited content".utf8))
+        let remoteSHA = SyncEngine.computeSha256(of: Data("remote edited content".utf8))
+        let generations = try await testFixture.store.read { conn -> ConflictGenerations in
+            let query = try conn.prepare(
+                "SELECT local_generation, remote_generation, dirty_generation FROM items WHERE item_id = \(testFixture.itemID);")
+            defer { query.reset() }
+            #expect(try query.step())
+            return ConflictGenerations(
+                local: query.columnInt64(at: 0) ?? 0,
+                remote: query.columnInt64(at: 1) ?? 0,
+                dirty: query.columnInt64(at: 2) ?? 0)
+        }
+        let operation = try await ConflictOperation.prepare(
+            store: testFixture.store, rootID: testFixture.rootID, itemID: testFixture.itemID,
+            parentID: testFixture.parentID, original: testFixture.original,
+            remoteID: testFixture.remoteID, parentRemoteID: "root",
+            copyRemoteID: "stale-copy-id", conflictID: "stale-conflict",
+            localSHA: localSHA, remoteSHA: remoteSHA,
+            localGeneration: generations.local, remoteGeneration: generations.remote,
+            dirtyGeneration: generations.dirty)
+        struct Stop: Error {}
+        do {
+            try await testFixture.engine.resolveConflict(operation) {
+                if $0 == .copy { throw Stop() }
+            }
+            Issue.record("Missing copy checkpoint")
+        } catch is Stop {}
+        let edited = Data("edited after interruption".utf8)
+        switch changedInput {
+        case "original":
+            try edited.write(to: testFixture.original)
+        case "copy":
+            try edited.write(to: URL(fileURLWithPath: operation.copyPath))
+        default:
+            context.value.state.withLock { $0.files[testFixture.remoteID]!.content = edited }
+        }
+        let healthy = testFixture.local.appendingPathComponent("healthy.txt")
+        try Data("healthy".utf8).write(to: healthy)
+
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(stats.filesUploaded == 1)
+        #expect(context.value.state.withLock {
+            $0.files.values.contains { $0.name == "healthy.txt" }
+        })
+        if changedInput == "original" {
+            #expect(try Data(contentsOf: testFixture.original) == edited)
+        } else if changedInput == "copy" {
+            #expect(try Data(contentsOf: URL(fileURLWithPath: operation.copyPath)) == edited)
+        } else {
+            #expect(context.value.state.withLock {
+                $0.files[testFixture.remoteID]?.content
+            } == edited)
+        }
+        #expect(try await ConflictOperation.pending(
+            store: testFixture.store, rootID: testFixture.rootID).map(\.id).contains(operation.id))
     }
 
 }

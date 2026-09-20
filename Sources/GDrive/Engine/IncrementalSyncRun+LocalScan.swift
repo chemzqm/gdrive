@@ -272,6 +272,42 @@ extension IncrementalSyncRun {
             return remoteID
         }
 
+        @Sendable func existingFile(
+            device: Int64, inode: Int64, parentItemID: Int64, name: String
+        ) async throws -> ExistingLocalItem? {
+            let matches: [ExistingLocalItem] = try await engine.store.read { conn in
+                let stmt = try conn.cachedStatement(
+                    """
+                    SELECT item_id, parent_id, name, remote_file_id
+                    FROM items
+                    WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                    """)
+                stmt.bindInt64(rootID, at: 1)
+                stmt.bindInt64(device, at: 2)
+                stmt.bindInt64(inode, at: 3)
+                defer { stmt.reset() }
+                var matches: [ExistingLocalItem] = []
+                while try stmt.step(),
+                      let itemID = stmt.columnInt64(at: 0),
+                      let storedParentID = stmt.columnInt64(at: 1),
+                      let storedName = stmt.columnText(at: 2) {
+                    matches.append(ExistingLocalItem(
+                        itemId: itemID, parentId: storedParentID, name: storedName,
+                        remoteId: stmt.columnText(at: 3)))
+                }
+                return matches
+            }
+            if let exact = matches.first(where: {
+                $0.parentId == parentItemID && $0.name == name
+            }) { return exact }
+            guard matches.count == 1, let candidate = matches.first else { return nil }
+            let parentPath = directoryContext.getRelPath(for: candidate.parentId) ?? ""
+            let oldPath = parentPath.isEmpty
+                ? candidate.name : "\(parentPath)/\(candidate.name)"
+            return FileManager.default.fileExists(
+                atPath: rootURL.appendingPathComponent(oldPath).path) ? nil : candidate
+        }
+
         @Sendable func observeDirectory(_ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String) async throws {
             let parentItemId = try directoryParentID(
                 relPath: relPath, parentRelPath: parentRelNormalized, name: name)
@@ -422,38 +458,17 @@ extension IncrementalSyncRun {
             // Matching the path as well as identity preserves the rename path below,
             // while an ordinary unchanged file needs no per-item SQLite round trip.
             if !(localChangeScope?.includes(relativePath) ?? false),
-                let cached = baselineCache.lookupUnchanged(
-                    device: dev, inode: ino, mtime: mtime, size: fileSize),
-                cached.parentId == parentItemId, cached.name == name {
+                baselineCache.lookupUnchanged(
+                    device: dev, inode: ino, mtime: mtime, size: fileSize,
+                    parentId: parentItemId, name: name) != nil {
                 seenTracker.markSeen(parentId: parentItemId, name: name)
                 scanProgress.incSkipped()
                 return
             }
 
             // Check if local files have been renamed or moved (press dev + ino Find)
-            let existingFile:
-                ExistingLocalItem? =
-                    try await engine.store.read { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            SELECT item_id, parent_id, name, remote_file_id
-                            FROM items
-                            WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
-                            """)
-                        stmt.bindInt64(rootID, at: 1)
-                        stmt.bindInt64(dev, at: 2)
-                        stmt.bindInt64(ino, at: 3)
-                        defer { stmt.reset() }
-                        if try stmt.step(),
-                            let iId = stmt.columnInt64(at: 0),
-                            let pId = stmt.columnInt64(at: 1),
-                            let itemName = stmt.columnText(at: 2) {
-                            let rId = stmt.columnText(at: 3)
-                            return ExistingLocalItem(
-                                itemId: iId, parentId: pId, name: itemName, remoteId: rId)
-                        }
-                        return nil
-                    }
+            let existingFile = try await existingFile(
+                device: dev, inode: ino, parentItemID: parentItemId, name: name)
 
             if let existing = existingFile {
                 let parentPath =
@@ -463,6 +478,7 @@ extension IncrementalSyncRun {
                     ? existing.name : "\(parentPath)/\(existing.name)"
                 if remoteGate.blocks(oldPath) { return }
             }
+            var renamedOrMoved = false
             if let existing = existingFile,
                 existing.name != name || existing.parentId != parentItemId {
                 // Local files are renamed or moved
@@ -488,6 +504,7 @@ extension IncrementalSyncRun {
                         statement.reset()
                     }
                     seenTracker.markSeen(parentId: parentItemId, name: name)
+                    renamedOrMoved = true
                 } catch {
                     if DatabaseFailure.isSQLite(error) { throw error }
                     engine.logger.error(
@@ -501,10 +518,13 @@ extension IncrementalSyncRun {
             seenTracker.markSeen(parentId: parentItemId, name: name)
 
             // Quick change comparison (§6.2)
-            if !(localChangeScope?.includes(relativePath) ?? false),
-                baselineCache.lookupUnchanged(
+            let unchanged = renamedOrMoved
+                ? baselineCache.lookupUnchanged(
                     device: dev, inode: ino, mtime: mtime, size: fileSize)
-                != nil {
+                : baselineCache.lookupUnchanged(
+                    device: dev, inode: ino, mtime: mtime, size: fileSize,
+                    parentId: parentItemId, name: name)
+            if !(localChangeScope?.includes(relativePath) ?? false), unchanged != nil {
                 scanProgress.incSkipped()
                 return
             }

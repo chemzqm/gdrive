@@ -44,7 +44,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
         }
     }
 
-    private var cache: [Key: CachedItemMetadata] = [:]
+    private var cache: [Key: [CachedItemMetadata]] = [:]
     private var lock = os_unfair_lock()
 
     public init() {}
@@ -92,7 +92,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
                     size: size,
                     baseSha256: sha256
                 )
-                detector.cache[Key(device: dev, inode: ino)] = meta
+                detector.cache[Key(device: dev, inode: ino), default: []].append(meta)
             }
             stmt.reset()
         }
@@ -106,7 +106,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
 
-        guard let cached = cache[Key(device: device, inode: inode)] else {
+        guard let cached = cache[Key(device: device, inode: inode)]?.first else {
             return nil
         }
 
@@ -117,10 +117,21 @@ public final class LocalBaselineCache: @unchecked Sendable {
         return nil
     }
 
+    func lookupUnchanged(
+        device: Int64, inode: Int64, mtime: Int64, size: Int64,
+        parentId: Int64, name: String
+    ) -> CachedItemMetadata? {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return cache[Key(device: device, inode: inode)]?.first {
+            $0.parentId == parentId && $0.name == name && $0.mtime == mtime && $0.size == size
+        }
+    }
+
     /// Total number of current cache entries
     public var count: Int {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
-        return cache.count
+        return cache.values.reduce(0) { $0 + $1.count }
     }
 }

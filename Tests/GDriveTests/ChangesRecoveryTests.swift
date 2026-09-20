@@ -1003,6 +1003,74 @@ struct ChangesRecoveryTests {
         #expect(!newRequests.contains { $0.hasPrefix("POST ") || $0.hasPrefix("PUT ") || $0.hasPrefix("PATCH ") })
     }
 
+    @Test(
+        "A hard link is uploaded as a separate path without renaming its sibling",
+        arguments: [false, true])
+    func hardLinkDoesNotBecomeRename(crossDirectory: Bool) async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let original = testFixture.local.appendingPathComponent("a.txt")
+        let linkedParent = crossDirectory
+            ? testFixture.local.appendingPathComponent("sub", isDirectory: true)
+            : testFixture.local
+        try FileManager.default.createDirectory(at: linkedParent, withIntermediateDirectories: true)
+        let linked = linkedParent.appendingPathComponent("b.txt")
+        let content = Data("shared inode".utf8)
+        try content.write(to: original)
+        #expect(link(original.path, linked.path) == 0)
+        var metadata = stat()
+        #expect(lstat(original.path, &metadata) == 0)
+        let device = metadata.st_dev
+        let inode = metadata.st_ino
+        let mtime = metadata.st_mtimespec.tv_sec * 1_000_000_000
+            + metadata.st_mtimespec.tv_nsec
+        let sha = SyncEngine.computeSha256(of: content)
+        let remote = remoteFile("remote-a", parent: "root", content: "shared inode", name: "a.txt")
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+                INSERT INTO items(
+                    root_id,parent_id,name,entry_kind,remote_file_id,
+                    local_device,local_inode,local_mtime,local_size,local_sha256,
+                    base_sha256,base_size,remote_sha256,remote_size,
+                    local_status,remote_status,phase,dirty_generation,created_at,updated_at)
+                VALUES (
+                    \(testFixture.rootID),\(testFixture.rootItemID),'a.txt','file','\(remote.id)',
+                    \(device),\(inode),\(mtime),\(content.count),'\(sha)',
+                    '\(sha)',\(content.count),'\(sha)',\(content.count),
+                    'present','present','committed',0,1,1);
+                """)
+        }
+
+        let stats = try await testFixture.engine.syncIncrementalUnlocked(
+            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+            onProgress: nil, localChanges: nil)
+
+        #expect(stats.filesUploaded == 1)
+        let names = context.value.state.withLock { Set($0.files.values.map(\.name)) }
+        #expect(names.contains("a.txt"))
+        #expect(names.contains("b.txt"))
+        let storedNames = try await testFixture.store.read { conn -> Set<String> in
+            let query = try conn.prepare(
+                "SELECT name FROM items WHERE root_id = \(testFixture.rootID) AND entry_kind = 'file' AND is_tombstone = 0;")
+            defer { query.reset() }
+            var result = Set<String>()
+            while try query.step(), let name = query.columnText(at: 0) { result.insert(name) }
+            return result
+        }
+        #expect(storedNames.contains("a.txt"))
+        #expect(storedNames.contains("b.txt"))
+        let requestCount = context.value.state.withLock { $0.requests.count }
+        let second = try await testFixture.engine.syncIncrementalUnlocked(
+            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+            onProgress: nil, localChanges: nil)
+        #expect(second.filesUploaded == 0)
+        #expect(context.value.state.withLock {
+            !$0.requests.dropFirst(requestCount).contains { $0.hasPrefix("PATCH ") }
+        })
+    }
+
     @Test("A file watcher event observes only the file and never scans or deletes its sibling")
     func scopedFileObservationAvoidsWholeRootScan() async throws {
         let testFixture = try await fixture()

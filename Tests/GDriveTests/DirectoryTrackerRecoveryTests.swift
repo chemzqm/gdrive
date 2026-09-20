@@ -130,6 +130,56 @@ struct DirectoryTrackerRecoveryTests {
         return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
+    @Test("Concurrent bootstrap downloads report exact file and byte totals")
+    func concurrentDownloadStatsAreExact() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-stats-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        let fileCount = 256
+        let contents = Dictionary(uniqueKeysWithValues: (0..<fileCount).map { index in
+            let id = "file-\(index)"
+            return (id, Data(repeating: UInt8(index % 251), count: 1024 + index))
+        })
+        let listing = try JSONSerialization.data(withJSONObject: ["files": contents.map { id, data in
+            [
+                "id": id, "name": "\(id).bin", "mimeType": "application/octet-stream",
+                "size": String(data.count), "sha256Checksum": SyncEngine.computeSha256(of: data),
+                "parents": ["root"]
+            ]
+        }])
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"initial"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files") { return (response, listing) }
+            if let data = contents[url.lastPathComponent] { return (response, data) }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
+
+        let stats = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root", maxDownloadConcurrency: 64)
+
+        #expect(stats.filesDownloaded == fileCount)
+        #expect(stats.bytesDownloaded == contents.values.reduce(0) { $0 + Int64($1.count) })
+    }
+
     // MARK: - Unit Tests: DirectoryTracker (Probe P04 & Error Propagation)
 
     @Test("A bootstrap download receipt database failure remains recoverable after reopening")

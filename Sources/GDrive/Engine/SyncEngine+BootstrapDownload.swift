@@ -5,6 +5,28 @@ import Logging
 import DirectoryScanner
 import os
 
+private final class BootstrapDownloadTracker: @unchecked Sendable {
+    struct State: Sendable {
+        var filesDownloaded = 0
+        var bytesDownloaded: Int64 = 0
+        var dirsCreated = 0
+        var failures = 0
+        var conflicts = 0
+    }
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func recordDirectory() { state.withLock { $0.dirsCreated += 1 } }
+    func recordDownload(bytes: Int64, conflict: Bool = false) {
+        state.withLock {
+            $0.filesDownloaded += 1
+            $0.bytesDownloaded += bytes
+            if conflict { $0.conflicts += 1 }
+        }
+    }
+    func recordFailure() { state.withLock { $0.failures += 1 } }
+    func snapshot() -> State { state.withLock { $0 } }
+}
+
 // Internal SyncEngine implementation split by synchronization phase.
 extension SyncEngine {
     // MARK: - mode 2:remote directory -> Fast download of local empty directory (remoteToLocalEmpty)
@@ -119,14 +141,7 @@ extension SyncEngine {
             guard DatabaseFailure.isSQLite(error) else { return }
             databaseError.withLock { if $0 == nil { $0 = error } }
         }
-        final class DownloadTracker: @unchecked Sendable {
-            var filesDownloaded = 0
-            var bytesDownloaded: Int64 = 0
-            var dirsCreated = 0
-            let failures = OSAllocatedUnfairLock(initialState: 0)
-            let conflicts = OSAllocatedUnfairLock(initialState: 0)
-        }
-        let progress = DownloadTracker()
+        let progress = BootstrapDownloadTracker()
 
         func commitDownloadedFile(
             _ item: DriveFile, parentItemId: Int64, localURL: URL, published: LocalFileVersion
@@ -238,7 +253,7 @@ extension SyncEngine {
                 if item.isDirectory {
                     // Create local directory
                     try FileManager.default.createDirectory(at: itemLocalURL, withIntermediateDirectories: true)
-                    progress.dirsCreated += 1
+                    progress.recordDirectory()
 
                     // write SQLite
                     let dirItemId: Int64 = try await self.store.write { conn in
@@ -307,9 +322,7 @@ extension SyncEngine {
                                 let fileSize = try await stageConflict(
                                     item, parentItemId: parentItemId,
                                     localURL: itemLocalURL, relativePath: relativePath)
-                                progress.conflicts.withLock { $0 += 1 }
-                                progress.filesDownloaded += 1
-                                progress.bytesDownloaded += fileSize
+                                progress.recordDownload(bytes: fileSize, conflict: true)
                                 return
                             }
                             let published: LocalFileVersion
@@ -331,9 +344,7 @@ extension SyncEngine {
                                     let fileSize = try await stageConflict(
                                         item, parentItemId: parentItemId,
                                         localURL: itemLocalURL, relativePath: relativePath)
-                                    progress.conflicts.withLock { $0 += 1 }
-                                    progress.filesDownloaded += 1
-                                    progress.bytesDownloaded += fileSize
+                                    progress.recordDownload(bytes: fileSize, conflict: true)
                                     return
                                 }
                                 throw error
@@ -348,11 +359,10 @@ extension SyncEngine {
                                 throw SyncEngineError.general("The initial download receipt has expired, retain the existing status: \(item.name)")
                             }
 
-                            progress.filesDownloaded += 1
-                            progress.bytesDownloaded += fileSize
+                            progress.recordDownload(bytes: fileSize)
                         } catch {
                             recordDatabaseFailure(error)
-                            progress.failures.withLock { $0 += 1 }
+                            progress.recordFailure()
                             self.logger.error("Failed to download file [\(item.name)]: \(error)")
                         }
                     }
@@ -389,7 +399,8 @@ extension SyncEngine {
         }
         try await store.checkpoint()
 
-        let filesFailed = progress.failures.withLock { $0 }
+        let progressSnapshot = progress.snapshot()
+        let filesFailed = progressSnapshot.failures
         if filesFailed == 0 {
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
@@ -403,9 +414,9 @@ extension SyncEngine {
         }
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
-        stats.directoriesCreated = progress.dirsCreated
-        stats.filesDownloaded = progress.filesDownloaded
-        stats.bytesDownloaded = progress.bytesDownloaded
+        stats.directoriesCreated = progressSnapshot.dirsCreated
+        stats.filesDownloaded = progressSnapshot.filesDownloaded
+        stats.bytesDownloaded = progressSnapshot.bytesDownloaded
         stats.filesFailed = filesFailed
         stats.conflicts = try await SyncConflictStore.list(store: store, rootID: rootId)
         stats.remoteWorkPending = filesFailed + stats.conflicts.count

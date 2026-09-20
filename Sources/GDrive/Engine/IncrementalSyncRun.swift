@@ -142,17 +142,40 @@ extension IncrementalSyncRun {
         }
         let pendingConflicts = try await ConflictOperation.pending(
             store: engine.store, rootID: rootID)
-        let recoveredConflicts = pendingConflicts.count
-        if !pendingConflicts.isEmpty {
-            try await withThrowingTaskGroup(of: Void.self) { group in
+        var recoverableConflicts: [ConflictOperation] = []
+        for pendingOperation in pendingConflicts {
+            do {
+                if try await pendingOperation.canAutomaticallyRecover(store: engine.store) {
+                    recoverableConflicts.append(pendingOperation)
+                } else {
+                    engine.logger.error(
+                        "Pending conflict cannot be recovered automatically and remains blocked [\(pendingOperation.originalPath)]"
+                    )
+                }
+            } catch {
+                engine.logger.error(
+                    "Failed to inspect pending conflict; it remains blocked [\(pendingOperation.originalPath)]: \(error)"
+                )
+            }
+        }
+        let recoveredConflicts = OSAllocatedUnfairLock(initialState: 0)
+        if !recoverableConflicts.isEmpty {
+            await withTaskGroup(of: Void.self) { group in
                 let limit = max(1, min(64, maxConcurrency))
-                for (index, pendingOperation) in pendingConflicts.enumerated() {
-                    if index >= limit { try await group.next() }
+                for (index, pendingOperation) in recoverableConflicts.enumerated() {
+                    if index >= limit { await group.next() }
                     group.addTask {
-                        try await engine.resolveConflict(pendingOperation, temporaryDirectory: downloadDirectory)
+                        do {
+                            try await engine.resolveConflict(
+                                pendingOperation, temporaryDirectory: downloadDirectory)
+                            recoveredConflicts.withLock { $0 += 1 }
+                        } catch {
+                            engine.logger.error(
+                                "Pending conflict recovery failed and remains blocked [\(pendingOperation.originalPath)]: \(error)"
+                            )
+                        }
                     }
                 }
-                try await group.waitForAll()
             }
         }
         let remoteChanges = RemoteChanges(
@@ -177,7 +200,7 @@ extension IncrementalSyncRun {
             startedTransfers: OSAllocatedUnfairLock(initialState: false),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
-            startTime: startTime, recoveredConflicts: recoveredConflicts,
+            startTime: startTime, recoveredConflicts: recoveredConflicts.withLock { $0 },
             localChangeScope: localChanges.map { LocalChangeScope(rootURL: rootURL, changes: $0) }
         )
         prepared = true
