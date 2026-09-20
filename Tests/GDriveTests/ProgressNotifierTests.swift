@@ -4,7 +4,7 @@ import Testing
 
 @Suite("ProgressNotifier Tests")
 struct ProgressNotifierTests {
-    @Test("ProgressNotifier aggregates discovery and completion with 500ms debounce")
+    @Test("ProgressNotifier aggregates discovery and completion with 50ms test debounce")
     func testProgressNotifierDebounce() async throws {
         final class CallbackRecord: @unchecked Sendable {
             var calls = [SyncProgress]()
@@ -30,7 +30,7 @@ struct ProgressNotifierTests {
         }
 
         let tracker = CallbackRecord()
-        let notifier = ProgressNotifier(interval: 0.5) { progress in
+        let notifier = ProgressNotifier(interval: 0.05) { progress in
             tracker.record(progress)
         }
 
@@ -42,11 +42,15 @@ struct ProgressNotifierTests {
             }
         }
 
-        // During intensive calls, due to 500ms Anti-shake throttling, will not be called 100 times
+        // The 50ms test interval coalesces the burst of updates.
         #expect(tracker.count <= 2)
 
-        // 2. wait > 550ms trigger trailing debounce timer
-        try await Task.sleep(nanoseconds: 600_000_000)
+        // Observe the real timer, retaining the original 600ms scheduling budget.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(600))
+        while tracker.last?.completedFiles != 50 && clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
 
         // should trigger the merged trailing callback
         #expect(tracker.count >= 1)

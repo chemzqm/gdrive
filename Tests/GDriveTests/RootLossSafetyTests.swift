@@ -3,8 +3,6 @@ import Testing
 @testable import GDrive
 
 final class MockRootURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-
     override static func canInit(with request: URLRequest) -> Bool {
         return true
     }
@@ -14,7 +12,7 @@ final class MockRootURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func startLoading() {
-        guard let handler = Self.requestHandler else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -31,8 +29,9 @@ final class MockRootURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Root Loss Safety Tests", .serialized)
+@Suite("Root Loss Safety Tests")
 struct RootLossSafetyTests {
+    private let context = TestHTTPContext(TestRequestHandler())
 
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
@@ -51,13 +50,15 @@ struct RootLossSafetyTests {
 
     private func createMockClient(auth: Auth) -> DriveClient {
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [MockRootURLProtocol.self]
         let session = URLSession(configuration: config)
-        return DriveClient(auth: auth, session: session)
+        return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
     @Test("Local root missing throws localRootNotFound error without trashing remote files or clearing DB")
     func testLocalRootMissingThrowsError() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("root_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -145,6 +146,7 @@ struct RootLossSafetyTests {
 
     @Test("Remote root trashed throws remoteRootLost error and preserves local files and DB")
     func testRemoteRootTrashedThrowsError() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("root_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -201,7 +203,7 @@ struct RootLossSafetyTests {
         }
 
         // Mock remote root folder as trashed
-        MockRootURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             if url.contains("/drive/v3/files/remote_root_trashed") {
                 let json = """
@@ -249,6 +251,7 @@ struct RootLossSafetyTests {
 
     @Test("Remote root 404 (not found) throws remoteRootLost error and preserves local files and DB")
     func testRemoteRoot404ThrowsError() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("root_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -284,7 +287,7 @@ struct RootLossSafetyTests {
         }
 
         // Mock remote root folder as 404 Not Found
-        MockRootURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let response = HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!
             return (response, Data())
         }
@@ -308,6 +311,7 @@ struct RootLossSafetyTests {
 
     @Test("Remote root trashed in Changes feed throws remoteRootLost error and aborts immediately")
     func testRemoteRootTrashedInChangesStream() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("root_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -352,7 +356,7 @@ struct RootLossSafetyTests {
             _ = try stmt.step()
         }
 
-        MockRootURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             if url.contains("/drive/v3/files/remote_root_change_test") {
                 // Pre-flight check passes (returns active directory)

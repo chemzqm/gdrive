@@ -4,13 +4,11 @@ import Testing
 @testable import GDrive
 
 final class MockFailureSafetyURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let handler = Self.requestHandler else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -45,8 +43,9 @@ final class FailureControlState: @unchecked Sendable {
     }
 }
 
-@Suite("API Failure and State Safety Tests (A07)", .serialized)
+@Suite("API Failure and State Safety Tests (A07)")
 struct FailureStateSafetyTests {
+    private let context = TestHTTPContext(TestRequestHandler())
 
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
@@ -65,11 +64,13 @@ struct FailureStateSafetyTests {
 
     private func createMockClient(auth: Auth) -> DriveClient {
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [MockFailureSafetyURLProtocol.self]
         let session = URLSession(configuration: config)
         return DriveClient(
             auth: auth,
             session: session,
+            requestsPerSecond: nil,
             maxRetries: 1,
             retrySleep: { _ in try Task.checkCancellation() }
         )
@@ -77,6 +78,7 @@ struct FailureStateSafetyTests {
 
     @Test("Directory rename failure does not commit new name to SQLite; retrying succeeds")
     func testDirectoryRenameFailurePreservesBaselineAndRetries() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_dir_rename_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -145,7 +147,7 @@ struct FailureStateSafetyTests {
 
         let control = FailureControlState()
 
-        MockFailureSafetyURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 
@@ -215,6 +217,7 @@ struct FailureStateSafetyTests {
 
     @Test("File rename preserves content detection and retries safely (A10)", arguments: [false, true], [false, true])
     func testFileRenameFailurePreservesBaselineAndRetries(contentChanged: Bool, failRename: Bool) async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_file_rename_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -366,7 +369,7 @@ struct FailureStateSafetyTests {
 
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
-        MockFailureSafetyURLProtocol.requestHandler = handleRequest
+        context.value.requestHandler = handleRequest
 
         // Established-baseline fixtures include their durable Changes boundary.
         try await store.write { conn in
@@ -415,6 +418,7 @@ struct FailureStateSafetyTests {
 
     @Test("Remote trash failure does not mark item as tombstone in SQLite; retry succeeds")
     func testRemoteTrashFailurePreservesItemAndRetries() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_trash_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -486,7 +490,7 @@ struct FailureStateSafetyTests {
 
         let control = FailureControlState()
 
-        MockFailureSafetyURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 
@@ -557,6 +561,7 @@ struct FailureStateSafetyTests {
 
     @Test("Directory creation failure during incremental scan does not mark committed in SQLite; retrying succeeds")
     func testDirectoryCreationFailureDoesNotCommitCommittedStateAndRetries() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_dir_create_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -596,7 +601,7 @@ struct FailureStateSafetyTests {
 
         let control = FailureControlState()
 
-        MockFailureSafetyURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 
@@ -670,6 +675,7 @@ struct FailureStateSafetyTests {
 
     @Test("IDPool fetch failure does not generate UUID fallback creation request")
     func testIdPoolFailureDoesNotProduceUUIDRequest() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_idpool_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -719,7 +725,7 @@ struct FailureStateSafetyTests {
         }
         let tracker = CreatedIdsTracker()
 
-        MockFailureSafetyURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 

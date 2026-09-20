@@ -209,7 +209,7 @@ func main() async -> Int32 {
     // 2. Initialize DriveClient.
     let uploadMetrics = UploadRequestMetrics()
     let session = makeBenchmarkSession(delegate: uploadMetrics)
-    let client = DriveClient(auth: auth, session: session)
+    let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
 
     // 3. Determine or create an empty directory on the remote target
     let remoteRootId: String

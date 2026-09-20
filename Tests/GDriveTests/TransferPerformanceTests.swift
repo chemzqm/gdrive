@@ -48,6 +48,7 @@ struct TransferPerformanceTests {
         var firstUploads: [Double] = []
         var commits: [Int] = []
         let incremental = ProcessInfo.processInfo.environment["GDRIVE_PERF_INCREMENTAL"] == "1"
+        // Legacy flag still selects a single transfer; request pacing is disabled for this benchmark.
         let unpaced = ProcessInfo.processInfo.environment["GDRIVE_PERF_UNPACED"] == "1"
         for _ in 0..<5 {
             let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-perf-\(UUID().uuidString)")
@@ -67,10 +68,8 @@ struct TransferPerformanceTests {
             let auth = try Auth(path: authPath.path)
             let config = URLSessionConfiguration.ephemeral
             config.protocolClasses = [PerformanceURLProtocol.self]
-            let limiter = unpaced
-                ? DriveRateLimiter(targetRate: 100_000, burstCapacity: 100_000, minRate: 100_000, maxRate: 100_000)
-                : DriveRateLimiter()
-            let client = DriveClient(auth: auth, session: URLSession(configuration: config), rateLimiter: limiter)
+            let limiter = DriveRateLimiter()
+            let client = DriveClient(auth: auth, session: URLSession(configuration: config), rateLimiter: limiter, requestsPerSecond: nil)
             let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
             let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }))
             if incremental {
@@ -104,7 +103,7 @@ struct TransferPerformanceTests {
             }
             uploads.append(first.elapsedSeconds)
         }
-        print("PERF incremental=\(incremental) unpaced=\(unpaced) first uploads=\(firstUploads) median=\(firstUploads.sorted()[2]); commits=\(commits)")
+        print("PERF incremental=\(incremental) singleTransfer=\(unpaced) requestCap=disabled first uploads=\(firstUploads) median=\(firstUploads.sorted()[2]); commits=\(commits)")
         print("A11 PERF upload seconds: \(uploads); median=\(uploads.sorted()[2])")
         print("A11 PERF unchanged seconds: \(skips); median=\(skips.sorted()[skips.count / 2])")
     }

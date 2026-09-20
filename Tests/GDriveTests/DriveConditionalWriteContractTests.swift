@@ -10,7 +10,7 @@ struct DriveConditionalWriteContractTests {
         let auth = try Auth()
         let config = await auth.authData()
         let root = try #require(config.rootID)
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
         let id = try #require(try await client.generateIds(count: 1).first)
         let initial = Data("A11 original".utf8)
         _ = try await client.uploadMultipart(

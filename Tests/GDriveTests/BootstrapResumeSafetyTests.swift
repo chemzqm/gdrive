@@ -3,21 +3,6 @@ import Foundation
 @testable import GDrive
 
 final class MockBootstrapSafetyURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-    private static let lock = NSLock()
-
-    static func setHandler(_ handler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?) {
-        lock.lock()
-        defer { lock.unlock() }
-        requestHandler = handler
-    }
-
-    static func getHandler() -> (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))? {
-        lock.lock()
-        defer { lock.unlock() }
-        return requestHandler
-    }
-
     override static func canInit(with request: URLRequest) -> Bool {
         return true
     }
@@ -27,7 +12,7 @@ final class MockBootstrapSafetyURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func startLoading() {
-        guard let handler = Self.getHandler() else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badURL))
             return
         }
@@ -125,8 +110,9 @@ final class RequestEventRecorder: @unchecked Sendable {
     }
 }
 
-@Suite("Bootstrap and Resume Safety Tests (A08)", .serialized)
+@Suite("Bootstrap and Resume Safety Tests (A08)")
 struct BootstrapResumeSafetyTests {
+    private let context = TestHTTPContext(TestRequestHandler())
 
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
@@ -145,15 +131,17 @@ struct BootstrapResumeSafetyTests {
 
     private func createMockClient(auth: Auth) -> DriveClient {
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [MockBootstrapSafetyURLProtocol.self]
         let session = URLSession(configuration: config)
-        return DriveClient(auth: auth, session: session)
+        return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
     // MARK: - Test 1: LocalBaselineCache Excludes inFlight, Dirty, and Uncommitted Files
 
     @Test("LocalBaselineCache excludes inFlight, dirty, or uncommitted files")
     func testLocalBaselineCacheFilter() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_cache_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -261,6 +249,7 @@ struct BootstrapResumeSafetyTests {
 
     @Test("Repeated initialization calls do not duplicate directories or files, remote IDs and counts remain stable")
     func testRepeatedInitializationStable() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_repeat_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -348,7 +337,7 @@ struct BootstrapResumeSafetyTests {
 
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
-        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
+        context.value.setHandler(handleRequest)
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
@@ -415,6 +404,7 @@ struct BootstrapResumeSafetyTests {
 
     @Test("Changed existing file remains pending without an unsafe remote overwrite (A11)")
     func testChangedFileUpdatesInPlace() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_change_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -435,7 +425,7 @@ struct BootstrapResumeSafetyTests {
         let recorder = RequestEventRecorder()
         let fixedFileId = "remote_file_doc_100"
 
-        MockBootstrapSafetyURLProtocol.setHandler { request in
+        context.value.setHandler { request in
             guard let url = request.url else {
                 return (HTTPURLResponse(url: URL(string: "https://invalid")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
             }
@@ -540,6 +530,7 @@ struct BootstrapResumeSafetyTests {
 
     @Test("Interrupted resumable upload resumes session and reuses remote ID")
     func testInterruptedResumableUploadResumes() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_resumable_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -666,7 +657,7 @@ struct BootstrapResumeSafetyTests {
 
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
-        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
+        context.value.setHandler(handleRequest)
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
@@ -716,6 +707,7 @@ struct BootstrapResumeSafetyTests {
 
     @Test("Resumable client exposes server-confirmed offsets and terminal session states")
     func testResumableServerStates() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a09_client_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -748,7 +740,7 @@ struct BootstrapResumeSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data())
             }
         }
-        MockBootstrapSafetyURLProtocol.setHandler(handleRequest)
+        context.value.setHandler(handleRequest)
 
         if case .incomplete(let offset) = try await client.queryResumableOffset(sessionURL: URL(string: "https://upload.invalid/no-range")!, totalBytes: total) {
             #expect(offset == 0)
@@ -780,6 +772,7 @@ struct BootstrapResumeSafetyTests {
 
     @Test("Unfinished file is NOT falsely skipped by cache on rerun")
     func testUnfinishedFileNotSkippedOnRerun() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_unfinished_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -832,7 +825,7 @@ struct BootstrapResumeSafetyTests {
         let client = createMockClient(auth: auth)
         let recorder = RequestEventRecorder()
 
-        MockBootstrapSafetyURLProtocol.setHandler { request in
+        context.value.setHandler { request in
             guard let url = request.url else {
                 return (HTTPURLResponse(url: URL(string: "https://invalid")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
             }

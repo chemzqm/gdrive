@@ -89,19 +89,24 @@ public final class TransferMonitor: @unchecked Sendable {
 
     private var timerTask: Task<Void, Never>?
 
-    public init() {
+    public convenience init() {
+        self.init(refreshInterval: .milliseconds(500))
+    }
+
+    /// Allows tests to use a shorter real timer interval.
+    init(refreshInterval: Duration) {
         self.cachedSnapshot = TransferSnapshot()
-        self.startTimer()
+        self.startTimer(interval: refreshInterval)
     }
 
     deinit {
         timerTask?.cancel()
     }
 
-    private func startTimer() {
+    private func startTimer(interval: Duration) {
         timerTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 500_000_000) // 500ms
+                try? await Task.sleep(for: interval)
                 guard let self else { break }
                 self.refreshSnapshot()
             }

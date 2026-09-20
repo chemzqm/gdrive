@@ -25,7 +25,7 @@ struct AuthTests {
     @Test("Fetch 1000 IDs from Google Drive files.generateIds")
     func testGenerate1000Ids() async throws {
         let auth = try Auth()
-        let api = DriveAPI(auth: auth)
+        let api = DriveAPI(auth: auth, requestsPerSecond: nil)
         let ids = try await api.generateIds(count: 1000)
         #expect(ids.count == 1000)
         #expect(Set(ids).count == 1000)

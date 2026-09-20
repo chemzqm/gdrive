@@ -5,15 +5,11 @@ import os
 @testable import GDrive
 
 private final class RetrySemanticsURLProtocol: URLProtocol, @unchecked Sendable {
-    typealias Handler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
-
-    static let handler = OSAllocatedUnfairLock<Handler?>(initialState: nil)
-
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let handler = Self.handler.withLock({ $0 }) else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -30,10 +26,13 @@ private final class RetrySemanticsURLProtocol: URLProtocol, @unchecked Sendable 
     override func stopLoading() {}
 }
 
-@Suite("Retry semantics", .serialized)
+@Suite("Retry semantics")
 struct RetrySemanticsTests {
+    private let context = TestHTTPContext(TestRequestHandler())
+
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
+        context.configure(configuration)
         configuration.protocolClasses = [RetrySemanticsURLProtocol.self]
         return URLSession(configuration: configuration)
     }
@@ -54,18 +53,19 @@ struct RetrySemanticsTests {
 
     @Test("HTTP error text preserves UTF-8 and explicitly reports invalid UTF-8", arguments: [false, true])
     func errorBodyDecoding(invalidUTF8: Bool) async throws {
+        defer { context.value.requestHandler = nil }
         let expected = invalidUTF8 ? "Invalid UTF-8 data" : "服务器错误: café"
         let body = invalidUTF8 ? Data([0x61, 0xFF, 0x62]) : Data(expected.utf8)
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 (HTTPURLResponse(url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!, body)
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session)
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
         do {
             _ = try await client.executeRequest(request, maxRetries: 0)
@@ -78,12 +78,13 @@ struct RetrySemanticsTests {
 
     @Test("401 forces one refresh and retries with the new token")
     func unauthorizedForcesRefresh() async throws {
+        defer { context.value.requestHandler = nil }
         struct State {
             var refreshes = 0
             var authorizationHeaders: [String] = []
         }
         let state = OSAllocatedUnfairLock(initialState: State())
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 let url = try #require(request.url)
                 if url.host == "oauth2.googleapis.com" {
@@ -106,12 +107,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session)
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
         request.setValue("Bearer stale-token", forHTTPHeaderField: "Authorization")
 
@@ -125,8 +126,9 @@ struct RetrySemanticsTests {
 
     @Test("Cancellation during retry backoff stops before another request")
     func cancellationStopsRetry() async throws {
+        defer { context.value.requestHandler = nil }
         let requestCount = OSAllocatedUnfairLock(initialState: 0)
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 requestCount.withLock { $0 += 1 }
                 return (
@@ -137,12 +139,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session)
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
         let task = Task { try await client.executeRequest(request) }
 
@@ -157,9 +159,10 @@ struct RetrySemanticsTests {
 
     @Test("Streaming download retries a rate-limited response")
     func downloadRetriesRateLimit() async throws {
+        defer { context.value.requestHandler = nil }
         let requestCount = OSAllocatedUnfairLock(initialState: 0)
         let body = Data("downloaded".utf8)
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 let count = requestCount.withLock { count in
                     count += 1
@@ -181,12 +184,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session)
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         let destination = directory.appendingPathComponent("destination")
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
 
@@ -199,7 +202,8 @@ struct RetrySemanticsTests {
 
     @Test("executeRequest throws distinct rateLimited429 error when retries are exhausted")
     func executeRequestThrowsRateLimited429() async throws {
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        defer { context.value.requestHandler = nil }
+        context.value.handler.withLock { handler in
             handler = { request in
                 (
                     HTTPURLResponse(
@@ -209,12 +213,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil, maxRetries: 0, retrySleep: { _ in })
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
 
         await #expect(throws: DriveError.rateLimited429(retryAfter: 3.0)) {
@@ -224,6 +228,7 @@ struct RetrySemanticsTests {
 
     @Test("executeRequest throws distinct rateLimited403 error for userRateLimitExceeded")
     func executeRequestThrowsRateLimited403UserQuota() async throws {
+        defer { context.value.requestHandler = nil }
         let errorBody = """
         {
           "error": {
@@ -239,7 +244,7 @@ struct RetrySemanticsTests {
           }
         }
         """
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 (
                     HTTPURLResponse(
@@ -249,12 +254,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil, maxRetries: 0, retrySleep: { _ in })
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
 
         await #expect(throws: DriveError.rateLimited403(reason: "userRateLimitExceeded", retryAfter: 5.0)) {
@@ -264,6 +269,7 @@ struct RetrySemanticsTests {
 
     @Test("executeRequest throws distinct rateLimited403 error for rateLimitExceeded")
     func executeRequestThrowsRateLimited403ProjectLimit() async throws {
+        defer { context.value.requestHandler = nil }
         let errorBody = """
         {
           "error": {
@@ -279,7 +285,7 @@ struct RetrySemanticsTests {
           }
         }
         """
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 (
                     HTTPURLResponse(
@@ -289,12 +295,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session, maxRetries: 0, retrySleep: { _ in })
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil, maxRetries: 0, retrySleep: { _ in })
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
 
         await #expect(throws: DriveError.rateLimited403(reason: "rateLimitExceeded", retryAfter: 2.0)) {
@@ -304,6 +310,7 @@ struct RetrySemanticsTests {
 
     @Test("executeRequest non-rate-limit 403 throws serverError immediately without rate limiting")
     func executeRequestThrowsServerErrorForPermissionDenied() async throws {
+        defer { context.value.requestHandler = nil }
         let errorBody = """
         {
           "error": {
@@ -319,7 +326,7 @@ struct RetrySemanticsTests {
           }
         }
         """
-        RetrySemanticsURLProtocol.handler.withLock { handler in
+        context.value.handler.withLock { handler in
             handler = { request in
                 (
                     HTTPURLResponse(
@@ -329,12 +336,12 @@ struct RetrySemanticsTests {
                 )
             }
         }
-        defer { RetrySemanticsURLProtocol.handler.withLock { $0 = nil } }
+        defer { context.value.handler.withLock { $0 = nil } }
 
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = DriveClient(auth: auth, session: session, maxRetries: 3, retrySleep: { _ in })
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil, maxRetries: 3, retrySleep: { _ in })
         let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
 
         await #expect(throws: DriveError.serverError(statusCode: 403, message: errorBody)) {

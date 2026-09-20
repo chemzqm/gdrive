@@ -14,7 +14,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         // 1. Build a temporary test tree locally containing multiple levels of subdirectories and small files
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_sync_test_\(UUID().uuidString.prefix(8))")
@@ -136,7 +136,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_fast_skip_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -228,7 +228,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_inc_test_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -334,7 +334,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_lifecycle_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -444,7 +444,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_large_test_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -531,7 +531,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_stale_test_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -740,7 +740,7 @@ struct SyncEngineTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive_unified_test_\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)

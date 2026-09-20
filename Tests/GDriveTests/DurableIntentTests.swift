@@ -4,13 +4,11 @@ import Testing
 @testable import GDrive
 
 final class DurableIntentURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let handler = Self.requestHandler else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -27,8 +25,10 @@ final class DurableIntentURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Durable create intents (A05)", .serialized)
+@Suite("Durable create intents (A05)")
 struct DurableIntentTests {
+    private let context = TestHTTPContext(TestRequestHandler())
+
     private func makeAuth(in directory: URL) throws -> Auth {
         let path = directory.appendingPathComponent("auth.json")
         let authData = AuthData(
@@ -74,6 +74,7 @@ struct DurableIntentTests {
 
     @Test("An unfinished multipart intent survives a fresh store and reuses its operation and Drive IDs")
     func unfinishedIntentReusesIdentity() async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-reuse-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -145,10 +146,11 @@ struct DurableIntentTests {
 
     @Test("Durable requests commit only their own generation (A05/A11)", arguments: ["none", "local_generation", "remote_generation", "dirty_generation", "source"], [false, true])
     func requestsStartAfterIntentCommit(invalidation: String, incremental: Bool) async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-order-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer {
-            DurableIntentURLProtocol.requestHandler = nil
+            context.value.requestHandler = nil
             try? FileManager.default.removeItem(at: directory)
         }
 
@@ -163,8 +165,9 @@ struct DurableIntentTests {
         let store = try await StateStore(path: databasePath, batchCapacity: 256, batchTimeoutMs: 20)
         let auth = try makeAuth(in: directory)
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [DurableIntentURLProtocol.self]
-        let client = DriveClient(auth: auth, session: URLSession(configuration: config))
+        let client = DriveClient(auth: auth, session: URLSession(configuration: config), requestsPerSecond: nil)
         let idPool = IDPool(initialIds: ["small-file-id", "empty-dir-id"])
 
         @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
@@ -250,7 +253,7 @@ struct DurableIntentTests {
             }
             return (response, data)
         }
-        DurableIntentURLProtocol.requestHandler = handleRequest
+        context.value.requestHandler = handleRequest
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: idPool)
         let stats: SyncStats
@@ -292,10 +295,11 @@ struct DurableIntentTests {
 
     @Test("A fresh engine retries an unknown multipart result with the persisted Drive ID and accepts 409 verification")
     func incrementalRecoveryUsesPersistedID() async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-recover-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer {
-            DurableIntentURLProtocol.requestHandler = nil
+            context.value.requestHandler = nil
             try? FileManager.default.removeItem(at: directory)
         }
 
@@ -334,10 +338,11 @@ struct DurableIntentTests {
 
         let auth = try makeAuth(in: directory)
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [DurableIntentURLProtocol.self]
-        let client = DriveClient(auth: auth, session: URLSession(configuration: config))
+        let client = DriveClient(auth: auth, session: URLSession(configuration: config), requestsPerSecond: nil)
 
-        DurableIntentURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             if url.path.hasSuffix("/changes/startPageToken") {
                 return (
@@ -412,11 +417,12 @@ struct DurableIntentTests {
 
     @Test("Bootstrap retries an unfinished directory before creating its children")
     func bootstrapRecoversUnfinishedDirectory() async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("bootstrap-directory-\(UUID().uuidString)")
         let localRoot = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: localRoot.appendingPathComponent("parent/child"), withIntermediateDirectories: true)
         defer {
-            DurableIntentURLProtocol.requestHandler = nil
+            context.value.requestHandler = nil
             try? FileManager.default.removeItem(at: directory)
         }
         let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
@@ -429,7 +435,7 @@ struct DurableIntentTests {
             store: store, operationID: intent.operationID, error: URLError(.networkConnectionLost)
         )
         let requests = SafeCounter(0)
-        DurableIntentURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
             if request.httpMethod == "GET", url.path.hasSuffix("/files/remote-root") {
@@ -456,9 +462,10 @@ struct DurableIntentTests {
         }
         let auth = try makeAuth(in: directory)
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [DurableIntentURLProtocol.self]
         let engine = try await SyncEngine(auth: auth, store: store,
-            client: DriveClient(auth: auth, session: URLSession(configuration: config)),
+            client: DriveClient(auth: auth, session: URLSession(configuration: config), requestsPerSecond: nil),
             idPool: IDPool(initialIds: ["candidate-one", "candidate-two", "candidate-three"]))
         let failed = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "remote-root")
         #expect(failed.directoriesCreated == 0)
@@ -483,6 +490,7 @@ struct DurableIntentTests {
 
     @Test("Concurrent intents use group commit instead of one fsync per small file")
     func intentsRemainBatched() async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-a05-batch-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }

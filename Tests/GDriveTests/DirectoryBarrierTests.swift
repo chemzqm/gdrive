@@ -4,8 +4,6 @@ import Testing
 @testable import GDrive
 
 final class MockDirectoryBarrierURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-
     override static func canInit(with request: URLRequest) -> Bool {
         return true
     }
@@ -15,7 +13,7 @@ final class MockDirectoryBarrierURLProtocol: URLProtocol, @unchecked Sendable {
     }
 
     override func startLoading() {
-        guard let handler = Self.requestHandler else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -32,8 +30,9 @@ final class MockDirectoryBarrierURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Directory Barrier Tests (A04)", .serialized)
+@Suite("Directory Barrier Tests (A04)")
 struct DirectoryBarrierTests {
+    private let context = TestHTTPContext(TestRequestHandler())
 
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
@@ -52,13 +51,15 @@ struct DirectoryBarrierTests {
 
     private func createMockClient(auth: Auth) -> DriveClient {
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [MockDirectoryBarrierURLProtocol.self]
         let session = URLSession(configuration: config)
-        return DriveClient(auth: auth, session: session)
+        return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
     @Test("Scenario 1: Local directory deleted but remote child modified -> child downloaded, parent directory recreated, remote parent NOT trashed")
     func testLocalDirDeletedRemoteChildModified() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test1_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -150,7 +151,7 @@ struct DirectoryBarrierTests {
         // Mock HTTP requests
         nonisolated(unsafe) var trashedRemoteFolders: [String] = []
 
-        MockDirectoryBarrierURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             let method = request.httpMethod ?? "GET"
 
@@ -224,6 +225,7 @@ struct DirectoryBarrierTests {
 
     @Test("Scenario 2: Remote directory trashed but local child newly created -> child uploaded, remote folder untrashed, local parent directory NOT deleted")
     func testRemoteDirTrashedLocalChildNewlyAdded() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test2_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -288,7 +290,7 @@ struct DirectoryBarrierTests {
         nonisolated(unsafe) var untrashedRemoteFolders: [String] = []
         nonisolated(unsafe) var uploadedFiles: [String] = []
 
-        MockDirectoryBarrierURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             let method = request.httpMethod ?? "GET"
 
@@ -370,6 +372,7 @@ struct DirectoryBarrierTests {
 
     @Test("Scenario 3: Bottom-up safe directory clean when all children deleted locally")
     func testBottomUpDirectorySafeCleanup() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test3_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -474,7 +477,7 @@ struct DirectoryBarrierTests {
 
         nonisolated(unsafe) var trashedRemoteOrder: [String] = []
 
-        MockDirectoryBarrierURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             let method = request.httpMethod ?? "GET"
 
@@ -556,6 +559,7 @@ struct DirectoryBarrierTests {
 
     @Test("Scenario 4: remote child download honors generation and directory barrier (A04/A11)", arguments: ["none", "local_generation", "remote_generation", "dirty_generation"])
     func testLocalDirDeletedRemoteChildNewlyAdded(invalidation: String) async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test4_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -568,7 +572,7 @@ struct DirectoryBarrierTests {
         let dbPath = tempDir.appendingPathComponent("test.sqlite").path
         let store = try await StateStore(path: dbPath)
 
-        let rootRemoteId = "remote_root_4"
+        let rootRemoteId = "remote_root_4-\(UUID().uuidString)"
         defer { removeTestDownloadDirectory(remoteRootID: rootRemoteId) }
         let parentDirRemoteId = "remote_folder_sub_4"
         let newChildRemoteId = "remote_new_child_file_4"
@@ -619,7 +623,7 @@ struct DirectoryBarrierTests {
 
         nonisolated(unsafe) var trashedRemoteFolders: [String] = []
 
-        MockDirectoryBarrierURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             let method = request.httpMethod ?? "GET"
 
@@ -728,6 +732,7 @@ struct DirectoryBarrierTests {
 
     @Test("Scenario 5: Remote directory and child deleted -> child deleted first, empty local parent directory moved to trash safely")
     func testRemoteDirAndChildDeletedLocalCleanedBottomUp() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test5_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -819,7 +824,7 @@ struct DirectoryBarrierTests {
             return conn.lastInsertRowId
         }
 
-        MockDirectoryBarrierURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = request.url?.absoluteString ?? ""
             if url.contains("/drive/v3/files/\(rootRemoteId)") {
                 let json = """

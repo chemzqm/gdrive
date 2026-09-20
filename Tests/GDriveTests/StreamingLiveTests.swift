@@ -46,7 +46,7 @@ struct StreamingLiveTests {
             configuredRootIDValue,
             "Live streaming regression requires rootID in the configured GDrive credentials"
         )
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         let localRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("gdrive_streaming_live_\(UUID().uuidString)", isDirectory: true)

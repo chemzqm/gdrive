@@ -65,15 +65,18 @@ struct TransferMonitorTests {
         #expect(finishedSnapshot.activeDownloads.isEmpty)
     }
 
-    @Test("TransferMonitor automatic 500ms periodic background refresh")
+    @Test("TransferMonitor automatic periodic background refresh (50ms test interval)")
     func testAutomaticPeriodicRefresh() async throws {
-        let monitor = TransferMonitor()
+        let monitor = TransferMonitor(refreshInterval: .milliseconds(50))
+        let initialTime = monitor.getSnapshot().refreshedAt
         monitor.enqueueUpload(id: "auto_1", name: "auto.bin", totalBytes: 1000)
 
-        let initialTime = monitor.getSnapshot().refreshedAt
-
-        // Waiting for background timer Periodic automatic refresh (> 600ms)
-        try await Task.sleep(nanoseconds: 650_000_000)
+        // Observe the real timer; retain the original 650ms scheduling budget.
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .milliseconds(650))
+        while monitor.getSnapshot().queuedUploads.isEmpty && clock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
 
         let nextSnapshot = monitor.getSnapshot()
         #expect(nextSnapshot.queuedUploads.count == 1)

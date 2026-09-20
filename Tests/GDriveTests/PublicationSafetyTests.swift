@@ -3,13 +3,11 @@ import Testing
 import os
 @testable import GDrive
 
-private final class PublicationURLProtocol: URLProtocol, @unchecked Sendable {
-    static let requests = OSAllocatedUnfairLock(initialState: 0)
+private class PublicationURLProtocol: URLProtocol, @unchecked Sendable {
     static let content = Data(repeating: 0x72, count: 65_544)
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        Self.requests.withLock { $0 += 1 }
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Self.content)
         client?.urlProtocolDidFinishLoading(self)
@@ -17,16 +15,26 @@ private final class PublicationURLProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Stable transfer inputs and local publication (A11)", .serialized)
+// Only blocksOverwrite uses this protocol, so concurrent downloads cannot affect its count.
+private final class BlockedPublicationURLProtocol: PublicationURLProtocol, @unchecked Sendable {
+    static let requests = OSAllocatedUnfairLock(initialState: 0)
+
+    override func startLoading() {
+        Self.requests.withLock { $0 += 1 }
+        super.startLoading()
+    }
+}
+
+@Suite("Stable transfer inputs and local publication (A11)")
 struct PublicationSafetyTests {
-    private func client(in directory: URL) throws -> DriveClient {
+    private func client(in directory: URL, protocolClass: URLProtocol.Type = PublicationURLProtocol.self) throws -> DriveClient {
         let credentials = directory.appendingPathComponent("auth.json")
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(AuthData(clientId: "test", accessToken: "test", expiresAt: Date().addingTimeInterval(3600))).write(to: credentials)
         let configuration = URLSessionConfiguration.ephemeral
-        configuration.protocolClasses = [PublicationURLProtocol.self]
-        return DriveClient(auth: try Auth(path: credentials.path), session: URLSession(configuration: configuration))
+        configuration.protocolClasses = [protocolClass]
+        return DriveClient(auth: try Auth(path: credentials.path), session: URLSession(configuration: configuration), requestsPerSecond: nil)
     }
 
     @Test("Unsupported remote overwrites fail before any request")
@@ -34,8 +42,8 @@ struct PublicationSafetyTests {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-block-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let client = try client(in: directory)
-        PublicationURLProtocol.requests.withLock { $0 = 0 }
+        let client = try client(in: directory, protocolClass: BlockedPublicationURLProtocol.self)
+        BlockedPublicationURLProtocol.requests.withLock { $0 = 0 }
         do {
             _ = try await client.updateMultipart(remoteId: "existing", content: Data(), expectedSha256: "unused")
             Issue.record("Unconditional overwrite was allowed")
@@ -44,7 +52,7 @@ struct PublicationSafetyTests {
             _ = try await client.initiateResumableUpdate(remoteId: "existing", totalBytes: 9 * 1024 * 1024)
             Issue.record("Unconditional resumable update was allowed")
         } catch DriveError.unsafeOverwrite { }
-        #expect(PublicationURLProtocol.requests.withLock { $0 } == 0)
+        #expect(BlockedPublicationURLProtocol.requests.withLock { $0 } == 0)
     }
 
     @Test("A modification during streaming download survives publication and temporary cleanup")

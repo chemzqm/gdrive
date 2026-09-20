@@ -162,6 +162,7 @@ public final class DriveClient: Sendable {
     private let retrySleep: RetrySleep
     private let retryLimitOverride: Int?
     private let logger = Logger(label: "gdrive.client")
+    private let requestGate: RequestRateGate
 
     public static let fields = "id,name,mimeType,parents,size,sha256Checksum,version,trashed"
 
@@ -183,14 +184,17 @@ public final class DriveClient: Sendable {
         return URLSession(configuration: config)
     }
 
+    /// requestsPerSecond defaults to 65; pass a positive cap or nil to disable pacing.
     public init(
         auth: Auth,
         session: URLSession = DriveClient.makeDefaultSession(),
-        rateLimiter: DriveRateLimiter = DriveRateLimiter()
+        rateLimiter: DriveRateLimiter = DriveRateLimiter(),
+        requestsPerSecond: Int? = 65
     ) {
         self.auth = auth
         self.session = session
         self.rateLimiter = rateLimiter
+        self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = nil
         self.retrySleep = { delay in
             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -201,12 +205,14 @@ public final class DriveClient: Sendable {
         auth: Auth,
         session: URLSession,
         rateLimiter: DriveRateLimiter = DriveRateLimiter(),
+        requestsPerSecond: Int? = 65,
         maxRetries: Int,
         retrySleep: @escaping RetrySleep
     ) {
         self.auth = auth
         self.session = session
         self.rateLimiter = rateLimiter
+        self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = max(0, maxRetries)
         self.retrySleep = retrySleep
     }
@@ -287,6 +293,7 @@ public final class DriveClient: Sendable {
             attempt += 1
             try await rateLimiter.acquire()
 
+            try await requestGate.wait()
             let data: Data
             let response: URLResponse
             do {
@@ -319,7 +326,6 @@ public final class DriveClient: Sendable {
             }
 
             if http.statusCode == 409 || http.statusCode == 308 || acceptableStatusCodes.contains(http.statusCode) {
-                await rateLimiter.reportSuccess()
                 return (data, http)
             }
 
@@ -458,6 +464,7 @@ public final class DriveClient: Sendable {
             attempt += 1
             try await rateLimiter.acquire()
 
+            try await requestGate.wait()
             let bytes: URLSession.AsyncBytes
             let response: URLResponse
             do {
@@ -488,7 +495,6 @@ public final class DriveClient: Sendable {
                 continue
             }
 
-            await rateLimiter.reportSuccess()
             return (bytes, http)
         }
     }
@@ -1107,3 +1113,34 @@ public final class DriveClient: Sendable {
 
 /// Compatible aliases
 public typealias DriveAPI = DriveClient
+
+/// Optional smooth pacing with a conservative 1.01s rolling window.
+/// Shared by ordinary requests, streaming requests, and retries for one client.
+actor RequestRateGate {
+    private let requestsPerSecond: Int?
+    private var starts: [TimeInterval] = []
+
+    init(requestsPerSecond: Int? = 65) {
+        precondition(requestsPerSecond == nil || requestsPerSecond! > 0,
+                     "requestsPerSecond must be positive or nil")
+        self.requestsPerSecond = requestsPerSecond
+    }
+
+    func wait() async throws {
+        while true {
+            try Task.checkCancellation()
+            guard let limit = requestsPerSecond else { return }
+            let now = ProcessInfo.processInfo.systemUptime
+            starts.removeAll { $0 <= now - 1.01 }
+            let windowReady = starts.count < limit ? now : starts[starts.count - limit] + 1.01
+            let pacedReady = starts.last.map { $0 + 1.0 / Double(limit) } ?? now
+            let ready = max(pacedReady, windowReady)
+            if now >= ready {
+                starts.append(now)
+                return
+            }
+            let delay = max(0.0001, ready - now)
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+}

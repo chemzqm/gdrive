@@ -14,7 +14,7 @@ struct DriveClientTests {
             "Live Drive tests require rootID in ~/.gdrive/auth.json; configure a disposable test root before running."
         )
 
-        let client = DriveClient(auth: auth)
+        let client = DriveClient(auth: auth, requestsPerSecond: nil)
 
         // 1. prefetch 2 a ID:1 directory for testing,1 files for testing
         let ids = try await client.generateIds(count: 2)

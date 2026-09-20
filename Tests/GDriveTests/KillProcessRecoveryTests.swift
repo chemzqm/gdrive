@@ -3,7 +3,8 @@ import Foundation
 import Testing
 @testable import GDrive
 
-@Suite("SQLite kill-process recovery", .serialized)
+// Each case owns its database directory and helper processes.
+@Suite("SQLite kill-process recovery")
 struct KillProcessRecoveryTests {
     private static let helperName = "GDriveKillProcessTestHelper"
 

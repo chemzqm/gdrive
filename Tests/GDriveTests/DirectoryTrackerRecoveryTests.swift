@@ -5,8 +5,6 @@ import DirectoryScanner
 @testable import GDrive
 
 final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
-    nonisolated(unsafe) static var requestHandler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
-
     private var isStopped = false
     private let lock = NSLock()
 
@@ -14,7 +12,7 @@ final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
-        guard let handler = Self.requestHandler else {
+        guard let handler = TestHTTPContext<TestRequestHandler>.value(for: request)?.requestHandler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
             return
         }
@@ -66,8 +64,9 @@ extension URLRequest {
     }
 }
 
-@Suite("Directory Tracker Failure and Cancellation Recovery (A06)", .serialized)
+@Suite("Directory Tracker Failure and Cancellation Recovery (A06)")
 struct DirectoryTrackerRecoveryTests {
+    private let context = TestHTTPContext(TestRequestHandler())
 
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authPath = tempDir.appendingPathComponent("auth.json").path
@@ -86,9 +85,10 @@ struct DirectoryTrackerRecoveryTests {
 
     private func createMockClient(auth: Auth) -> DriveClient {
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [MockDirectoryRecoveryURLProtocol.self]
         let session = URLSession(configuration: config)
-        return DriveClient(auth: auth, session: session)
+        return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
     // MARK: - Unit Tests: DirectoryTracker (Probe P04 & Error Propagation)
@@ -220,6 +220,7 @@ struct DirectoryTrackerRecoveryTests {
 
     @Test("Swift Acceptance 1: Parent directory 403 injection: children fail promptly, sibling directory succeeds, sync returns complete stats")
     func testParentDir403AllowsSiblingToComplete() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a06_test403_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -252,7 +253,7 @@ struct DirectoryTrackerRecoveryTests {
 
         let remoteRootId = "remote_root_123"
 
-        MockDirectoryRecoveryURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 
@@ -338,6 +339,7 @@ struct DirectoryTrackerRecoveryTests {
 
     @Test("Swift Acceptance 2: Parent directory 409 conflict failure: children wake up and fail, sibling completes")
     func testParentDir409ConflictAllowsSiblingToComplete() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a06_test409_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -365,7 +367,7 @@ struct DirectoryTrackerRecoveryTests {
 
         let remoteRootId = "remote_root_409"
 
-        MockDirectoryRecoveryURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
 
@@ -450,6 +452,7 @@ struct DirectoryTrackerRecoveryTests {
 
     @Test("Swift Acceptance 3: Cancellation injection terminates sync without deadlock")
     func testCancellationOfSyncTerminatesPromptly() async throws {
+        defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a06_cancel_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -471,7 +474,7 @@ struct DirectoryTrackerRecoveryTests {
 
         let remoteRootId = "remote_root_cancel"
 
-        MockDirectoryRecoveryURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let path = url.path
             if path.hasSuffix("/changes/startPageToken") {
@@ -530,16 +533,17 @@ struct DirectoryTrackerRecoveryTests {
     }
     @Test("Bootstrap drains admitted tasks after scan failure or cancellation", arguments: [false, true])
     func scanInterruptionDrainsTasks(cancel: Bool) async throws {
+        defer { context.value.requestHandler = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("bootstrap-scan-\(UUID().uuidString)")
         let local = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: local.appendingPathComponent("parent"), withIntermediateDirectories: true)
         let file = local.appendingPathComponent("parent/file.txt")
         try Data("content".utf8).write(to: file)
         defer {
-            MockDirectoryRecoveryURLProtocol.requestHandler = nil
+            context.value.requestHandler = nil
             try? FileManager.default.removeItem(at: directory)
         }
-        MockDirectoryRecoveryURLProtocol.requestHandler = { request in
+        context.value.requestHandler = { request in
             let url = try #require(request.url)
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
             if url.path.hasSuffix("/changes/startPageToken") {

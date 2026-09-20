@@ -24,14 +24,17 @@ private struct ChangesServer: Sendable {
     var activeUploads = 0
     var peakUploads = 0
 }
+private struct ChangesProtocolState: Sendable {
+    let heldDownload = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
+    let holdDownloads = OSAllocatedUnfairLock(initialState: false)
+    let state = OSAllocatedUnfairLock(initialState: ChangesServer())
+}
 private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
-    static let heldDownload = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
-    static let holdDownloads = OSAllocatedUnfairLock(initialState: false)
-    static let state = OSAllocatedUnfairLock(initialState: ChangesServer())
+    private lazy var server = TestHTTPContext<ChangesProtocolState>.value(for: request)!
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        let delay = Self.state.withLock { state -> TimeInterval in
+        let delay = self.server.state.withLock { state -> TimeInterval in
             guard request.url!.path.contains("/upload/"), state.uploadDelay > 0 else { return 0 }
             state.activeUploads += 1
             state.peakUploads = max(state.peakUploads, state.activeUploads)
@@ -39,7 +42,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
         }
         if delay > 0 {
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
-                Self.state.withLock { $0.activeUploads -= 1 }
+                self.server.state.withLock { $0.activeUploads -= 1 }
                 self.respond()
             }
         } else { respond() }
@@ -58,7 +61,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
                 let name = try #require(metadata["name"] as? String)
                 let parent = (metadata["parents"] as? [String])?.first ?? "root"
                 let size = request.value(forHTTPHeaderField: "X-Upload-Content-Length") ?? "0"
-                ChangesProtocol.state.withLock {
+                self.server.state.withLock {
                     $0.requests.append("POST \(url.path)?\(url.query ?? "")")
                     $0.resumableFiles[id] = DriveFile(id: id, name: name, parents: [parent], size: size, version: "1")
                     $0.resumableContents[id] = Data()
@@ -77,7 +80,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
             func respondToChunk() throws {
                 let id = url.lastPathComponent
                 let body = request.extractBodyData ?? Data()
-                let result = try ChangesProtocol.state.withLock { state -> ResumableResponse in
+                let result = try self.server.state.withLock { state -> ResumableResponse in
                     state.requests.append("PUT \(url.path)?\(url.query ?? "")")
                     state.resumableContents[id, default: Data()].append(body)
                     let file = try #require(state.resumableFiles[id])
@@ -109,13 +112,13 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
                 return
             }
 
-            let response = try Self.state.withLock { state in
+            let response = try self.server.state.withLock { state in
                 try self.response(for: url, state: &state)
             }
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: response.0, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
             client?.urlProtocol(self, didLoad: response.1)
-            if request.url!.query?.contains("alt=media") == true, Self.holdDownloads.withLock({ $0 }) {
-                Self.heldDownload.withLock { $0 = { self.client?.urlProtocolDidFinishLoading(self) } }
+            if request.url!.query?.contains("alt=media") == true, self.server.holdDownloads.withLock({ $0 }) {
+                self.server.heldDownload.withLock { $0 = { self.client?.urlProtocolDidFinishLoading(self) } }
                 return
             }
             client?.urlProtocolDidFinishLoading(self)
@@ -180,8 +183,9 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Changes durability and scoped reconstruction (A13)", .serialized)
+@Suite("Changes durability and scoped reconstruction (A13)")
 struct ChangesRecoveryTests {
+    private let context = TestHTTPContext(ChangesProtocolState())
     private struct Fixture {
         let directory: URL
         let local: URL
@@ -192,7 +196,6 @@ struct ChangesRecoveryTests {
         let rootID: Int64
         let rootItemID: Int64
         func cleanup() {
-            removeTestDownloadDirectory(remoteRootID: "root")
             try? FileManager.default.removeItem(at: directory)
         }
         var changes: RemoteChanges { RemoteChanges(store: store, client: client, rootID: rootID, remoteRootID: "root", rootURL: local) }
@@ -204,11 +207,11 @@ struct ChangesRecoveryTests {
     private func remoteFile(_ id: String, parent: String, content: String = "remote content", name: String? = nil) -> DriveFile {
         let bytes = Data(content.utf8)
         let file = DriveFile(id: id, name: name ?? id, parents: [parent], size: String(bytes.count), sha256Checksum: SyncEngine.computeSha256(of: bytes), version: "1")
-        ChangesProtocol.state.withLock { $0.files[id] = file; $0.contents[id] = bytes }
+        context.value.state.withLock { $0.files[id] = file; $0.contents[id] = bytes }
         return file
     }
     private func fixture(cursor: Bool = true) async throws -> Fixture {
-        ChangesProtocol.state.withLock { $0 = ChangesServer(files: ["root": folder("root", nil)]) }
+        context.value.state.withLock { $0 = ChangesServer(files: ["root": folder("root", nil)]) }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a13-\(UUID().uuidString)")
         let local = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
@@ -218,8 +221,9 @@ struct ChangesRecoveryTests {
         try encoder.encode(AuthData(clientId: "test", accessToken: "test", expiresAt: Date().addingTimeInterval(3600))).write(to: authURL)
         let auth = try Auth(path: authURL.path)
         let config = URLSessionConfiguration.ephemeral
+        context.configure(config)
         config.protocolClasses = [ChangesProtocol.self]
-        let client = DriveClient(auth: auth, session: URLSession(configuration: config))
+        let client = DriveClient(auth: auth, session: URLSession(configuration: config), requestsPerSecond: nil)
         let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
         let ids = try await store.write { conn -> (Int64, Int64) in
             let rootStatement = try conn.prepare("INSERT INTO roots(account_id, local_root_path, local_root_device, local_root_inode, remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at) VALUES ('default', ?, 1, 1, 'root', 'localToRemoteEmpty', 'existingKnown', 1, 1);")
@@ -231,7 +235,8 @@ struct ChangesRecoveryTests {
             if cursor { try conn.execute("INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) VALUES (\(root), 'default', 'drive_changes', 'start', 1);") }
             return (root, item)
         }
-        let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "new-\($0)" }))
+        let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "new-\($0)" }),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"))
         return Fixture(directory: directory, local: local, store: store, client: client, auth: auth, engine: engine, rootID: ids.0, rootItemID: ids.1)
     }
     private func token(_ testFixture: Fixture) async throws -> String? {
@@ -275,7 +280,7 @@ struct ChangesRecoveryTests {
             _ = try queryStatement.step()
         }
         try FileManager.default.removeItem(at: localDirectory)
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[remoteDirectory.id] = remoteDirectory
             $0.pages["start"] = DriveChangesPage(
                 nextPageToken: nil,
@@ -303,7 +308,7 @@ struct ChangesRecoveryTests {
         try Data("ready upload".utf8).write(to: testFixture.local.appendingPathComponent("ready.txt"))
         let parent = folder("dir", "root")
         let child = remoteFile("child", parent: "dir")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[parent.id] = parent
             $0.pages["start"] = DriveChangesPage(nextPageToken: "page2", newStartPageToken: nil, changes: [DriveChange(fileId: child.id, removed: false, file: child)])
             $0.pages["page2"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: parent.id, removed: false, file: parent)])
@@ -311,13 +316,13 @@ struct ChangesRecoveryTests {
         }
         do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected page failure") } catch {}
         #expect(try await token(testFixture) == "page2")
-        #expect(!ChangesProtocol.state.withLock { $0.requests.contains { $0.contains("/upload/") } })
+        #expect(!context.value.state.withLock { $0.requests.contains { $0.contains("/upload/") } })
         let reopened = try await StateStore(path: testFixture.store.path)
         let pending = try await reopened.read { conn in
             let queryStatement = try conn.prepare("SELECT count(*) FROM remote_change_inbox;"); _ = try queryStatement.step(); return queryStatement.columnInt64(at: 0)
         }
         #expect(pending == 1)
-        ChangesProtocol.state.withLock { $0.failToken = nil }
+        context.value.state.withLock { $0.failToken = nil }
         let engine = try await SyncEngine(auth: testFixture.auth, store: reopened, client: testFixture.client)
         _ = try await engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         try await converge(testFixture)
@@ -330,7 +335,7 @@ struct ChangesRecoveryTests {
         defer { testFixture.cleanup() }
         let parent = folder("incoming", "root")
         let nested = folder("nested", "incoming")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[parent.id] = parent; $0.files[nested.id] = nested
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: parent.id, removed: false, file: parent)])
         }
@@ -339,7 +344,7 @@ struct ChangesRecoveryTests {
         let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(first.filesUploaded == 1)
         #expect(first.remoteWorkPending > 0)
-        let requests = ChangesProtocol.state.withLock { $0.requests }
+        let requests = context.value.state.withLock { $0.requests }
         let upload = try #require(requests.firstIndex { $0.contains("/upload/") })
         let listing = try #require(requests.firstIndex { $0.contains("/files?q=") })
         #expect(upload < listing)
@@ -352,7 +357,7 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture(cursor: kind != "missing")
         defer { testFixture.cleanup() }
         remoteFile("before-token", parent: "root")
-        if kind == "rejected" { ChangesProtocol.state.withLock { $0.rejectToken = "start" } }
+        if kind == "rejected" { context.value.state.withLock { $0.rejectToken = "start" } }
         if kind == "invalid" { try await testFixture.store.write { try $0.execute("UPDATE cursors SET is_valid = 0;") } }
         try await converge(testFixture)
         #expect(try String(contentsOf: testFixture.local.appendingPathComponent("before-token"), encoding: .utf8) == "remote content")
@@ -364,12 +369,12 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture(cursor: false)
         defer { testFixture.cleanup() }
         remoteFile("retained", parent: "root")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             if incomplete { $0.incompleteFolder = "root" } else { $0.failFolder = "root" }
         }
         do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected listing failure") } catch {}
         #expect(try await testFixture.changes.pendingCount() > 0)
-        ChangesProtocol.state.withLock { $0.failFolder = nil; $0.incompleteFolder = nil }
+        context.value.state.withLock { $0.failFolder = nil; $0.incompleteFolder = nil }
         try await converge(testFixture)
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("retained").path))
     }
@@ -379,13 +384,13 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let child = remoteFile("child", parent: "unavailable")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: child.id, removed: false, file: child)])
         }
         let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(first.remoteWorkPending > 0)
         #expect(try await token(testFixture) == "steady")
-        ChangesProtocol.state.withLock { $0.files["unavailable"] = folder("unavailable", "root") }
+        context.value.state.withLock { $0.files["unavailable"] = folder("unavailable", "root") }
         try await converge(testFixture)
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("unavailable/child").path))
     }
@@ -395,11 +400,11 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let file = remoteFile("known", parent: "root")
-        ChangesProtocol.state.withLock { $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)]) }
+        context.value.state.withLock { $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)]) }
         try await converge(testFixture)
         let outside = folder("outside", nil)
         let moved = DriveFile(id: file.id, name: file.name, parents: [outside.id], size: file.size, sha256Checksum: file.sha256Checksum, version: "2")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[outside.id] = outside; $0.files[file.id] = moved
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "after-move", changes: [DriveChange(fileId: moved.id, removed: false, file: moved)])
         }
@@ -424,10 +429,10 @@ struct ChangesRecoveryTests {
             Issue.record("Existing roots must reconstruct missing cursor history")
         } catch {}
         #expect(try await token(testFixture) == nil)
-        ChangesProtocol.state.withLock { $0.failStart = true }
+        context.value.state.withLock { $0.failStart = true }
         do { try await RemoteChanges.saveInitialCursor(store: testFixture.store, client: testFixture.client, rootID: testFixture.rootID); Issue.record("Expected token error") } catch {}
         #expect(try await token(testFixture) == nil)
-        ChangesProtocol.state.withLock { $0.failStart = false }
+        context.value.state.withLock { $0.failStart = false }
         try await RemoteChanges.saveInitialCursor(store: testFixture.store, client: testFixture.client, rootID: testFixture.rootID)
         try await testFixture.store.write { try $0.execute("UPDATE cursors SET token_value = 'older-boundary';") }
         try await RemoteChanges.saveInitialCursor(store: testFixture.store, client: testFixture.client, rootID: testFixture.rootID)
@@ -438,7 +443,7 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let file = remoteFile("atomic", parent: "root")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)])
         }
         try await testFixture.store.write { conn in
@@ -464,13 +469,13 @@ struct ChangesRecoveryTests {
         let encoder = JSONEncoder()
         let firstPage = try JSONSerialization.data(withJSONObject: ["nextPageToken": "tail", "files": [JSONSerialization.jsonObject(with: encoder.encode(first))]])
         let secondPage = try JSONSerialization.data(withJSONObject: ["files": [JSONSerialization.jsonObject(with: encoder.encode(second))]])
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.listingPages["root:first"] = firstPage
             $0.listingPages["root:tail"] = secondPage
         }
         let round = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(round.remoteWorkPending > 0)
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             if rejected { $0.rejectListingToken = "tail" } else { $0.failFolder = "root" }
         }
         do { _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root"); Issue.record("Expected tail-page failure") } catch {}
@@ -478,7 +483,7 @@ struct ChangesRecoveryTests {
             let queryStatement = try conn.prepare("SELECT page_token FROM remote_directory_scans WHERE remote_id = 'root';"); _ = try queryStatement.step(); return queryStatement.columnText(at: 0)
         }
         #expect(checkpoint == (rejected ? nil : "tail"))
-        ChangesProtocol.state.withLock { $0.failFolder = nil; $0.rejectListingToken = nil }
+        context.value.state.withLock { $0.failFolder = nil; $0.rejectListingToken = nil }
         try await converge(testFixture)
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("first").path))
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("second").path))
@@ -492,7 +497,7 @@ struct ChangesRecoveryTests {
             let file = DriveFile(id: "id-\(index)", name: "file-\(index)", parents: ["root"], size: "1", sha256Checksum: String(repeating: "a", count: 64))
             return DriveChange(fileId: file.id, removed: false, file: file)
         }
-        ChangesProtocol.state.withLock { $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: changes) }
+        context.value.state.withLock { $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: changes) }
         let before = await testFixture.store.getWriterStats()
         try await testFixture.changes.consume()
         let after = await testFixture.store.getWriterStats()
@@ -509,14 +514,14 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let dir = folder("empty", "root")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[dir.id] = dir
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: dir.id, removed: false, file: dir)])
         }
         try await converge(testFixture)
         _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("empty").path))
-        #expect(!ChangesProtocol.state.withLock { $0.requests.contains { $0.hasPrefix("PATCH") } })
+        #expect(!context.value.state.withLock { $0.requests.contains { $0.hasPrefix("PATCH") } })
     }
 
     @Test("Moved-out directories also block new children after a local rename")
@@ -524,14 +529,14 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let dir = folder("dir", "root")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[dir.id] = dir
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: dir.id, removed: false, file: dir)])
         }
         remoteFile("child", parent: "dir")
         try await converge(testFixture)
         let moved = folder("dir", "outside")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files["outside"] = folder("outside", nil)
             $0.files["dir"] = moved
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "after-move", changes: [DriveChange(fileId: moved.id, removed: false, file: moved)])
@@ -558,7 +563,7 @@ struct ChangesRecoveryTests {
             let queryStatement = try conn.prepare("INSERT INTO remote_change_inbox(root_id, remote_id, payload) VALUES (?, 'stale', ?);")
             queryStatement.bindInt64(testFixture.rootID, at: 1); queryStatement.bindText(payload, at: 2); _ = try queryStatement.step()
         }
-        ChangesProtocol.state.withLock { _ = $0.files.removeValue(forKey: "stale") }
+        context.value.state.withLock { _ = $0.files.removeValue(forKey: "stale") }
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(stats.remoteWorkPending > 0)
         #expect(stats.filesDownloaded == 0)
@@ -590,7 +595,7 @@ struct ChangesRecoveryTests {
             _ = try await testFixture.engine.syncRemoteToLocalEmpty(localPath: testFixture.local.path, remoteRootId: "root")
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path).isEmpty)
-        #expect(ChangesProtocol.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
+        #expect(context.value.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
         #expect(try await testFixture.changes.pendingCount() > 0)
     }
 
@@ -598,7 +603,7 @@ struct ChangesRecoveryTests {
     func bootstrapDirectoryCollision(mixed: Bool) async throws {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files["one"] = folder("one", "root", name: "same")
             $0.files["two"] = mixed ? DriveFile(id: "two", name: "same", parents: ["root"]) : folder("two", "root", name: "same")
         }
@@ -621,7 +626,7 @@ struct ChangesRecoveryTests {
         defer { testFixture.cleanup() }
         let one = remoteFile("one", parent: "root", content: "first", name: names[0])
         let two = remoteFile("two", parent: "root", content: "second", name: names[1])
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [
                 DriveChange(fileId: one.id, removed: false, file: one),
                 DriveChange(fileId: two.id, removed: false, file: two)])
@@ -632,7 +637,7 @@ struct ChangesRecoveryTests {
         #expect(blocked.filesDownloaded == 0)
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path).isEmpty)
         let renamed = remoteFile("two", parent: "root", content: "second", name: "unique")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "done", changes: [DriveChange(fileId: renamed.id, removed: false, file: renamed)])
         }
         try await converge(testFixture)
@@ -650,7 +655,7 @@ struct ChangesRecoveryTests {
         }
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path).isEmpty)
         #expect(!FileManager.default.fileExists(atPath: testFixture.directory.appendingPathComponent("escape").path))
-        #expect(ChangesProtocol.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
+        #expect(context.value.state.withLock { !$0.requests.contains { $0.contains("alt=media") } })
     }
 
     @Test("A14 Changes block symlinked parents without writing outside root")
@@ -658,7 +663,7 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let parent = folder("parent", "root")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.files[parent.id] = parent
             $0.pages["start"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: parent.id, removed: false, file: parent)])
         }
@@ -672,7 +677,7 @@ struct ChangesRecoveryTests {
             try RemoteNameMapping.validateDestination(localParent.appendingPathComponent("missing/child"), root: testFixture.local)
         }
         let child = remoteFile("child", parent: "parent")
-        ChangesProtocol.state.withLock {
+        context.value.state.withLock {
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "done", changes: [DriveChange(fileId: child.id, removed: false, file: child)])
         }
         try await testFixture.changes.consume()
@@ -715,13 +720,13 @@ struct ChangesRecoveryTests {
             #expect(queryStatement.columnText(at: 1) == "committed")
             #expect(queryStatement.columnText(at: 2) == "fresh")
         }
-        let requests = ChangesProtocol.state.withLock { $0.requests }
+        let requests = context.value.state.withLock { $0.requests }
         #expect(requests.count == 3)
         #expect(requests[1].contains("startPageToken"))
         #expect(requests[2].contains("/files?"))
         if remoteAddition {
             let file = remoteFile("new", parent: "root", content: "new content", name: ".env")
-            ChangesProtocol.state.withLock {
+            context.value.state.withLock {
                 $0.pages["fresh"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "steady", changes: [DriveChange(fileId: file.id, removed: false, file: file)])
             }
         } else {
@@ -818,7 +823,7 @@ struct ChangesRecoveryTests {
         #expect(result.filesDownloaded == 1)
         #expect(result.filesFailed == 0)
         #expect(!FileManager.default.fileExists(atPath: staging.appendingPathComponent("root").path))
-        #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("startPageToken") }.count } == 1)
+        #expect(context.value.state.withLock { $0.requests.filter { $0.contains("startPageToken") }.count } == 1)
     }
 
     private func oneEntry(_ url: URL, type: EntryType = .file) throws -> ScanBatch {
@@ -845,7 +850,7 @@ struct ChangesRecoveryTests {
 
     private func waitForUpload(_ name: String) async throws -> Bool {
         for _ in 0..<200 {
-            if ChangesProtocol.state.withLock({ $0.files.values.contains { $0.name == name } }) { return true }
+            if context.value.state.withLock({ $0.files.values.contains { $0.name == name } }) { return true }
             try await Task.sleep(for: .milliseconds(10))
         }
         return false
@@ -899,7 +904,7 @@ struct ChangesRecoveryTests {
 
         #expect(stats.filesFailed == 1)
         #expect(stats.filesUploaded == 1)
-        #expect(ChangesProtocol.state.withLock { $0.files.values.contains { $0.name == "healthy" } })
+        #expect(context.value.state.withLock { $0.files.values.contains { $0.name == "healthy" } })
         let preserved = try await testFixture.store.read { conn in
             let query = try conn.prepare("SELECT local_status, is_tombstone, base_sha256, dirty_generation, phase, local_sha256 FROM items WHERE name = 'vanished';")
             guard try query.step() else { return false }
@@ -908,7 +913,7 @@ struct ChangesRecoveryTests {
                 && query.columnText(at: 4) == "waitingEvidence" && query.columnText(at: 5) == oldSHA
         }
         #expect(preserved)
-        #expect(!ChangesProtocol.state.withLock { $0.requests.contains { $0.contains("remote-vanished") } })
+        #expect(!context.value.state.withLock { $0.requests.contains { $0.contains("remote-vanished") } })
     }
 
     @Test("Streaming downloads stay outside the active scan and use the configured remote-root folder")
@@ -927,11 +932,11 @@ struct ChangesRecoveryTests {
         let batch = try oneEntry(first)
         let stagingBase = testFixture.directory.appendingPathComponent("downloads")
         let staging = stagingBase.appendingPathComponent("root")
-        ChangesProtocol.holdDownloads.withLock { $0 = true }
-        defer { ChangesProtocol.holdDownloads.withLock { $0 = false } }
+        context.value.holdDownloads.withLock { $0 = true }
+        defer { context.value.holdDownloads.withLock { $0 = false } }
         let engine = try await SyncEngine(auth: testFixture.auth, store: testFixture.store, client: testFixture.client,
             idPool: IDPool(initialIds: ["temp-upload-id"]), incrementalScan: { _, consume in
-                defer { ChangesProtocol.heldDownload.withLock { callback in callback?(); callback = nil } }
+                defer { context.value.heldDownload.withLock { callback in callback?(); callback = nil } }
                 try await consume(batch)
                 var temporary: URL?
                 for _ in 0..<500 {
@@ -962,7 +967,7 @@ struct ChangesRecoveryTests {
         #expect(stats.filesUploaded == 0)
         #expect(stats.filesFailed == 0)
         #expect(try Data(contentsOf: first) == Data(String(repeating: "R", count: 131072).utf8))
-        #expect(ChangesProtocol.state.withLock { !$0.files.values.contains { $0.name.hasPrefix(".tmp_") } })
+        #expect(context.value.state.withLock { !$0.files.values.contains { $0.name.hasPrefix(".tmp_") } })
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path) == ["first"])
         #expect(!FileManager.default.fileExists(atPath: staging.path))
     }
@@ -982,7 +987,7 @@ struct ChangesRecoveryTests {
             try conn.execute("INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id, local_status, remote_status, phase, created_at, updated_at) VALUES (\(testFixture.rootID), \(testFixture.rootItemID), 'slow-tail', 'directory', 'tail', 'present', 'present', 'committed', 1, 1);")
         }
         // The HTTP boundary checks that local observation AND create intent were committed first.
-        ChangesProtocol.state.withLock { state in
+        context.value.state.withLock { state in
             state.verifyUpload = { name in
                 let conn = try SQLiteConnection(path: testFixture.store.path, readonly: true)
                 let queryStatement = try conn.prepare("SELECT i.local_sha256, op.expected_sha256 FROM items i JOIN operations op ON op.item_id = i.item_id WHERE i.name = ? AND op.state != 'completed';")
@@ -1024,7 +1029,7 @@ struct ChangesRecoveryTests {
             #expect(tail.columnText(at: 0) == "present")
             #expect(tail.columnInt64(at: 1) == 0)
         }
-        #expect(ChangesProtocol.state.withLock { $0.requests.filter { $0.contains("/upload/") }.count } == 1)
+        #expect(context.value.state.withLock { $0.requests.filter { $0.contains("/upload/") }.count } == 1)
     }
 
     @Test("A16 1000 observations and matching receipts commit in bounded batches")
@@ -1077,12 +1082,12 @@ struct ChangesRecoveryTests {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         for itemIndex in 0..<80 { try Data("body".utf8).write(to: testFixture.local.appendingPathComponent("file-\(itemIndex)")) }
-        ChangesProtocol.state.withLock { $0.uploadDelay = 0.02 }
+        context.value.state.withLock { $0.uploadDelay = 0.02 }
         let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 2)
         #expect(result.filesUploaded == 80)
         #expect(result.filesFailed == 0)
-        #expect(ChangesProtocol.state.withLock { $0.peakUploads } == 2)
-        #expect(ChangesProtocol.state.withLock { $0.activeUploads } == 0)
+        #expect(context.value.state.withLock { $0.peakUploads } == 2)
+        #expect(context.value.state.withLock { $0.activeUploads } == 0)
     }
 
     @Test("A17 incremental large files use bounded resumable chunks")
@@ -1099,7 +1104,7 @@ struct ChangesRecoveryTests {
         let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1)
         #expect(result.filesUploaded == 1)
         #expect(result.filesFailed == 0)
-        let requests = ChangesProtocol.state.withLock { $0.requests }
+        let requests = context.value.state.withLock { $0.requests }
         #expect(requests.contains { $0.contains("uploadType=resumable") })
         #expect(requests.filter { $0.hasPrefix("PUT /resumable/") }.count == 2)
         #expect(!requests.contains { $0.contains("uploadType=multipart") })
@@ -1128,11 +1133,11 @@ struct ChangesRecoveryTests {
         let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(result.filesUploaded == 1)
         #expect(result.filesFailed == 0)
-        let requests = ChangesProtocol.state.withLock { $0.requests }
+        let requests = context.value.state.withLock { $0.requests }
         let creation = try #require(requests.firstIndex { $0.hasPrefix("POST /drive/v3/files?") })
         let upload = try #require(requests.firstIndex { $0.contains("/upload/") })
         #expect(creation < upload)
-        #expect(ChangesProtocol.state.withLock { $0.files.values.first { $0.name == "child" }?.parents } == ["pending-id"])
+        #expect(context.value.state.withLock { $0.files.values.first { $0.name == "child" }?.parents } == ["pending-id"])
     }
 
 }

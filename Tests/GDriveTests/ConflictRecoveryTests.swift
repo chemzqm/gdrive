@@ -20,8 +20,11 @@ private struct ConflictServerState: Sendable {
     var sessions: [String: ConflictRemoteFile] = [:]
     var sessionSizes: [String: Int] = [:]
 }
+private struct ConflictProtocolState: Sendable {
+    let state = OSAllocatedUnfairLock(initialState: ConflictServerState())
+}
 private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
-    static let state = OSAllocatedUnfairLock(initialState: ConflictServerState())
+    private lazy var server = TestHTTPContext<ConflictProtocolState>.value(for: request)!
     override static func canInit(with request: URLRequest) -> Bool { true }
     override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     private struct Response {
@@ -32,7 +35,7 @@ private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
     override func startLoading() {
         do {
             let url = request.url!
-            let response = try Self.state.withLock { state in
+            let response = try self.server.state.withLock { state in
                 try self.response(for: url, state: &state)
             }
             client?.urlProtocol(self, didReceive: HTTPURLResponse(url: url, statusCode: response.status, httpVersion: nil, headerFields: response.headers)!, cacheStoragePolicy: .notAllowed)
@@ -111,8 +114,9 @@ private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
     override func stopLoading() {}
 }
 
-@Suite("Durable conflict convergence (A12)", .serialized)
+@Suite("Durable conflict convergence (A12)")
 struct ConflictRecoveryTests {
+    private let context = TestHTTPContext(ConflictProtocolState())
     private struct Fixture {
         let directory: URL
         let local: URL
@@ -127,7 +131,7 @@ struct ConflictRecoveryTests {
         let remoteID: String
     }
     private func fixture(localContent: Data = Data("local edited content".utf8)) async throws -> Fixture {
-        ConflictProtocol.state.withLock { $0 = ConflictServerState() }
+        context.value.state.withLock { $0 = ConflictServerState() }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a12-\(UUID().uuidString)")
         let local = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
@@ -139,8 +143,9 @@ struct ConflictRecoveryTests {
         try encoder.encode(AuthData(clientId: "test", accessToken: "test", expiresAt: Date().addingTimeInterval(3600))).write(to: authURL)
         let auth = try Auth(path: authURL.path)
         let configuration = URLSessionConfiguration.ephemeral
+        context.configure(configuration)
         configuration.protocolClasses = [ConflictProtocol.self]
-        let client = DriveClient(auth: auth, session: URLSession(configuration: configuration))
+        let client = DriveClient(auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
         let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
         let engine = try await SyncEngine(auth: auth, store: store, client: client,
             idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }),
@@ -159,24 +164,24 @@ struct ConflictRecoveryTests {
             return ItemIdentity(rootID: queryStatement.columnInt64(at: 0)!, parentID: queryStatement.columnInt64(at: 1)!, itemID: queryStatement.columnInt64(at: 2)!, remoteID: queryStatement.columnText(at: 3)!)
         }
         try localContent.write(to: original)
-        ConflictProtocol.state.withLock { $0.files[ids.remoteID]!.content = Data("remote edited content".utf8) }
+        context.value.state.withLock { $0.files[ids.remoteID]!.content = Data("remote edited content".utf8) }
         return Fixture(directory: directory, local: local, original: original, auth: auth, client: client,
                        store: store, engine: engine, rootID: ids.rootID, parentID: ids.parentID, itemID: ids.itemID, remoteID: ids.remoteID)
     }
     private func assertConverged(_ testFixture: Fixture) async throws {
-        let remote = ConflictProtocol.state.withLock { Array($0.files.values) }
+        let remote = context.value.state.withLock { Array($0.files.values) }
         #expect(remote.count == 2)
         for file in remote {
             #expect(try Data(contentsOf: testFixture.local.appendingPathComponent(file.name)) == file.content)
         }
-        let before = ConflictProtocol.state.withLock { ($0.uploads, $0.downloads) }
+        let before = context.value.state.withLock { ($0.uploads, $0.downloads) }
         let next = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(next.conflictsResolved == 0)
         #expect(next.filesFailed == 0)
         #expect(next.filesUploaded == 0)
         #expect(next.filesDownloaded == 0)
-        #expect(ConflictProtocol.state.withLock { $0.uploads } == before.0)
-        #expect(ConflictProtocol.state.withLock { $0.downloads } == before.1)
+        #expect(context.value.state.withLock { $0.uploads } == before.0)
+        #expect(context.value.state.withLock { $0.downloads } == before.1)
         let pending = try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID)
         #expect(pending.isEmpty)
         let committed = try await testFixture.store.read { conn in
@@ -205,7 +210,7 @@ struct ConflictRecoveryTests {
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(stats.conflictsResolved == 1)
         #expect(stats.filesFailed == 0)
-        #expect(ConflictProtocol.state.withLock { $0.sessions.count } == 1)
+        #expect(context.value.state.withLock { $0.sessions.count } == 1)
         try await assertConverged(testFixture)
     }
 
@@ -213,14 +218,14 @@ struct ConflictRecoveryTests {
     func lostResponse() async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
-        ConflictProtocol.state.withLock { $0.loseResponse = true }
+        context.value.state.withLock { $0.loseResponse = true }
         let failed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(failed.conflictsResolved == 0)
         #expect(failed.filesFailed == 1)
         #expect(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).count == 1)
         let recovered = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         #expect(recovered.conflictsResolved == 1)
-        #expect(ConflictProtocol.state.withLock { $0.uploads } == 2) // baseline + one copy
+        #expect(context.value.state.withLock { $0.uploads } == 2) // baseline + one copy
         try await assertConverged(testFixture)
     }
 
@@ -264,7 +269,7 @@ struct ConflictRecoveryTests {
     func changedDuringRecovery(kind: String) async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
-        ConflictProtocol.state.withLock { $0.loseResponse = true }
+        context.value.state.withLock { $0.loseResponse = true }
         _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
         let operationStatement = try #require(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).first)
         let newer = Data("newer user data".utf8)
@@ -276,14 +281,14 @@ struct ConflictRecoveryTests {
             try await testFixture.store.write { conn in
                 try conn.execute("UPDATE items SET local_generation = local_generation + 1 WHERE item_id = \(itemID);")
             }
-        default: ConflictProtocol.state.withLock { $0.files[operationStatement.copyRemoteID]!.content = newer }
+        default: context.value.state.withLock { $0.files[operationStatement.copyRemoteID]!.content = newer }
         }
         do {
             _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, remoteRootId: "root")
             Issue.record("Changed conflict inputs must not be marked resolved")
         } catch {}
         #expect(try await ConflictOperation.pending(store: testFixture.store, rootID: testFixture.rootID).count == 1)
-        #expect(ConflictProtocol.state.withLock { $0.uploads } == 2)
+        #expect(context.value.state.withLock { $0.uploads } == 2)
         if kind == "original" { #expect(try Data(contentsOf: testFixture.original) == newer) }
         if kind == "copy" { #expect(try Data(contentsOf: URL(fileURLWithPath: operationStatement.copyPath)) == newer) }
         let base = try await testFixture.store.read { conn in
