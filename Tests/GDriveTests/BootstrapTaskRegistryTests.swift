@@ -8,11 +8,10 @@ struct BootstrapTaskRegistryTests {
     func pendingParentSharesBothIDs() async throws {
         let registry = BootstrapTaskRegistry(root: .init(remoteID: "root", itemID: 1))
         let gate = AsyncSemaphore(count: 0)
-        let task = Task<BootstrapDirectoryTarget, Error> {
+        registry.startDirectoryTask(for: "parent") {
             await gate.wait()
             return .init(remoteID: "parent", itemID: 42)
         }
-        registry.registerDirectoryTask(task, for: "parent")
         let dependency = try registry.dependency(for: "parent")
         let children = (0..<8).map { _ in Task { try await dependency.value() } }
         gate.signal()
@@ -31,11 +30,9 @@ struct BootstrapTaskRegistryTests {
         #expect(throws: BootstrapDirectoryDependencyError.self) {
             _ = try registry.dependency(for: "missing")
         }
-        let task = Task<BootstrapDirectoryTarget, Error> { throw Failure.parent }
-        registry.registerDirectoryTask(task, for: "parent")
+        registry.startDirectoryTask(for: "parent") { throw Failure.parent }
         let parent = try registry.dependency(for: "parent")
-        let child = Task<BootstrapDirectoryTarget, Error> { try await parent.value() }
-        registry.registerDirectoryTask(child, for: "parent/child")
+        registry.startDirectoryTask(for: "parent/child") { try await parent.value() }
         let descendant = try registry.dependency(for: "parent/child")
         await #expect(throws: Failure.self) { _ = try await descendant.value() }
         let root = try await registry.dependency(for: "").value()
@@ -47,12 +44,12 @@ struct BootstrapTaskRegistryTests {
     func lateRegistrationIsCancelled() async throws {
         let registry = BootstrapTaskRegistry(root: .init(remoteID: "root", itemID: 1))
         registry.cancelAll()
-        let task = Task<BootstrapDirectoryTarget, Error> {
+        registry.startDirectoryTask(for: "parent") {
             try await Task.sleep(for: .seconds(60))
             return .init(remoteID: "unexpected", itemID: 2)
         }
-        registry.registerDirectoryTask(task, for: "parent")
-        await #expect(throws: CancellationError.self) { _ = try await task.value }
+        let dependency = try registry.dependency(for: "parent")
+        await #expect(throws: CancellationError.self) { _ = try await dependency.value() }
         await registry.waitForAll()
     }
 }

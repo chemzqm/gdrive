@@ -552,10 +552,9 @@ extension SyncEngine {
                         if (try? taskRegistry.dependency(for: relPath)) != nil {
                             continue
                         }
-                        let task = Task {
+                        taskRegistry.startDirectoryTask(for: relPath) {
                             try await createDirectory(relPath: relPath, parent: parent, name: name, metadata: metadata)
                         }
-                        taskRegistry.registerDirectoryTask(task, for: relPath)
                     } else if type == .file {
                         let dev = Int64(metadata?.identity.device ?? 1)
                         let ino = Int64(metadata?.identity.inode ?? 0)
@@ -571,10 +570,9 @@ extension SyncEngine {
                         // File handling: wait for its immediate parent directory to be ready and upload immediately
                         notifier.addDiscovered(files: 1, bytes: Int64(fileSize))
                         self.monitor.enqueueUpload(id: fullPath, name: name, totalBytes: Int64(fileSize))
-                        let task = Task {
+                        taskRegistry.startFileTask {
                             await uploadFile(fullPath: fullPath, relPath: relPath, parent: parent, name: name, fileSize: Int64(fileSize))
                         }
-                        taskRegistry.registerFileTask(task)
                     }
                 }
             }

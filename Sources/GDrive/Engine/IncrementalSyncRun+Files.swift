@@ -109,11 +109,7 @@ extension IncrementalSyncRun {
     }
 
     func drainTransfers() async {
-        // Keep no-change scans free of the new streaming phase's queue hops.
-        guard startedTransfers.withLock({ $0 }) else { return }
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            syncGroup.notify(queue: .global(qos: .userInitiated)) { cont.resume() }
-        }
+        await itemTaskRegistry.drainAll()
     }
 
     private func acquireTransfer() async throws {
@@ -129,7 +125,6 @@ extension IncrementalSyncRun {
             syncSemaphore.signal()
             throw error
         }
-        startedTransfers.withLock { $0 = true }
     }
 
     func scheduleFiles(_ fileItems: [DirtyRecord], duringScan: Bool) async throws {
@@ -232,14 +227,12 @@ extension IncrementalSyncRun {
         notifier.addDiscovered(files: 1, bytes: upBytes)
         try await acquireTransfer()
         engine.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
-        syncGroup.enter()
         do {
             _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             var createIntent = item.pendingCreate
             defer {
                 engine.monitor.finishUpload(id: item.name)
                 syncSemaphore.signal()
-                syncGroup.leave()
                 notifier.addCompleted(files: 1, bytes: upBytes)
             }
 
@@ -323,7 +316,6 @@ extension IncrementalSyncRun {
         } catch {
             engine.monitor.finishUpload(id: item.name)
             syncSemaphore.signal()
-            syncGroup.leave()
             notifier.addCompleted(files: 1, bytes: upBytes)
             throw error
         }
@@ -354,13 +346,11 @@ extension IncrementalSyncRun {
         notifier.addDiscovered(files: 1, bytes: downSize)
         try await acquireTransfer()
         engine.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
-        syncGroup.enter()
         do {
             _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             defer {
                 engine.monitor.finishDownload(id: downId)
                 syncSemaphore.signal()
-                syncGroup.leave()
                 notifier.addCompleted(files: 1, bytes: downSize)
             }
 
@@ -446,7 +436,6 @@ extension IncrementalSyncRun {
         } catch {
             engine.monitor.finishDownload(id: downId)
             syncSemaphore.signal()
-            syncGroup.leave()
             notifier.addCompleted(files: 1, bytes: downSize)
             throw error
         }
@@ -474,12 +463,10 @@ extension IncrementalSyncRun {
 
     private func scheduleConflict(_ item: DirtyRecord, winner: ConflictWinner, conflictId: String) async throws {
         try await acquireTransfer()
-        syncGroup.enter()
         do {
             _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             defer {
                 syncSemaphore.signal()
-                syncGroup.leave()
             }
             do {
                 guard winner == .remote, let remoteID = item.remoteFileId else {
@@ -540,7 +527,6 @@ extension IncrementalSyncRun {
             }
         } catch {
             syncSemaphore.signal()
-            syncGroup.leave()
             throw error
         }
     }

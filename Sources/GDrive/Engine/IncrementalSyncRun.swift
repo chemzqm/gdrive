@@ -18,11 +18,9 @@ final class IncrementalSyncRun: Sendable {
     let remoteGate: RemoteChanges.Gate
     let directoryContext: DirectoryContext
     let syncSemaphore: AsyncSemaphore
-    let syncGroup: DispatchGroup
     let itemTaskRegistry: ItemTaskRegistry
     let actionTracker: ActionTracker
     let scheduled: OSAllocatedUnfairLock<Set<Int64>>
-    let startedTransfers: OSAllocatedUnfairLock<Bool>
     let seenTracker: SeenItemsTracker
     let seenDirTracker: SeenItemsTracker
     let scanProgress: ScanProgress
@@ -48,11 +46,9 @@ final class IncrementalSyncRun: Sendable {
         remoteGate: RemoteChanges.Gate,
         directoryContext: DirectoryContext,
         syncSemaphore: AsyncSemaphore,
-        syncGroup: DispatchGroup,
         itemTaskRegistry: ItemTaskRegistry,
         actionTracker: ActionTracker,
         scheduled: OSAllocatedUnfairLock<Set<Int64>>,
-        startedTransfers: OSAllocatedUnfairLock<Bool>,
         seenTracker: SeenItemsTracker,
         seenDirTracker: SeenItemsTracker,
         scanProgress: ScanProgress,
@@ -75,11 +71,9 @@ final class IncrementalSyncRun: Sendable {
         self.remoteGate = remoteGate
         self.directoryContext = directoryContext
         self.syncSemaphore = syncSemaphore
-        self.syncGroup = syncGroup
         self.itemTaskRegistry = itemTaskRegistry
         self.actionTracker = actionTracker
         self.scheduled = scheduled
-        self.startedTransfers = startedTransfers
         self.seenTracker = seenTracker
         self.seenDirTracker = seenDirTracker
         self.scanProgress = scanProgress
@@ -202,10 +196,9 @@ extension IncrementalSyncRun {
             remoteChanges: remoteChanges, remoteGate: remoteGate,
             directoryContext: directoryContext,
             syncSemaphore: AsyncSemaphore(count: effectiveSyncConcurrency),
-            syncGroup: DispatchGroup(), itemTaskRegistry: itemTaskRegistry,
+            itemTaskRegistry: itemTaskRegistry,
             actionTracker: ActionTracker(),
             scheduled: OSAllocatedUnfairLock(initialState: Set<Int64>()),
-            startedTransfers: OSAllocatedUnfairLock(initialState: false),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
             startTime: startTime, recoveredConflicts: recoveredConflicts.withLock { $0 },
@@ -220,6 +213,19 @@ extension IncrementalSyncRun {
             downloadCache.clear()
             engine.cleanupDownloadStagingDirectory(downloadDirectory)
         }
+        return try await withTaskCancellationHandler {
+            do {
+                return try await executeStages()
+            } catch {
+                await itemTaskRegistry.drainAll()
+                throw error
+            }
+        } onCancel: {
+            Task { await self.itemTaskRegistry.cancelAll() }
+        }
+    }
+
+    private func executeStages() async throws -> SyncStats {
         let pendingDirectories = try await loadDirtyItems().filter { item in
             guard item.entryKind == "directory", item.pendingCreate != nil else { return false }
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
@@ -267,9 +273,7 @@ extension IncrementalSyncRun {
     }
 
     private func finish() async throws -> SyncStats {
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            syncGroup.notify(queue: .global(qos: .userInitiated)) { cont.resume() }
-        }
+        await itemTaskRegistry.drainAll()
         let enumerated = try await remoteChanges.enumeratePending(limit: maxConcurrency)
         var stats = SyncStats()
         stats.remoteWorkPending = max(try await remoteChanges.pendingCount(), enumerated ? 1 : 0)

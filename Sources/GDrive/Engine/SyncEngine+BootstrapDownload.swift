@@ -130,7 +130,7 @@ extension SyncEngine {
 
         let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
         let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)
-        let downloadGroup = DispatchGroup()
+        let downloadTasks = TaskLifecycle()
         let databaseError = OSAllocatedUnfairLock<(any Error)?>(initialState: nil)
 
         @Sendable func checkDatabaseFailure() throws {
@@ -162,7 +162,7 @@ extension SyncEngine {
         let conflictRoot = try SyncConflictStore.directory(
             base: conflictDirectory, remoteRootID: remoteRootId)
 
-        func stageConflict(
+        @Sendable func stageConflict(
             _ item: DriveFile, parentItemId: Int64, localURL: URL, relativePath: String
         ) async throws -> Int64 {
             let conflictURL = conflictRoot.appendingPathComponent(relativePath)
@@ -192,17 +192,20 @@ extension SyncEngine {
             let downloadBytes = item.sizeBytes ?? 0
             notifier.addDiscovered(files: 1, bytes: downloadBytes)
             self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
-            downloadGroup.enter()
-            Task {
-                await downloadSemaphore.wait()
+            await downloadSemaphore.wait()
+            if Task.isCancelled {
+                downloadSemaphore.signal()
+                throw CancellationError()
+            }
+            downloadTasks.start {
                 defer {
                     self.monitor.finishDownload(id: item.id)
                     downloadSemaphore.signal()
-                    downloadGroup.leave()
                     notifier.addCompleted(files: 1, bytes: downloadBytes)
                 }
 
                 do {
+                    try Task.checkCancellation()
                     try checkDatabaseFailure()
                     self.monitor.startDownload(
                         id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
@@ -337,11 +340,11 @@ extension SyncEngine {
             try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
         } catch { traversalError = error }
 
-        // Wait for all in-flight download tasks to complete
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            downloadGroup.notify(queue: .global(qos: .userInitiated)) {
-                cont.resume()
-            }
+        // Wait for all admitted downloads. Cancellation reaches every active task.
+        await withTaskCancellationHandler {
+            await downloadTasks.waitForAll()
+        } onCancel: {
+            downloadTasks.cancelAll()
         }
 
         try checkDatabaseFailure()

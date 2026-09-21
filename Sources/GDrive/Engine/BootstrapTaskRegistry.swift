@@ -36,12 +36,10 @@ enum BootstrapDirectoryDependencyError: Error, LocalizedError, Sendable {
 final class BootstrapTaskRegistry: @unchecked Sendable {
     private struct State {
         var directories: [String: BootstrapDirectoryDependency]
-        var directoryTasks: [Task<BootstrapDirectoryTarget, Error>] = []
-        var fileTasks: [Task<Void, Never>] = []
-        var cancelled = false
     }
 
     private let state: OSAllocatedUnfairLock<State>
+    private let lifecycle = TaskLifecycle()
 
     init(root: BootstrapDirectoryTarget) {
         state = OSAllocatedUnfairLock(initialState: State(directories: ["": .ready(root)]))
@@ -62,35 +60,30 @@ final class BootstrapTaskRegistry: @unchecked Sendable {
         }
     }
 
-    func registerDirectoryTask(_ task: Task<BootstrapDirectoryTarget, Error>, for path: String) {
-        let shouldCancel = state.withLock { state in
-            state.directories[path] = .task(task)
-            state.directoryTasks.append(task)
-            return state.cancelled
-        }
-        if shouldCancel { task.cancel() }
+    func startDirectoryTask(
+        for path: String,
+        operation: @escaping @Sendable () async throws -> BootstrapDirectoryTarget
+    ) {
+        lifecycle.startThrowing({
+            let target = try await operation()
+            self.registerReady(target, for: path)
+            return target
+        }, onRegistered: { task in
+            state.withLock { state in
+                state.directories[path] = .task(task)
+            }
+        })
     }
 
-    func registerFileTask(_ task: Task<Void, Never>) {
-        let shouldCancel = state.withLock { state in
-            state.fileTasks.append(task)
-            return state.cancelled
-        }
-        if shouldCancel { task.cancel() }
+    func startFileTask(operation: @escaping @Sendable () async -> Void) {
+        lifecycle.start(operation)
     }
 
     func cancelAll() {
-        let tasks = state.withLock { state -> ([Task<BootstrapDirectoryTarget, Error>], [Task<Void, Never>]) in
-            state.cancelled = true
-            return (state.directoryTasks, state.fileTasks)
-        }
-        tasks.0.forEach { $0.cancel() }
-        tasks.1.forEach { $0.cancel() }
+        lifecycle.cancelAll()
     }
 
     func waitForAll() async {
-        let tasks = state.withLock { ($0.directoryTasks, $0.fileTasks) }
-        for task in tasks.0 { _ = try? await task.value }
-        for task in tasks.1 { await task.value }
+        await lifecycle.waitForAll()
     }
 }

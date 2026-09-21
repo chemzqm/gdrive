@@ -79,6 +79,20 @@ actor ItemTaskRegistry {
     func unblock(itemIDs: Set<Int64>) {
         blocked.subtract(itemIDs)
     }
+
+    func drainAll() async {
+        while !entries.isEmpty {
+            let tasks = entries.values.map(\.task)
+            for task in tasks { await task.value }
+        }
+    }
+
+    func cancelAll() async {
+        let tasks = entries.values.map(\.task)
+        tasks.forEach { $0.cancel() }
+        for task in tasks { await task.value }
+        entries.removeAll()
+    }
 }
 
 private struct ItemCleanupPlan: Sendable {
