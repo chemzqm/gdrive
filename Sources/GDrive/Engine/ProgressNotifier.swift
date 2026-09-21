@@ -49,9 +49,22 @@ public final class ProgressNotifier: @unchecked Sendable {
     private var tickerTask: Task<Void, Never>?
 
     public init(interval: TimeInterval = 0.5, onProgress: (@Sendable (SyncProgress) -> Void)?) {
+        self.onProgress = onProgress
+        self.interval = interval
+        startTicker()
+    }
+
+    init(
+        interval: TimeInterval,
+        startsTicker: Bool,
+        onProgress: (@Sendable (SyncProgress) -> Void)?
+    ) {
         self.interval = interval
         self.onProgress = onProgress
+        if startsTicker { startTicker() }
+    }
 
+    private func startTicker() {
         guard onProgress != nil else { return }
 
         // Launch Exclusive Independent Background Sampling Ticker,External callbacks and scans/Network pipeline is completely physically isolated
@@ -99,7 +112,7 @@ public final class ProgressNotifier: @unchecked Sendable {
     }
 
     /// Review and distribute changes (back office only Ticker triggered, the worker thread never executes an external closure)
-    private func notifyIfChanged() {
+    func notifyIfChanged() {
         guard let onProgress = self.onProgress else { return }
         os_unfair_lock_lock(&lock)
         guard totalDiscoveredFiles != lastNotifiedDiscovered || completedFiles != lastNotifiedCompleted else {

@@ -29,7 +29,6 @@ final class IncrementalSyncRun: Sendable {
     let startTime: DispatchTime
     let recoveredConflicts: Int
     let recoveredCleanups: Int
-    let localChangeScope: LocalChangeScope?
     let downloadCache: DownloadCache
     let collidedDownloads: OSAllocatedUnfairLock<[CollidedDownload]>
 
@@ -59,8 +58,7 @@ final class IncrementalSyncRun: Sendable {
         scanProgress: ScanProgress,
         startTime: DispatchTime,
         recoveredConflicts: Int,
-        recoveredCleanups: Int,
-        localChangeScope: LocalChangeScope?
+        recoveredCleanups: Int
     ) {
         self.engine = engine
         self.rootID = rootID
@@ -88,7 +86,6 @@ final class IncrementalSyncRun: Sendable {
         self.startTime = startTime
         self.recoveredConflicts = recoveredConflicts
         self.recoveredCleanups = recoveredCleanups
-        self.localChangeScope = localChangeScope
         self.downloadCache = DownloadCache()
         self.collidedDownloads = OSAllocatedUnfairLock(initialState: [])
     }
@@ -101,8 +98,7 @@ extension SyncEngine {
         localPath: String,
         remoteRootId: String,
         maxConcurrency: Int,
-        onProgress: (@Sendable (SyncProgress) -> Void)?,
-        localChanges: [LocalChange]? = nil
+        onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let run = try await IncrementalSyncRun.prepare(
             engine: self,
@@ -111,8 +107,7 @@ extension SyncEngine {
             localPath: localPath,
             remoteRootID: remoteRootId,
             maxConcurrency: maxConcurrency,
-            onProgress: onProgress,
-            localChanges: localChanges
+            onProgress: onProgress
         )
         return try await run.execute()
     }
@@ -126,8 +121,7 @@ extension IncrementalSyncRun {
         localPath: String,
         remoteRootID: String,
         maxConcurrency: Int,
-        onProgress: (@Sendable (SyncProgress) -> Void)?,
-        localChanges: [LocalChange]?
+        onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> IncrementalSyncRun {
         let startTime = DispatchTime.now()
         let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
@@ -215,8 +209,7 @@ extension IncrementalSyncRun {
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
             startTime: startTime, recoveredConflicts: recoveredConflicts.withLock { $0 },
-            recoveredCleanups: recoveredCleanups,
-            localChangeScope: localChanges.map { LocalChangeScope(rootURL: rootURL, changes: $0) }
+            recoveredCleanups: recoveredCleanups
         )
         prepared = true
         return run
@@ -231,7 +224,7 @@ extension IncrementalSyncRun {
             guard item.entryKind == "directory", item.pendingCreate != nil else { return false }
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
-            return !remoteGate.blocks(path) && isInLocalScope(path)
+            return !remoteGate.blocks(path)
         }
         try await recoverPendingDirectories(pendingDirectories)
         try await scanLocal()
@@ -241,7 +234,7 @@ extension IncrementalSyncRun {
         let eligibleItems = dirtyItems.filter { item in
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
-            return !remoteGate.blocks(path) && isInLocalScope(path)
+            return !remoteGate.blocks(path)
         }
         let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
         let deletionRoots = dirItems.compactMap { item -> String? in
@@ -271,10 +264,6 @@ extension IncrementalSyncRun {
         try await engine.store.flush()
         try await reconcileDirectories(dirItems)
         return try await finish()
-    }
-
-    func isInLocalScope(_ relativePath: String) -> Bool {
-        localChangeScope?.includes(relativePath) ?? true
     }
 
     private func finish() async throws -> SyncStats {

@@ -206,7 +206,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
     }
 }
 
-@Suite("Changes durability and scoped reconstruction (A13)")
+@Suite("Changes durability and reconstruction (A13)")
 struct ChangesRecoveryTests {
     private let context = TestHTTPContext(ChangesProtocolState())
     private struct Fixture {
@@ -302,7 +302,7 @@ struct ChangesRecoveryTests {
             try await testFixture.engine.syncIncrementalUnlocked(
                 rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
                 localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil, localChanges: [.modified(path: local.path, isDirectory: false)])
+                onProgress: nil)
         }
         let sqlite = try #require(error) as NSError
         #expect(sqlite.domain == "SQLiteStatement")
@@ -459,8 +459,8 @@ struct ChangesRecoveryTests {
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("unavailable/child").path))
     }
 
-    @Test("Known file moved outside preserves local bytes and cannot be written back", arguments: [false, true])
-    func movedOutside(scoped: Bool) async throws {
+    @Test("Known file moved outside preserves local bytes and cannot be written back")
+    func movedOutside() async throws {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let file = remoteFile("known", parent: "root")
@@ -474,16 +474,8 @@ struct ChangesRecoveryTests {
         }
         let local = testFixture.local.appendingPathComponent("known")
         try Data("new local content".utf8).write(to: local)
-        let stats: SyncStats
-        if scoped {
-            stats = try await testFixture.engine.syncIncrementalUnlocked(
-                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil, localChanges: [.modified(path: local.path, isDirectory: false)])
-        } else {
-            stats = try await testFixture.engine.syncIncremental(
-                localPath: testFixture.local.path)
-        }
+        let stats = try await testFixture.engine.syncIncremental(
+            localPath: testFixture.local.path)
         #expect(stats.filesUploaded == 0)
         #expect(stats.filesDeleted == 0)
         #expect(try String(contentsOf: local, encoding: .utf8) == "new local content")
@@ -597,8 +589,8 @@ struct ChangesRecoveryTests {
         #expect(!context.value.state.withLock { $0.requests.contains { $0.hasPrefix("PATCH") } })
     }
 
-    @Test("Moved-out directories also block new children after a local rename", arguments: [false, true])
-    func movedOutsideDirectory(scoped: Bool) async throws {
+    @Test("Moved-out directories also block new children after a local rename")
+    func movedOutsideDirectory() async throws {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
         let dir = folder("dir", "root")
@@ -617,16 +609,8 @@ struct ChangesRecoveryTests {
         _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         try FileManager.default.moveItem(at: testFixture.local.appendingPathComponent("dir"), to: testFixture.local.appendingPathComponent("renamed"))
         try Data("local new".utf8).write(to: testFixture.local.appendingPathComponent("renamed/new.txt"))
-        let stats: SyncStats
-        if scoped {
-            stats = try await testFixture.engine.syncIncrementalUnlocked(
-                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil, localChanges: [.modified(path: testFixture.local.path, isDirectory: true)])
-        } else {
-            stats = try await testFixture.engine.syncIncremental(
-                localPath: testFixture.local.path)
-        }
+        let stats = try await testFixture.engine.syncIncremental(
+            localPath: testFixture.local.path)
         #expect(stats.filesFailed == 0)
         #expect(stats.filesUploaded == 0)
         #expect(stats.directoriesCreated == 0)
@@ -939,10 +923,10 @@ struct ChangesRecoveryTests {
     }
 
     @Test(
-        "File and directory replacements preserve the baseline in full and scoped scans",
-        arguments: [false, true], [false, true])
+        "File and directory replacements preserve the baseline",
+        arguments: [false, true])
     func typeReplacementPreservesBaseline(
-        replacementIsDirectory: Bool, scoped: Bool
+        replacementIsDirectory: Bool
     ) async throws {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
@@ -971,15 +955,11 @@ struct ChangesRecoveryTests {
                 """)
         }
         let requestsBefore = context.value.state.withLock { $0.requests.count }
-        let changes: [LocalChange]? = scoped
-            ? [.modified(path: local.path, isDirectory: replacementIsDirectory)]
-            : nil
-
         await #expect(throws: (any Error).self) {
             try await testFixture.engine.syncIncrementalUnlocked(
                 rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
                 localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil, localChanges: changes)
+                onProgress: nil)
         }
 
         let baseline = try await testFixture.store.read { conn -> StoredBaseline in
@@ -1041,7 +1021,7 @@ struct ChangesRecoveryTests {
         let stats = try await testFixture.engine.syncIncrementalUnlocked(
             rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
             localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: nil)
+            onProgress: nil)
 
         #expect(stats.filesUploaded == 1)
         let names = context.value.state.withLock { Set($0.files.values.map(\.name)) }
@@ -1061,240 +1041,11 @@ struct ChangesRecoveryTests {
         let second = try await testFixture.engine.syncIncrementalUnlocked(
             rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
             localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: nil)
+            onProgress: nil)
         #expect(second.filesUploaded == 0)
         #expect(context.value.state.withLock {
             !$0.requests.dropFirst(requestCount).contains { $0.hasPrefix("PATCH ") }
         })
-    }
-
-    @Test("A file watcher event observes only the file and never scans or deletes its sibling")
-    func scopedFileObservationAvoidsWholeRootScan() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let changed = testFixture.local.appendingPathComponent("changed.txt")
-        let sibling = testFixture.local.appendingPathComponent("sibling.txt")
-        try Data("changed body".utf8).write(to: changed)
-        try Data("sibling body".utf8).write(to: sibling)
-        let remoteSibling = remoteFile("remote-sibling", parent: "root", content: "sibling body", name: "sibling.txt")
-        try await testFixture.store.write { conn in
-            try conn.execute("""
-                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (\(testFixture.rootID),\(testFixture.rootItemID),'sibling.txt','file','\(remoteSibling.id)','present','present','committed',0,1,1);
-                """)
-        }
-        let scanCount = OSAllocatedUnfairLock(initialState: 0)
-        let engine = try await SyncEngine(auth: testFixture.auth, store: testFixture.store,
-            client: testFixture.client, idPool: IDPool(initialIds: ["changed-id"]),
-            incrementalScan: { _, _ in scanCount.withLock { $0 += 1 } })
-
-        let stats = try await engine.syncIncrementalUnlocked(
-            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: [.modified(path: changed.path, isDirectory: false)])
-
-        #expect(stats.filesUploaded == 1)
-        #expect(scanCount.withLock { $0 } == 0)
-        let siblingState = try await testFixture.store.read { conn -> String? in
-            let stmt = try conn.prepare("SELECT local_status FROM items WHERE name = 'sibling.txt';")
-            defer { stmt.reset() }
-            #expect(try stmt.step())
-            return stmt.columnText(at: 0)
-        }
-        #expect(siblingState == "present")
-    }
-
-    @Test("A directory watcher event creates its parent then scans exactly that subtree")
-    func scopedDirectoryObservationCreatesParentAndScansSubtree() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let parent = testFixture.local.appendingPathComponent("new-parent", isDirectory: true)
-        let child = parent.appendingPathComponent("child.txt")
-        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
-        try Data("child body".utf8).write(to: child)
-        let scanRoots = OSAllocatedUnfairLock(initialState: [String]())
-        let engine = try await SyncEngine(auth: testFixture.auth, store: testFixture.store,
-            client: testFixture.client, idPool: IDPool(initialIds: ["parent-id", "child-id"]),
-            incrementalScan: { request, consume in
-                scanRoots.withLock { $0.append(request.root) }
-                try await SyncEngine.defaultDirectoryScan(request, consume)
-            })
-
-        let stats = try await engine.syncIncrementalUnlocked(
-            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: [.created(path: parent.path, isDirectory: true)])
-
-        #expect(stats.filesUploaded == 1)
-        #expect(scanRoots.withLock { $0 } == [parent.path])
-        let hierarchy = context.value.state.withLock { state in
-            let parentRemote = state.files.values.first { $0.name == "new-parent" }
-            let childRemote = state.files.values.first { $0.name == "child.txt" }
-            return (parentRemote?.id, parentRemote?.parents, childRemote?.parents)
-        }
-        #expect(hierarchy.1 == ["root"])
-        #expect(hierarchy.2 == [hierarchy.0].compactMap { $0 })
-    }
-
-    @Test("A delayed delete event re-observes a recreated file and never trashes its remote baseline")
-    func delayedDeleteRecreatedFileUsesCurrentEvidence() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let local = testFixture.local.appendingPathComponent("recreated.txt")
-        let old = Data("old body".utf8)
-        let current = Data("new body".utf8)
-        try current.write(to: local)
-        let remote = remoteFile("remote-recreated", parent: "root", content: "old body", name: "recreated.txt")
-        let oldSHA = SyncEngine.computeSha256(of: old)
-        try await testFixture.store.write { conn in
-            try conn.execute("""
-                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,base_sha256,base_size,remote_sha256,remote_size,local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (\(testFixture.rootID),\(testFixture.rootItemID),'recreated.txt','file','\(remote.id)','\(oldSHA)',\(old.count),'\(oldSHA)',\(old.count),'present','present','committed',0,1,1);
-                """)
-        }
-
-        _ = try await testFixture.engine.syncIncrementalUnlocked(
-            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: [.deleted(path: local.path, isDirectory: false)])
-        #expect(context.value.state.withLock { $0.files[remote.id]?.trashed != true })
-        let observed = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_sha256, local_status, dirty_generation, phase FROM items WHERE remote_file_id = 'remote-recreated';")
-            defer { stmt.reset() }
-            #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnText(at: 1), stmt.columnInt64(at: 2), stmt.columnText(at: 3))
-        }
-        #expect(observed.0 == SyncEngine.computeSha256(of: current))
-        #expect(observed.1 == "present")
-        #expect((observed.2 ?? 0) > 0)
-        #expect(observed.3 == "blocked")
-    }
-
-    @Test("A root modification persists a descendant hash failure while completing a healthy upload")
-    func rootScopePersistsDescendantFailureAfterHealthyUpload() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let vanished = testFixture.local.appendingPathComponent("vanished.txt")
-        let healthy = testFixture.local.appendingPathComponent("healthy.txt")
-        try Data("vanish".utf8).write(to: vanished)
-        try Data("healthy".utf8).write(to: healthy)
-        let batch = try entries([(vanished, .file), (healthy, .file)])
-        let roots = OSAllocatedUnfairLock(initialState: [String]())
-        let engine = try await SyncEngine(auth: testFixture.auth, store: testFixture.store,
-            client: testFixture.client, idPool: IDPool(initialIds: ["healthy-id"]),
-            incrementalScan: { request, consume in
-                roots.withLock { $0.append(request.root) }
-                try FileManager.default.removeItem(at: vanished)
-                try await consume(batch)
-            })
-
-        let stats = try await engine.syncIncrementalUnlocked(
-            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: [.modified(path: testFixture.local.path, isDirectory: true)])
-        #expect(roots.withLock { $0 } == [testFixture.local.path])
-        #expect(stats.filesFailed == 1)
-        #expect(stats.filesUploaded == 1)
-        #expect(context.value.state.withLock { $0.files.values.contains { $0.name == "healthy.txt" } })
-        let vanishedState = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status, local_sha256, dirty_generation, phase FROM items WHERE name = 'vanished.txt';")
-            defer { stmt.reset() }
-            #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnText(at: 1), stmt.columnInt64(at: 2), stmt.columnText(at: 3))
-        }
-        #expect(vanishedState.0 == "unknown")
-        #expect(vanishedState.1 == nil)
-        #expect((vanishedState.2 ?? 0) > 0)
-        #expect(vanishedState.3 == "waitingEvidence")
-    }
-
-    @Test("A modified-then-moved file hashes same-size same-mtime content instead of using the metadata shortcut")
-    func scopedMovedFileForcesSHADespiteMatchingMetadata() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let originalPath = testFixture.local.appendingPathComponent("same-metadata.txt")
-        let local = testFixture.local.appendingPathComponent("renamed-metadata.txt")
-        let old = Data("AAAA".utf8)
-        let current = Data("BBBB".utf8)
-        try old.write(to: originalPath)
-        var original = stat()
-        #expect(lstat(originalPath.path, &original) == 0)
-        let device = original.st_dev
-        let inode = original.st_ino
-        let mtime = original.st_mtimespec
-        let mtimeNanos = mtime.tv_sec * 1_000_000_000 + mtime.tv_nsec
-        let remote = remoteFile("remote-same-metadata", parent: "root", content: "AAAA", name: "same-metadata.txt")
-        let oldSHA = SyncEngine.computeSha256(of: old)
-        try await testFixture.store.write { conn in
-            try conn.execute("""
-                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,local_device,local_inode,local_mtime,local_size,local_sha256,base_sha256,base_size,remote_sha256,remote_size,local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (\(testFixture.rootID),\(testFixture.rootItemID),'same-metadata.txt','file','\(remote.id)',\(device),\(inode),\(mtimeNanos),4,'\(oldSHA)','\(oldSHA)',4,'\(oldSHA)',4,'present','present','committed',0,1,1);
-                """)
-        }
-        try current.write(to: originalPath)
-        var timestamps = [timespec(tv_sec: 0, tv_nsec: Int(UTIME_OMIT)), mtime]
-        #expect(utimensat(AT_FDCWD, originalPath.path, &timestamps, 0) == 0)
-        try FileManager.default.moveItem(at: originalPath, to: local)
-
-        _ = try await testFixture.engine.syncIncrementalUnlocked(
-            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-            onProgress: nil, localChanges: [
-                .modified(path: originalPath.path, isDirectory: false),
-                .moved(from: originalPath.path, to: local.path, isDirectory: false)
-            ])
-        let localState = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_sha256, local_status, dirty_generation, phase FROM items WHERE remote_file_id = 'remote-same-metadata';")
-            defer { stmt.reset() }
-            #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnText(at: 1), stmt.columnInt64(at: 2), stmt.columnText(at: 3))
-        }
-        #expect(localState.0 == SyncEngine.computeSha256(of: current))
-        #expect(localState.1 == "present")
-        #expect((localState.2 ?? 0) > 0)
-        #expect(localState.3 == "blocked")
-    }
-
-    @Test("A symlink ancestor is never treated as a missing changed file")
-    func scopedPathThroughSymlinkRetainsBaseline() async throws {
-        let testFixture = try await fixture()
-        defer { testFixture.cleanup() }
-        let directory = testFixture.local.appendingPathComponent("tracked", isDirectory: true)
-        let localFile = directory.appendingPathComponent("file.txt")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        try Data("old local".utf8).write(to: localFile)
-        let remoteDirectory = folder("remote-tracked", "root", name: "tracked")
-        let remote = remoteFile("remote-tracked-file", parent: remoteDirectory.id, content: "old remote", name: "file.txt")
-        try await testFixture.store.write { conn in
-            try conn.execute("""
-                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (\(testFixture.rootID),\(testFixture.rootItemID),'tracked','directory','\(remoteDirectory.id)','present','present','committed',0,1,1);
-                """)
-            let directoryID = conn.lastInsertRowId
-            try conn.execute("""
-                INSERT INTO items(root_id,parent_id,name,entry_kind,remote_file_id,local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (\(testFixture.rootID),\(directoryID),'file.txt','file','\(remote.id)','present','present','committed',0,1,1);
-                """)
-        }
-        let outside = testFixture.directory.appendingPathComponent("outside", isDirectory: true)
-        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
-        try FileManager.default.removeItem(at: directory)
-        try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: outside)
-
-        await #expect(throws: (any Error).self) {
-            try await testFixture.engine.syncIncrementalUnlocked(
-                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil, localChanges: [.modified(path: localFile.path, isDirectory: false)])
-        }
-        #expect(context.value.state.withLock { $0.files[remote.id]?.trashed != true })
-        let state = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status FROM items WHERE remote_file_id = 'remote-tracked-file';")
-            defer { stmt.reset() }
-            #expect(try stmt.step())
-            return stmt.columnText(at: 0)
-        }
-        #expect(state == "present")
     }
 
     @Test("A vanished observation does not abort later files or become a deletion")

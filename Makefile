@@ -13,7 +13,7 @@ clean:
 	rm -rf .build
 
 test:
-	swift test
+	GDRIVE_TESTING=1 swift test
 
 lint:
 	swiftlint lint --strict Sources Tests

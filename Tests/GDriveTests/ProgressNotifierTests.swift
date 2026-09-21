@@ -4,8 +4,8 @@ import Testing
 
 @Suite("ProgressNotifier Tests")
 struct ProgressNotifierTests {
-    @Test("ProgressNotifier aggregates discovery and completion with 50ms test debounce")
-    func testProgressNotifierDebounce() async throws {
+    @Test("ProgressNotifier aggregates discovery and completion before final progress")
+    func testProgressNotifierAggregation() {
         final class CallbackRecord: @unchecked Sendable {
             var calls = [SyncProgress]()
             private var lock = os_unfair_lock()
@@ -30,9 +30,10 @@ struct ProgressNotifierTests {
         }
 
         let tracker = CallbackRecord()
-        let notifier = ProgressNotifier(interval: 0.05) { progress in
-            tracker.record(progress)
-        }
+        let notifier = ProgressNotifier(
+            interval: 0.05,
+            startsTicker: false,
+            onProgress: { progress in tracker.record(progress) })
 
         // 1. Intensive and rapid triggering 100 Updates (simulating uploading while scanning)
         for index in 1...100 {
@@ -42,18 +43,9 @@ struct ProgressNotifierTests {
             }
         }
 
-        // The 50ms test interval coalesces the burst of updates.
-        #expect(tracker.count <= 2)
-
-        // Observe the real timer, retaining the original 600ms scheduling budget.
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .milliseconds(600))
-        while tracker.last?.completedFiles != 50 && clock.now < deadline {
-            try await Task.sleep(for: .milliseconds(10))
-        }
-
-        // should trigger the merged trailing callback
-        #expect(tracker.count >= 1)
+        #expect(tracker.count == 0)
+        notifier.notifyIfChanged()
+        #expect(tracker.count == 1)
         if let latest = tracker.last {
             #expect(latest.totalDiscoveredFiles == 100)
             #expect(latest.completedFiles == 50)

@@ -162,11 +162,8 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 
 上述显式同步入口共用进程内根目录锁：同一本地根已有同步运行时，另一次显式调用立即抛出
 `SyncEngineError.rootBusy(path:)`；不同引擎实例也共享这一限制。不同本地根可独立运行，
-该锁不提供跨进程互斥。文件监听应使用 `notifyLocalChanges(_:)` 提交变化，
-该接口接收并合并变化后返回，在当前整轮同步结束后自动执行。
-pendingTask 执行期间同样持有根锁，显式同步调用仍返回 `rootBusy`；新的变化通知仍可接收。
-显式同步自身成功后，会等待当时及排空期间接收的 pendingTask 逐批执行完毕再返回；返回的
-`SyncStats` 只统计显式同步自身的轮次，不包含随后执行的 pendingTask。
+该锁不提供跨进程互斥。库不接收单个文件变化；需要响应文件监听事件时，由调用方合并或防抖后
+显式调用 `syncIncremental(localPath:)` 执行整根同步。
 
 ### 3.1 统一智能同步入口 (`sync`) 【推荐】
 
@@ -260,7 +257,7 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 ### 3.3 增量双向同步 (`syncIncremental`)
 
 完成初始化后，可通过 `syncIncremental` 主动执行整根双向同步，包括定时拉取远端变化。
-本地文件监听回调使用 `notifyLocalChanges(_:)`，无需提供远端 ID，见第 5 节。
+本地文件监听也应触发该整根同步入口，见第 5 节。
 
 ```swift
 let stats = try await engine.syncIncremental(
@@ -299,10 +296,7 @@ Google Drive 文件夹 ID；找不到完整绑定时会在扫描和任何远端�
 
 ## 4. 统计结果结构 (`SyncStats`)
 
-显式同步调用返回自身轮次的 `SyncStats` 值，字段均为可读写的 `public var`，初始值为 `0`；
-调用返回前排空的 pendingTask 不计入该值。
-`notifyLocalChanges(_:)` 只确认接收，不返回同步统计；运行状态和待执行通知通过
-`pendingLocalChangeStatus()` 查询，执行失败记录到日志。
+显式同步调用返回自身轮次的 `SyncStats` 值，字段均为可读写的 `public var`，初始值为 `0`。
 
 ```swift
 public struct SyncStats: Sendable {
@@ -329,7 +323,7 @@ public struct SyncStats: Sendable {
 
 ---
 
-## 5. 外部调用方如何实现常驻监听与自动触发
+## 5. 外部调用方如何实现常驻同步
 
 `GDrive` 库遵循轻量化设计，将监听策略的控制权交由调用方（宿主应用）。调用方可以根据业务场景选择最适宜的触发模型：
 
@@ -351,49 +345,9 @@ Task {
 }
 ```
 
-### 示例 B：提交本地文件和目录变化
-
-宿主负责监听文件系统，将具体变化交给 gdrive。路径使用本地路径字符串，支持展开 `~`；
-移动包含旧、新路径，删除事件也应保留原条目的 `isDirectory` 信息。
-
-```swift
-let changes: [LocalChange] = [
-    .created(path: localDir + "/new.txt", isDirectory: false),
-    .modified(path: localDir + "/notes.txt", isDirectory: false),
-    .deleted(path: localDir + "/old-folder", isDirectory: true),
-    .moved(from: localDir + "/draft.txt", to: localDir + "/final.txt", isDirectory: false)
-]
-try await engine.notifyLocalChanges(changes)
-```
-
-显式同步 API 在入口检查数据库连接，连接失败直接抛出；`notifyLocalChanges` 解析根绑定时的
-数据库访问失败按其原有 `async throws` 契约直接返回。
-接收后的后台同步中，可能影响后续传输或同步结果的数据库错误会终止本轮；能够在条目级
-隔离的数据库错误只写入 error log。后台任务在边界记录本轮错误，不再提供额外错误事件。
-
-调用方不需要 `remoteRootId`。库按路径查找所属的已配置同步根，或正在运行的父目录同步任务；
-首次同步尚未写入根记录时也可接收变化。无法找到所属根时抛错，不会猜测远端目标。
-
-每个根只有一个运行任务和一个合并中的 pendingTask：当前整轮同步结束后取出 pendingTask，
-清空待执行槽位，再执行涉及文件和目录的增量同步。期间收到的新变化进入下一批，逐批执行
-直到清空。根当前没有运行任务时，也会创建 pendingTask 并立即启动执行。
-同一根的同步轮次串行，单轮内的传输仍可并发，不同根彼此独立。
-
-执行前重新检查本地状态并与 SQLite 基线比较，淘汰过时操作：重复修改且 SHA-256 未变时
-不传输；新增后已消失的文件不会按旧事件上传；删除后重新出现的路径不会按旧事件删除。
-移动同时核实旧、新位置，目录按当前子树扫描。局部扫描只在覆盖范围内判断缺失，不会将
-未扫描的兄弟目录视为删除。局部观察的文件会重新核实 SHA-256，避免移动或重建后的
-路径误用旧的元数据缓存。
-
-```swift
-for status in await engine.pendingLocalChangeStatus() {
-    print(status.localRootPath,
-          "运行中:", status.isRunning,
-          "待处理变化:", status.pendingChangeCount)
-}
-```
-一次移动的两个路径必须属于同一个同步根；跨根移动应分别提交源路径删除和目标路径新增。
-队列为进程内状态，不承诺通知的崩溃持久化；重启后应主动执行一次整根同步重新观察状态。
+如宿主已有文件系统监听，可将事件仅作为“该根可能有变化”的触发信号，先在宿主侧合并或防抖，
+再调用 `syncIncremental(localPath:)`。库始终重新扫描整个同步根并与 SQLite 基线比较，不接受或
+缓存逐文件事件。同一根已有同步运行时会返回 `rootBusy`，调用方可在当前轮次结束后再次触发。
 
 ---
 
@@ -402,7 +356,7 @@ for status in await engine.pendingLocalChangeStatus() {
 初始化和同步入口使用 `async throws`；`setDownloadTemporaryDirectory(_:)` 为同步 `throws`，
 读取配置和传输快照不抛出异常。可能抛出的主要异常类型包括：
 
-- `SyncEngineError.rootBusy(path:)`：同一本地根在当前进程中已有同步运行；本地变化使用 `notifyLocalChanges(_:)` 合并提交。
+- `SyncEngineError.rootBusy(path:)`：同一本地根在当前进程中已有同步运行。
 - `SyncEngineError.localRootNotFound(path:)`：增量同步的本地根消失或不再是目录，停止同步以保护远端数据。
 - `SyncEngineError.remoteRootLost(remoteId:reason:)`：远端同步根丢失、被移入回收站或不再是目录，停止同步以保护本地数据。
 - `SyncEngineError.general(_:)`：配置或同步保护条件不满足，具体原因见错误描述。

@@ -244,8 +244,6 @@ extension SyncEngine {
             let plan = try await makeCleanupPlan(itemID: initial.itemID, expected: expected)
             let operationID = try await prepareCleanupIntent(
                 plan: plan, operationType: operationType)
-            await RootSyncCoordinator.shared.discardPendingChanges(
-                for: plan.localRootPath, under: plan.localURL.path)
             try await removePrimary(plan, operationID)
             try removeCleanupArtifacts(plan)
             try await deleteCleanupRows(plan, operationID: operationID)

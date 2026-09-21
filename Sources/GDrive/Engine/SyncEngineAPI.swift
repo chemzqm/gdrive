@@ -263,25 +263,6 @@ public final class SyncEngine: Sendable {
         }
     }
 
-    /// Registers watcher observations and returns after admission. Transfers run
-    /// after the current whole-root round, or in a new background round when idle.
-    public func notifyLocalChanges(_ changes: [LocalChange]) async throws {
-        guard !changes.isEmpty else { return }
-        let normalized = changes.map(Self.normalizedLocalChange)
-        let roots = try await resolveNotificationRoots(for: normalized)
-        for (root, rootChanges) in roots {
-            let shouldStart = await RootSyncCoordinator.shared.enqueue(rootChanges, for: root)
-            if shouldStart {
-                Task { await self.drainPendingLocalChanges(localRootPath: root) }
-            }
-        }
-    }
-
-    /// Returns process-local watcher queue state.
-    public func pendingLocalChangeStatus() async -> [PendingLocalChangeStatus] {
-        await RootSyncCoordinator.shared.statuses()
-    }
-
     // MARK: - Root synchronization lock
 
     func withRootSyncLock<T: Sendable>(
@@ -293,12 +274,10 @@ public final class SyncEngine: Sendable {
         try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
         do {
             let result = try await operation()
-            await drainPendingLocalChanges(localRootPath: resolvedLocalPath)
+            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
             return result
         } catch {
-            if !(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: resolvedLocalPath)) {
-                Task { await self.drainPendingLocalChanges(localRootPath: resolvedLocalPath) }
-            }
+            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
             throw error
         }
     }
@@ -315,66 +294,6 @@ public final class SyncEngine: Sendable {
 
     static func normalizedPath(_ path: String) -> String {
         RootSyncCoordinator.normalizedPath(path)
-    }
-
-    private static func normalizedLocalChange(_ change: LocalChange) -> LocalChange {
-        switch change {
-        case .created(let path, let isDirectory): return .created(path: normalizedPath(path), isDirectory: isDirectory)
-        case .modified(let path, let isDirectory): return .modified(path: normalizedPath(path), isDirectory: isDirectory)
-        case .deleted(let path, let isDirectory): return .deleted(path: normalizedPath(path), isDirectory: isDirectory)
-        case .moved(let from, let destination, let isDirectory):
-            return .moved(from: normalizedPath(from), to: normalizedPath(destination), isDirectory: isDirectory)
-        }
-    }
-
-    private func resolveNotificationRoots(for changes: [LocalChange]) async throws -> [(String, [LocalChange])] {
-        let paths = changes.flatMap(\.paths)
-        let active = await RootSyncCoordinator.shared.activeRoots(containing: paths)
-        let databaseRoots: [String] = try await store.read { conn in
-            let stmt = try conn.cachedStatement("SELECT local_root_path FROM roots WHERE is_active = 1;")
-            defer { stmt.reset() }
-            var result: [String] = []
-            while try stmt.step(), let path = stmt.columnText(at: 0) { result.append(Self.normalizedPath(path)) }
-            return result
-        }
-        let candidates = Set(active + databaseRoots)
-        var routed: [String: [LocalChange]] = [:]
-        for change in changes {
-            let matching = candidates.filter { root in change.paths.allSatisfy { RootSyncCoordinator.contains($0, in: root) } }
-            guard let root = matching.max(by: { $0.count < $1.count }) else {
-                throw SyncEngineError.general("No single configured local root contains local change paths: \(change.paths.joined(separator: ", "))")
-            }
-            routed[root, default: []].append(change)
-        }
-        return routed.map { ($0.key, $0.value) }
-    }
-
-    private func drainPendingLocalChanges(localRootPath: String) async {
-        while true {
-            guard let batch = await RootSyncCoordinator.shared.takePending(for: localRootPath) else {
-                if await RootSyncCoordinator.shared.finishIfIdle(localRootPath: localRootPath) { return }
-                continue
-            }
-            do {
-                try await runPendingLocalChanges(batch.changes, localRootPath: localRootPath)
-            } catch is CancellationError {
-                logger.warning("Discarded cancelled pending local changes for \(localRootPath)")
-                Task { await self.drainPendingLocalChanges(localRootPath: localRootPath) }
-                return
-            } catch {
-                logger.error("Discarded failed pending local changes for \(localRootPath): \(error)")
-            }
-        }
-    }
-
-    private func runPendingLocalChanges(_ changes: [LocalChange], localRootPath: String) async throws {
-        guard let root = try await activeRootBinding(localRootPath: localRootPath) else {
-            logger.warning(
-                "Discard pending local changes because no active root binding exists [\(localRootPath), changes=\(changes.count)]")
-            return
-        }
-        _ = try await syncIncrementalUnlocked(rootId: root.id, rootItemId: root.item, localPath: localRootPath,
-            remoteRootId: root.remote, maxConcurrency: 64, onProgress: nil, localChanges: changes)
     }
 
     private func activeRootBinding(localRootPath: String) async throws -> PendingRoot? {
