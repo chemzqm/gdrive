@@ -907,6 +907,32 @@ public final class DriveClient: Sendable {
         guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
             throw SyncEngineError.localFileModified(path: destinationURL.path)
         }
+        let download = try await downloadVerifiedFile(
+            remoteId: remoteId, expectedSha256: expectedSha256,
+            temporaryDirectory: temporaryDirectory, onProgress: onProgress)
+        defer { try? FileManager.default.removeItem(at: download.url) }
+        try await beforePublish?()
+        switch try LocalFilePublication.publish(
+            download.url, to: destinationURL, expected: expectedDestination,
+            expectedSHA256: download.sha256) {
+        case .published(let version): return version
+        case .destinationChanged:
+            throw SyncEngineError.localFileModified(path: destinationURL.path)
+        }
+    }
+
+    struct VerifiedDownload: Sendable {
+        let url: URL
+        let sha256: String
+        let size: Int64
+    }
+
+    func downloadVerifiedFile(
+        remoteId: String,
+        expectedSha256: String?,
+        temporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
+        onProgress: (@Sendable (Int64) -> Void)? = nil
+    ) async throws -> VerifiedDownload {
         try DownloadStaging.prepare(temporaryDirectory)
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
@@ -919,57 +945,56 @@ public final class DriveClient: Sendable {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
-        defer {
-            try? FileManager.default.removeItem(at: tempURL)
-        }
+        do {
+            let (asyncBytes, http) = try await executeStreamingRequest(req)
+            if http.statusCode == 404 {
+                throw DriveError.notFound(fileId: remoteId)
+            }
+            if !(200..<300).contains(http.statusCode) {
+                throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
+            }
 
-        let (asyncBytes, http) = try await executeStreamingRequest(req)
-        if http.statusCode == 404 {
-            throw DriveError.notFound(fileId: remoteId)
-        }
-        if !(200..<300).contains(http.statusCode) {
-            throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
-        }
+            FileManager.default.createFile(atPath: tempURL.path, contents: nil)
+            let fileHandle = try FileHandle(forWritingTo: tempURL)
+            defer { try? fileHandle.close() }
 
-        FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-        let fileHandle = try FileHandle(forWritingTo: tempURL)
-        defer { try? fileHandle.close() }
+            var ctx = CC_SHA256_CTX()
+            CC_SHA256_Init(&ctx)
+            var byteCount: Int64 = 0
+            var buffer = [UInt8]()
+            buffer.reserveCapacity(64 * 1024)
 
-        var ctx = CC_SHA256_CTX()
-        CC_SHA256_Init(&ctx)
-
-        var buffer = [UInt8]()
-        buffer.reserveCapacity(64 * 1024)
-
-        for try await byte in asyncBytes {
-            buffer.append(byte)
-            if buffer.count >= 64 * 1024 {
+            for try await byte in asyncBytes {
+                buffer.append(byte)
+                if buffer.count >= 64 * 1024 {
+                    CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
+                    try fileHandle.write(contentsOf: buffer)
+                    byteCount += Int64(buffer.count)
+                    onProgress?(Int64(buffer.count))
+                    buffer.removeAll(keepingCapacity: true)
+                }
+            }
+            if !buffer.isEmpty {
                 CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
                 try fileHandle.write(contentsOf: buffer)
+                byteCount += Int64(buffer.count)
                 onProgress?(Int64(buffer.count))
-                buffer.removeAll(keepingCapacity: true)
             }
-        }
-        if !buffer.isEmpty {
-            CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
-            try fileHandle.write(contentsOf: buffer)
-            onProgress?(Int64(buffer.count))
-        }
-        try fileHandle.close()
+            try fileHandle.close()
 
-        var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
-        CC_SHA256_Final(&digest, &ctx)
-        let actualSha256 = digest.map { String(format: "%02x", $0) }.joined()
+            var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
+            CC_SHA256_Final(&digest, &ctx)
+            let actualSha256 = digest.map { String(format: "%02x", $0) }.joined()
 
-        if let expected = expectedSha256, actualSha256.caseInsensitiveCompare(expected) != .orderedSame {
+            if let expected = expectedSha256,
+               actualSha256.caseInsensitiveCompare(expected) != .orderedSame {
+                throw DriveError.checksumMismatch(expected: expected, actual: actualSha256)
+            }
+            return VerifiedDownload(url: tempURL, sha256: actualSha256, size: byteCount)
+        } catch {
             try? FileManager.default.removeItem(at: tempURL)
-            throw DriveError.checksumMismatch(expected: expected, actual: actualSha256)
+            throw error
         }
-
-        try await beforePublish?()
-        return try LocalFilePublication.publish(
-            tempURL, to: destinationURL, expected: expectedDestination,
-            expectedSHA256: actualSha256)
     }
 
     // MARK: - Changes Incremental Changes

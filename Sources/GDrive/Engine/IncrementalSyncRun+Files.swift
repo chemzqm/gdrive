@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 
@@ -30,7 +31,129 @@ final class ActionTracker: @unchecked Sendable {
     }
 }
 
+struct CollidedDownload: Sendable {
+    let item: DirtyRecord
+    let localFileURL: URL
+    let relPath: String
+}
+
 extension IncrementalSyncRun {
+    private func downloadPlanIsCurrent(_ item: DirtyRecord) async throws -> Bool {
+        try await engine.store.read { conn in
+            let stmt = try conn.cachedStatement(
+                """
+                SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
+                    AND remote_generation = ? AND dirty_generation = ?;
+                """)
+            defer { stmt.reset() }
+            stmt.bindInt64(item.itemId, at: 1)
+            stmt.bindInt64(item.localGeneration, at: 2)
+            stmt.bindInt64(item.remoteGeneration, at: 3)
+            stmt.bindInt64(item.dirtyGeneration, at: 4)
+            return try stmt.step()
+        }
+    }
+
+    private func commitDownloadReceipt(
+        item: DirtyRecord, localFileURL: URL, published: LocalFileVersion
+    ) async throws {
+        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
+        try await engine.store.batchWrite { conn in
+            guard (try? LocalFileVersion.read(at: localFileURL)) == published else {
+                return
+            }
+            let stmt = try conn.cachedStatement(
+                """
+                UPDATE items SET
+                    local_sha256 = remote_sha256,
+                    local_size = remote_size,
+                    local_mtime = ?,
+                    local_device = ?,
+                    local_inode = ?,
+                    local_status = 'present',
+                    remote_status = 'present',
+                    base_sha256 = remote_sha256,
+                    base_size = remote_size,
+                    phase = 'committed',
+                    dirty_generation = 0,
+                    updated_at = ?
+                WHERE item_id = ? AND local_generation = ?
+                    AND remote_generation = ? AND dirty_generation = ?;
+                """)
+            stmt.bindInt64(Int64(published.mtime), at: 1)
+            stmt.bindInt64(published.device, at: 2)
+            stmt.bindInt64(published.inode, at: 3)
+            stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
+            stmt.bindInt64(item.itemId, at: 5)
+            stmt.bindInt64(item.localGeneration, at: 6)
+            stmt.bindInt64(item.remoteGeneration, at: 7)
+            stmt.bindInt64(item.dirtyGeneration, at: 8)
+            _ = try stmt.step()
+            stmt.reset()
+            guard conn.changes == 1 else { return }
+            receiptApplied.withLock { $0 = true }
+        }
+        guard receiptApplied.withLock({ $0 }) else {
+            throw SyncEngineError.general(
+                "The download receipt is stale; the newer generation remains pending: \(item.name)"
+            )
+        }
+    }
+
+    func processCollidedDownloads() async throws {
+        let collided = collidedDownloads.withLock { state -> [CollidedDownload] in
+            let all = state
+            state.removeAll()
+            return all
+        }
+        guard !collided.isEmpty else { return }
+
+        var receipts: [@Sendable (SQLiteConnection) throws -> Void] = []
+        for entry in collided {
+            try actionTracker.throwIfDatabaseFailure()
+            let item = entry.item
+            let localFileURL = entry.localFileURL
+
+            do {
+                guard try await downloadPlanIsCurrent(item) else {
+                    engine.logger.warning("Download plan expired for collided item: \(item.name)")
+                    continue
+                }
+
+                let currentVersion = try LocalFileVersion.read(at: localFileURL)
+                let localObs: LocalObservation
+                if let currentVersion {
+                    let digest = try SyncEngine.computeFileSha256(at: localFileURL)
+                    try currentVersion.validate(at: localFileURL)
+                    localObs = LocalObservation(
+                        status: .present, sha256: digest.sha256Hex,
+                        size: digest.fileSize, mtime: currentVersion.mtime)
+                } else {
+                    localObs = LocalObservation(status: .absent)
+                }
+
+                let decision = Reconciler.decide(
+                    baseline: item.baseline, local: localObs, remote: item.remote)
+
+                try await applyDecision(decision, to: item, receipts: &receipts)
+            } catch {
+                actionTracker.failures.withLock { $0 += 1 }
+                actionTracker.recordDatabaseFailure(error)
+                engine.logger.error("Failed to re-reconcile collided download [\(item.name)]: \(error)")
+            }
+        }
+
+        if !receipts.isEmpty {
+            let batch = receipts
+            try await engine.store.write { conn in
+                for receipt in batch { try receipt(conn) }
+            }
+        }
+
+        await drainTransfers()
+        try actionTracker.throwIfDatabaseFailure()
+    }
+
     func drainTransfers() async {
         // Keep no-change scans free of the new streaming phase's queue hops.
         guard startedTransfers.withLock({ $0 }) else { return }
@@ -387,6 +510,41 @@ extension IncrementalSyncRun {
         }
     }
 
+    private func validateExpectedDestination(at url: URL, item: DirtyRecord) throws -> LocalFileVersion? {
+        let expected = try LocalFileVersion.read(at: url)
+        if item.local?.status == .present {
+            guard let expected,
+                expected.device == item.localDevice,
+                expected.inode == item.localInode,
+                expected.mtime == item.localMtime,
+                expected.size == item.local?.size
+            else {
+                throw SyncEngineError.localFileModified(path: url.path)
+            }
+            return expected
+        }
+        if expected != nil {
+            throw SyncEngineError.localFileModified(path: url.path)
+        }
+        return nil
+    }
+
+    private func fetchVerifiedDownload(
+        remoteFileId: String, expectedSha256: String?, downId: String
+    ) async throws -> DriveClient.VerifiedDownload {
+        if let cached = downloadCache.take(remoteID: remoteFileId, sha256: expectedSha256 ?? "") {
+            return DriveClient.VerifiedDownload(url: cached.url, sha256: cached.sha256, size: cached.size)
+        }
+        return try await engine.client.downloadVerifiedFile(
+            remoteId: remoteFileId,
+            expectedSha256: expectedSha256,
+            temporaryDirectory: downloadDirectory,
+            onProgress: { delta in
+                self.engine.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
+            }
+        )
+    }
+
     private func scheduleDownload(_ item: DirtyRecord) async throws {
         let downId = item.remoteFileId ?? item.name
         let downSize = item.remote?.size ?? 0
@@ -414,101 +572,37 @@ extension IncrementalSyncRun {
                     at: localFileURL.deletingLastPathComponent(),
                     withIntermediateDirectories: true)
 
-                let expectedDestination = try LocalFileVersion.read(at: localFileURL)
-                if item.local?.status == .present {
-                    guard let expectedDestination,
-                        expectedDestination.device == item.localDevice,
-                        expectedDestination.inode == item.localInode,
-                        expectedDestination.mtime == item.localMtime,
-                        expectedDestination.size == item.local?.size
-                    else {
-                        throw SyncEngineError.localFileModified(path: localFileURL.path)
-                    }
-                } else if expectedDestination != nil {
-                    throw SyncEngineError.localFileModified(path: localFileURL.path)
-                }
+                let expectedDestination = try validateExpectedDestination(at: localFileURL, item: item)
                 engine.monitor.startDownload(
                     id: downId, name: item.name, totalBytes: downSize)
-                let published = try await engine.client.downloadFileSafely(
-                    remoteId: remoteFileId,
-                    destinationURL: localFileURL,
-                    expectedSha256: item.remote?.sha256,
-                    expectedDestination: expectedDestination,
-                    temporaryDirectory: downloadDirectory,
-                    beforePublish: {
-                        let current = try await self.engine.store.read { conn in
-                            let stmt = try conn.cachedStatement(
-                                """
-                                SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
-                                    AND remote_generation = ? AND dirty_generation = ?;
-                                """)
-                            defer { stmt.reset() }
-                            stmt.bindInt64(item.itemId, at: 1)
-                            stmt.bindInt64(item.localGeneration, at: 2)
-                            stmt.bindInt64(item.remoteGeneration, at: 3)
-                            stmt.bindInt64(item.dirtyGeneration, at: 4)
-                            return try stmt.step()
-                        }
-                        guard current else {
-                            throw SyncEngineError.general(
-                                "Download plan has expired, keep local files: \(item.name)")
-                        }
-                    },
-                    onProgress: { delta in
-                        self.engine.monitor.reportDownloadProgress(
-                            id: downId, additionalBytes: delta)
-                    }
-                )
-
-                let fSize = published.size
-                let mtime = published.mtime
-
-                let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                try await engine.store.batchWrite { conn in
-                    guard (try? LocalFileVersion.read(at: localFileURL)) == published else {
-                        return
-                    }
-                    let stmt = try conn.cachedStatement(
-                        """
-                        UPDATE items SET
-                            local_sha256 = remote_sha256,
-                            local_size = remote_size,
-                            local_mtime = ?,
-                            local_device = ?,
-                            local_inode = ?,
-                            local_status = 'present',
-                            remote_status = 'present',
-                            base_sha256 = remote_sha256,
-                            base_size = remote_size,
-                            phase = 'committed',
-                            dirty_generation = 0,
-                            updated_at = ?
-                        WHERE item_id = ? AND local_generation = ?
-                            AND remote_generation = ? AND dirty_generation = ?;
-                        """)
-                    stmt.bindInt64(Int64(mtime), at: 1)
-                    stmt.bindInt64(published.device, at: 2)
-                    stmt.bindInt64(published.inode, at: 3)
-                    stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
-                    stmt.bindInt64(item.itemId, at: 5)
-                    stmt.bindInt64(item.localGeneration, at: 6)
-                    stmt.bindInt64(item.remoteGeneration, at: 7)
-                    stmt.bindInt64(item.dirtyGeneration, at: 8)
-                    _ = try stmt.step()
-                    stmt.reset()
-                    guard conn.changes == 1 else { return }
-                    receiptApplied.withLock { $0 = true }
-                }
-                guard receiptApplied.withLock({ $0 }) else {
+                let download = try await fetchVerifiedDownload(
+                    remoteFileId: remoteFileId, expectedSha256: item.remote?.sha256, downId: downId)
+                defer { try? FileManager.default.removeItem(at: download.url) }
+                guard try await downloadPlanIsCurrent(item) else {
                     throw SyncEngineError.general(
-                        "The download receipt is stale; the newer generation remains pending: \(item.name)"
-                    )
+                        "Download plan has expired, keep local files: \(item.name)")
                 }
-
-                scheduled.withLock { _ = $0.remove(item.itemId) }
-                actionTracker.counts.withLock {
-                    $0.downloaded += 1
-                    $0.bytesDown += fSize
+                let publication = try LocalFilePublication.publish(
+                    download.url, to: localFileURL, expected: expectedDestination,
+                    expectedSHA256: download.sha256)
+                switch publication {
+                case .published(let published):
+                    try await commitDownloadReceipt(
+                        item: item, localFileURL: localFileURL, published: published)
+                    scheduled.withLock { _ = $0.remove(item.itemId) }
+                    actionTracker.counts.withLock {
+                        $0.downloaded += 1
+                        $0.bytesDown += published.size
+                    }
+                case .destinationChanged:
+                    if downloadCache.store(download, remoteID: remoteFileId, temporaryDirectory: downloadDirectory) != nil {
+                        collidedDownloads.withLock {
+                            $0.append(CollidedDownload(item: item, localFileURL: localFileURL, relPath: relPath))
+                        }
+                    } else {
+                        scheduled.withLock { _ = $0.remove(item.itemId) }
+                        throw SyncEngineError.localFileModified(path: localFileURL.path)
+                    }
                 }
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
@@ -577,10 +671,21 @@ extension IncrementalSyncRun {
                     let destination = conflictRoot.appendingPathComponent(relativePath)
                     try FileManager.default.createDirectory(
                         at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    _ = try await engine.client.downloadFileSafely(
-                        remoteId: remoteID, destinationURL: destination, expectedSha256: remoteSHA,
-                        expectedDestination: try LocalFileVersion.read(at: destination),
-                        temporaryDirectory: conflictRoot)
+                    if let cached = downloadCache.take(remoteID: remoteID, sha256: remoteSHA) {
+                        defer { try? FileManager.default.removeItem(at: cached.url) }
+                        let expected = try LocalFileVersion.read(at: destination)
+                        let result = try LocalFilePublication.publish(
+                            cached.url, to: destination, expected: expected,
+                            expectedSHA256: remoteSHA)
+                        guard case .published = result else {
+                            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+                        }
+                    } else {
+                        _ = try await engine.client.downloadFileSafely(
+                            remoteId: remoteID, destinationURL: destination, expectedSha256: remoteSHA,
+                            expectedDestination: try LocalFileVersion.read(at: destination),
+                            temporaryDirectory: conflictRoot)
+                    }
                     stored = destination
                 }
                 let status: SyncConflict.RemoteStatus = item.remote?.status == .trashed ? .trashed :
@@ -589,7 +694,10 @@ extension IncrementalSyncRun {
                     store: engine.store, rootID: rootID, itemID: item.itemId,
                     remoteFileID: remoteID, relativePath: relativePath,
                     localURL: original, conflictURL: stored,
-                    remoteSHA: remoteSHA, remoteSize: remoteSize, remoteStatus: status)
+                    remoteSHA: remoteSHA, remoteSize: remoteSize, remoteStatus: status,
+                    expectedLocalGeneration: item.localGeneration,
+                    expectedRemoteGeneration: item.remoteGeneration,
+                    expectedDirtyGeneration: item.dirtyGeneration)
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 actionTracker.recordDatabaseFailure(error)

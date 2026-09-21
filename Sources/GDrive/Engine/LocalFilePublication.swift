@@ -2,6 +2,11 @@ import Darwin
 import Foundation
 
 enum LocalFilePublication {
+    enum Result: Sendable, Equatable {
+        case published(LocalFileVersion)
+        case destinationChanged
+    }
+
     /// Writes source bytes through the destination path so filesystem watchers
     /// observe a content change. The caller retains ownership of `source`.
     static func publish(
@@ -9,15 +14,17 @@ enum LocalFilePublication {
         to destination: URL,
         expected: LocalFileVersion?,
         expectedSHA256: String
-    ) throws -> LocalFileVersion {
+    ) throws -> Result {
         guard let sourceVersion = try LocalFileVersion.read(at: source) else {
             throw CocoaError(.fileNoSuchFile)
         }
         guard try LocalFileVersion.read(at: destination) == expected else {
-            throw SyncEngineError.localFileModified(path: destination.path)
+            return .destinationChanged
         }
 
-        let descriptor = try openDestination(destination, expected: expected)
+        guard let descriptor = try openDestination(destination, expected: expected) else {
+            return .destinationChanged
+        }
         try writeContents(of: source, version: sourceVersion, to: descriptor)
         guard try LocalFileVersion.read(at: source) == sourceVersion else {
             throw SyncEngineError.localFilePublicationFailed(path: source.path)
@@ -36,26 +43,33 @@ enum LocalFilePublication {
         guard try LocalFileVersion.read(at: destination) == beforeHash else {
             throw SyncEngineError.localFilePublicationFailed(path: destination.path)
         }
-        return beforeHash
+        return .published(beforeHash)
     }
 
     private static func openDestination(
         _ destination: URL, expected: LocalFileVersion?
-    ) throws -> Int32 {
+    ) throws -> Int32? {
         guard let expected else {
             let descriptor = open(
                 destination.path,
                 O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
                 mode_t(0o666))
-            guard descriptor >= 0 else { throw posixError() }
+            guard descriptor >= 0 else {
+                if errno == EEXIST { return nil }
+                throw posixError()
+            }
             return descriptor
         }
         let descriptor = open(destination.path, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
-        guard descriptor >= 0 else { throw posixError() }
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw posixError()
+        }
         do {
             guard try LocalFileVersion.read(fileDescriptor: descriptor) == expected,
                   try LocalFileVersion.read(at: destination) == expected else {
-                throw SyncEngineError.localFileModified(path: destination.path)
+                close(descriptor)
+                return nil
             }
             return descriptor
         } catch {

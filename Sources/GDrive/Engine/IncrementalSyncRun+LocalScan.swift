@@ -308,36 +308,167 @@ extension IncrementalSyncRun {
                 atPath: rootURL.appendingPathComponent(oldPath).path) ? nil : candidate
         }
 
-        @Sendable func observeDirectory(_ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String) async throws {
+        @Sendable func findExistingDirectory(dev: Int64, ino: Int64) async throws -> ExistingLocalItem? {
+            try await engine.store.read { conn in
+                let stmt = try conn.cachedStatement(
+                    """
+                    SELECT item_id, parent_id, name, remote_file_id
+                    FROM items
+                    WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ?;
+                    """)
+                stmt.bindInt64(rootID, at: 1)
+                stmt.bindInt64(dev, at: 2)
+                stmt.bindInt64(ino, at: 3)
+                defer { stmt.reset() }
+                if try stmt.step(),
+                    let iId = stmt.columnInt64(at: 0),
+                    let pId = stmt.columnInt64(at: 1),
+                    let itemName = stmt.columnText(at: 2) {
+                    let rId = stmt.columnText(at: 3)
+                    return ExistingLocalItem(
+                        itemId: iId, parentId: pId, name: itemName, remoteId: rId)
+                }
+                return nil
+            }
+        }
+
+        @Sendable func renameOrMoveDirectory(
+            existing: ExistingLocalItem, parentItemId: Int64, name: String,
+            dev: Int64, ino: Int64
+        ) async throws {
+            seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
+            do {
+                try self.actionTracker.throwIfDatabaseFailure()
+                if let remoteID = existing.remoteId {
+                    let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
+                    let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
+                    let moving = parentItemId != existing.parentId
+                    _ = try await engine.client.updateMetadata(
+                        remoteId: remoteID, newName: name,
+                        addParentId: moving ? newParentRemoteID : nil,
+                        removeParentId: moving ? oldParentRemoteID : nil)
+                }
+                try await engine.store.write { conn in
+                    let statement = try conn.cachedStatement(
+                        """
+                        UPDATE items SET
+                            name = ?, parent_id = ?,
+                            local_status = 'present', local_device = ?, local_inode = ?,
+                            phase = CASE WHEN remote_status = 'trashed' THEN phase ELSE 'committed' END,
+                            dirty_generation = CASE WHEN remote_status = 'trashed' THEN dirty_generation ELSE 0 END,
+                            updated_at = ?
+                        WHERE item_id = ?;
+                        """)
+                    statement.bindText(name, at: 1)
+                    statement.bindInt64(parentItemId, at: 2)
+                    statement.bindInt64(dev, at: 3)
+                    statement.bindInt64(ino, at: 4)
+                    statement.bindDouble(now, at: 5)
+                    statement.bindInt64(existing.itemId, at: 6)
+                    _ = try statement.step()
+                    statement.reset()
+                }
+                seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                directoryContext.register(
+                    itemId: existing.itemId, parentItemId: parentItemId, name: name,
+                    remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
+            } catch {
+                if DatabaseFailure.isSQLite(error) { throw error }
+                engine.logger.error(
+                    "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
+            }
+        }
+
+        @Sendable func createLocalDirectory(
+            relPath: String, parentItemId: Int64, name: String,
+            dev: Int64, ino: Int64
+        ) async throws {
+            let remoteParentId = try remoteParentID(parentItemID: parentItemId, relPath: relPath)
+            var intent: DurableCreateIntent?
+            do {
+                try self.actionTracker.throwIfDatabaseFailure()
+                let candidateRemoteID = try await engine.idPool.nextId()
+                let prepared = try await DurableCreateIntentStore.prepareDirectory(
+                    store: engine.store,
+                    rootID: rootID,
+                    parentItemID: parentItemId,
+                    name: name,
+                    targetParentRemoteID: remoteParentId,
+                    candidateRemoteID: candidateRemoteID,
+                    device: dev,
+                    inode: ino
+                )
+                intent = prepared
+                _ = try await engine.client.createDirectory(
+                    name: name,
+                    parentId: prepared.targetParentRemoteID,
+                    remoteId: prepared.targetRemoteID
+                )
+                try await engine.store.write { conn in
+                    let timestamp = Date().timeIntervalSince1970
+                    let stmt = try conn.cachedStatement(
+                        """
+                        UPDATE items SET
+                            remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
+                        WHERE item_id = ?;
+                        """)
+                    stmt.bindDouble(timestamp, at: 1)
+                    stmt.bindInt64(prepared.itemID, at: 2)
+                    _ = try stmt.step()
+                    stmt.reset()
+                    try DurableCreateIntentStore.completeOperation(
+                        conn: conn, operationID: prepared.operationID, now: timestamp)
+                }
+                directoryContext.register(
+                    itemId: prepared.itemID,
+                    parentItemId: parentItemId,
+                    name: name,
+                    remoteId: prepared.targetRemoteID
+                )
+                seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                scanProgress.incDirs()
+            } catch {
+                if DatabaseFailure.isSQLite(error) { throw error }
+                if let intent {
+                    try await DurableCreateIntentStore.markUnknownOutcome(
+                        store: engine.store,
+                        operationID: intent.operationID,
+                        error: error
+                    )
+                }
+                engine.logger.error(
+                    "Failed to create remote directory [\(relPath)]: \(error)")
+            }
+        }
+
+        @Sendable func confirmLocalDirectory(itemID: Int64, dev: Int64, ino: Int64) async throws {
+            try await engine.store.write { conn in
+                let statement = try conn.cachedStatement(
+                    """
+                    UPDATE items SET
+                        local_status = 'present', local_device = ?, local_inode = ?,
+                        updated_at = ?
+                    WHERE item_id = ?;
+                    """)
+                statement.bindInt64(dev, at: 1)
+                statement.bindInt64(ino, at: 2)
+                statement.bindDouble(now, at: 3)
+                statement.bindInt64(itemID, at: 4)
+                _ = try statement.step()
+                statement.reset()
+            }
+        }
+
+        @Sendable func observeDirectory(
+            _ record: DiscoveredRecord, relPath: String, parentRelNormalized: String, name: String
+        ) async throws {
             let parentItemId = try directoryParentID(
                 relPath: relPath, parentRelPath: parentRelNormalized, name: name)
             let dev = record.dev
             let ino = record.ino
 
             // Check whether the local directory has been renamed or moved (press dev + ino Find)
-            let existingDir:
-                ExistingLocalItem? =
-                    try await engine.store.read { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            SELECT item_id, parent_id, name, remote_file_id
-                            FROM items
-                            WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ?;
-                            """)
-                        stmt.bindInt64(rootID, at: 1)
-                        stmt.bindInt64(dev, at: 2)
-                        stmt.bindInt64(ino, at: 3)
-                        defer { stmt.reset() }
-                        if try stmt.step(),
-                            let iId = stmt.columnInt64(at: 0),
-                            let pId = stmt.columnInt64(at: 1),
-                            let itemName = stmt.columnText(at: 2) {
-                            let rId = stmt.columnText(at: 3)
-                            return ExistingLocalItem(
-                                itemId: iId, parentId: pId, name: itemName, remoteId: rId)
-                        }
-                        return nil
-                    }
+            let existingDir = try await findExistingDirectory(dev: dev, ino: ino)
 
             if let existing = existingDir,
                 remoteGate.blocks(
@@ -347,99 +478,17 @@ extension IncrementalSyncRun {
             }
             if let existing = existingDir,
                 existing.name != name || existing.parentId != parentItemId {
-                // The local directory is renamed or moved
-                seenDirTracker.markSeen(
-                    parentId: existing.parentId, name: existing.name)
-                do {
-                    if let remoteID = existing.remoteId {
-                        let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
-                        let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
-                        let moving = parentItemId != existing.parentId
-                        _ = try await engine.client.updateMetadata(
-                            remoteId: remoteID, newName: name,
-                            addParentId: moving ? newParentRemoteID : nil,
-                            removeParentId: moving ? oldParentRemoteID : nil)
-                    }
-                    try await engine.store.write { conn in
-                        let statement = try conn.cachedStatement(
-                            "UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;")
-                        statement.bindText(name, at: 1)
-                        statement.bindInt64(parentItemId, at: 2)
-                        statement.bindDouble(now, at: 3)
-                        statement.bindInt64(existing.itemId, at: 4)
-                        _ = try statement.step()
-                        statement.reset()
-                    }
-                    seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                    directoryContext.register(
-                        itemId: existing.itemId, parentItemId: parentItemId, name: name,
-                        remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
-                } catch {
-                    if DatabaseFailure.isSQLite(error) { throw error }
-                    engine.logger.error(
-                        "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
-                    return
-                }
+                try await renameOrMoveDirectory(
+                    existing: existing, parentItemId: parentItemId, name: name, dev: dev, ino: ino)
             } else if directoryContext.getItemId(byRelPath: relPath) == nil {
-                // Create a new local directory
-                let remoteParentId = try remoteParentID(parentItemID: parentItemId, relPath: relPath)
-                var intent: DurableCreateIntent?
-                do {
-                    try self.actionTracker.throwIfDatabaseFailure()
-                    let candidateRemoteID = try await engine.idPool.nextId()
-                    let prepared = try await DurableCreateIntentStore.prepareDirectory(
-                        store: engine.store,
-                        rootID: rootID,
-                        parentItemID: parentItemId,
-                        name: name,
-                        targetParentRemoteID: remoteParentId,
-                        candidateRemoteID: candidateRemoteID,
-                        device: dev,
-                        inode: ino
-                    )
-                    intent = prepared
-                    _ = try await engine.client.createDirectory(
-                        name: name,
-                        parentId: prepared.targetParentRemoteID,
-                        remoteId: prepared.targetRemoteID
-                    )
-                    try await engine.store.write { conn in
-                        let timestamp = Date().timeIntervalSince1970
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET
-                                remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ?
-                            WHERE item_id = ?;
-                            """)
-                        stmt.bindDouble(timestamp, at: 1)
-                        stmt.bindInt64(prepared.itemID, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
-                        try DurableCreateIntentStore.completeOperation(
-                            conn: conn, operationID: prepared.operationID, now: timestamp)
-                    }
-                    directoryContext.register(
-                        itemId: prepared.itemID,
-                        parentItemId: parentItemId,
-                        name: name,
-                        remoteId: prepared.targetRemoteID
-                    )
-                    seenDirTracker.markSeen(parentId: parentItemId, name: name)
-                    scanProgress.incDirs()
-                } catch {
-                    if DatabaseFailure.isSQLite(error) { throw error }
-                    if let intent {
-                        try await DurableCreateIntentStore.markUnknownOutcome(
-                            store: engine.store,
-                            operationID: intent.operationID,
-                            error: error
-                        )
-                    }
-                    engine.logger.error(
-                        "Failed to create remote directory [\(relPath)]: \(error)")
-                }
+                try await createLocalDirectory(
+                    relPath: relPath, parentItemId: parentItemId, name: name, dev: dev, ino: ino)
             } else {
                 seenDirTracker.markSeen(parentId: parentItemId, name: name)
+                let itemID = existingDir?.itemId ?? directoryContext.getItemId(byRelPath: relPath)
+                if let itemID {
+                    try await confirmLocalDirectory(itemID: itemID, dev: dev, ino: ino)
+                }
             }
         }
 

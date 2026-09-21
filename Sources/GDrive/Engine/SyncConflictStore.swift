@@ -168,7 +168,9 @@ enum SyncConflictStore {
     static func commitIncremental(
         store: StateStore, rootID: Int64, itemID: Int64, remoteFileID: String,
         relativePath: String, localURL: URL, conflictURL: URL?,
-        remoteSHA: String, remoteSize: Int64, remoteStatus: SyncConflict.RemoteStatus = .present
+        remoteSHA: String, remoteSize: Int64, remoteStatus: SyncConflict.RemoteStatus = .present,
+        expectedLocalGeneration: Int64, expectedRemoteGeneration: Int64,
+        expectedDirtyGeneration: Int64
     ) async throws {
         let conflictID = "sync-\(rootID)-\(itemID)"
         try await store.batchWrite { conn in
@@ -179,6 +181,7 @@ enum SyncConflictStore {
                 remote_version, remote_status, created_at, updated_at)
             SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, remote_version, ?, ?, ?
             FROM items WHERE item_id = ? AND root_id = ? AND remote_file_id = ?
+                AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?
             ON CONFLICT(root_id, remote_file_id) DO UPDATE SET
                 relative_path = excluded.relative_path, local_path = excluded.local_path,
                 conflict_path = excluded.conflict_path, remote_sha256 = excluded.remote_sha256,
@@ -200,6 +203,9 @@ enum SyncConflictStore {
             insert.bindInt64(itemID, at: 13)
             insert.bindInt64(rootID, at: 14)
             insert.bindText(remoteFileID, at: 15)
+            insert.bindInt64(expectedLocalGeneration, at: 16)
+            insert.bindInt64(expectedRemoteGeneration, at: 17)
+            insert.bindInt64(expectedDirtyGeneration, at: 18)
             _ = try insert.step()
             insert.reset()
             guard conn.changes == 1 else {
@@ -207,14 +213,21 @@ enum SyncConflictStore {
             }
             let block = try conn.cachedStatement("""
             UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ?
-            WHERE item_id = ? AND root_id = ? AND remote_file_id = ?;
+            WHERE item_id = ? AND root_id = ? AND remote_file_id = ?
+                AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
             """)
             block.bindDouble(now, at: 1)
             block.bindInt64(itemID, at: 2)
             block.bindInt64(rootID, at: 3)
             block.bindText(remoteFileID, at: 4)
+            block.bindInt64(expectedLocalGeneration, at: 5)
+            block.bindInt64(expectedRemoteGeneration, at: 6)
+            block.bindInt64(expectedDirtyGeneration, at: 7)
             _ = try block.step()
             block.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general("The incremental conflict plan is stale: \(relativePath)")
+            }
         }
     }
 }
@@ -431,14 +444,16 @@ extension SyncEngine {
         let digest = try Self.computeFileSha256(at: storedURL)
         guard digest.sha256Hex.caseInsensitiveCompare(conflict.remoteSHA256) == .orderedSame,
               digest.fileSize == conflict.remoteSize else {
-            throw SyncEngineError.general("The stored remote conflict file changed: \(storedURL.path)")
+            throw SyncEngineError.general(
+                "The stored remote conflict file changed: \(storedURL.path)")
         }
-        guard let expected = try LocalFileVersion.read(at: localURL) else {
-            throw SyncEngineError.localFileModified(path: localURL.path)
-        }
-        let published = try LocalFilePublication.publish(
+        let expected = try LocalFileVersion.read(at: localURL)
+        let result = try LocalFilePublication.publish(
             storedURL, to: localURL, expected: expected,
             expectedSHA256: conflict.remoteSHA256)
+        guard case .published(let published) = result else {
+            throw SyncEngineError.localFileModified(path: localURL.path)
+        }
         try await commitRemoteConflictResolution(
             record, published: published,
             remotePresent: conflict.remoteStatus == .present)

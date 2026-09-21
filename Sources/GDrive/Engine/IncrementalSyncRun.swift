@@ -30,6 +30,8 @@ final class IncrementalSyncRun: Sendable {
     let recoveredConflicts: Int
     let recoveredCleanups: Int
     let localChangeScope: LocalChangeScope?
+    let downloadCache: DownloadCache
+    let collidedDownloads: OSAllocatedUnfairLock<[CollidedDownload]>
 
     private init(
         engine: SyncEngine,
@@ -87,6 +89,8 @@ final class IncrementalSyncRun: Sendable {
         self.recoveredConflicts = recoveredConflicts
         self.recoveredCleanups = recoveredCleanups
         self.localChangeScope = localChangeScope
+        self.downloadCache = DownloadCache()
+        self.collidedDownloads = OSAllocatedUnfairLock(initialState: [])
     }
 }
 
@@ -219,7 +223,10 @@ extension IncrementalSyncRun {
     }
 
     func execute() async throws -> SyncStats {
-        defer { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
+        defer {
+            downloadCache.clear()
+            engine.cleanupDownloadStagingDirectory(downloadDirectory)
+        }
         let pendingDirectories = try await loadDirtyItems().filter { item in
             guard item.entryKind == "directory", item.pendingCreate != nil else { return false }
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
@@ -258,6 +265,8 @@ extension IncrementalSyncRun {
             throw error
         }
         await drainTransfers()
+        try actionTracker.throwIfDatabaseFailure()
+        try await processCollidedDownloads()
         try actionTracker.throwIfDatabaseFailure()
         try await engine.store.flush()
         try await reconcileDirectories(dirItems)

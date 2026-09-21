@@ -24,6 +24,7 @@ private struct ConflictServerState: Sendable {
 }
 private struct ConflictProtocolState: Sendable {
     let state = OSAllocatedUnfairLock(initialState: ConflictServerState())
+    let downloadHook = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
 }
 private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
     private lazy var server = TestHTTPContext<ConflictProtocolState>.value(for: request)!
@@ -128,6 +129,10 @@ private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
         } else if let file = state.files[url.lastPathComponent] {
             if URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains(where: { $0.name == "alt" && $0.value == "media" }) == true {
                 state.downloads += 1
+                server.downloadHook.withLock { hook in
+                    hook?()
+                    hook = nil
+                }
                 return Response(status: 200, data: file.content, headers: headers)
             }
             json = file.json
@@ -160,6 +165,7 @@ struct ConflictRecoveryTests {
     }
     private func fixture(localContent: Data = Data("local edited content".utf8)) async throws -> Fixture {
         context.value.state.withLock { $0 = ConflictServerState() }
+        context.value.downloadHook.withLock { $0 = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a12-\(UUID().uuidString)")
         let local = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
@@ -222,6 +228,27 @@ struct ConflictRecoveryTests {
             at: testFixture.local, includingPropertiesForKeys: nil)
         #expect(localEntries.map(\.lastPathComponent) == ["file.txt"])
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("A local edit during a download becomes a queryable conflict")
+    func downloadRaceBecomesConflict() async throws {
+        let testFixture = try await fixture(localContent: Data("baseline".utf8))
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let localEdit = Data("edited during download".utf8)
+        context.value.downloadHook.withLock { hook in
+            hook = { try? localEdit.write(to: testFixture.original) }
+        }
+
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(stats.filesFailed == 0)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        #expect(try Data(contentsOf: testFixture.original) == localEdit)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath))
+            == Data("remote edited content".utf8))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            == [conflict])
     }
 
     @Test("Selecting the local conflict version keeps the conflict when overwrite is blocked")
@@ -300,7 +327,7 @@ struct ConflictRecoveryTests {
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
-    @Test("Local deletion against a remote modification creates a conflict")
+    @Test("Local deletion against a remote modification can select the remote version")
     func localDeletionAgainstRemoteModification() async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
@@ -312,6 +339,9 @@ struct ConflictRecoveryTests {
         #expect(conflict.remoteStatus == .present)
         #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == false)
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        #expect(try Data(contentsOf: testFixture.original) == Data("remote edited content".utf8))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
     @Test("Selecting a remote deletion trashes the local conflict file")

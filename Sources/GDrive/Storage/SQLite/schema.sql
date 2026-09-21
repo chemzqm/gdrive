@@ -211,8 +211,8 @@ CREATE TABLE IF NOT EXISTS remote_directory_scans (
 );
 CREATE INDEX IF NOT EXISTS idx_remote_scans_pending ON remote_directory_scans(root_id) WHERE state = 'pending';
 
--- Remote files that could not be published during remote-to-local bootstrap
--- because the destination was occupied by different local content.
+-- Remote files that could not be published because the destination was
+-- occupied by different local content during bootstrap or incremental sync.
 CREATE TABLE IF NOT EXISTS sync_conflicts (
     conflict_id TEXT PRIMARY KEY NOT NULL,
     root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,

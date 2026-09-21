@@ -116,11 +116,10 @@ struct PublicationSafetyTests {
         let newer = Data("new local version".utf8)
         try newer.write(to: destination)
         try Data("remote version".utf8).write(to: download)
-        #expect(throws: (any Error).self) {
-            _ = try LocalFilePublication.publish(
-                download, to: destination, expected: expected,
-                expectedSHA256: SyncEngine.computeSha256(of: Data("remote version".utf8)))
-        }
+        let result = try LocalFilePublication.publish(
+            download, to: destination, expected: expected,
+            expectedSHA256: SyncEngine.computeSha256(of: Data("remote version".utf8)))
+        #expect(result == .destinationChanged)
         #expect(try Data(contentsOf: destination) == newer)
         #expect(FileManager.default.fileExists(atPath: download.path))
     }
@@ -138,9 +137,13 @@ struct PublicationSafetyTests {
         let expected = try LocalFileVersion.read(at: destination)
         let content = Data("remote version".utf8)
         try content.write(to: download)
-        let published = try LocalFilePublication.publish(
+        let result = try LocalFilePublication.publish(
             download, to: destination, expected: expected,
             expectedSHA256: SyncEngine.computeSha256(of: content))
+        guard case .published(let published) = result else {
+            Issue.record("Unchanged destination was rejected")
+            return
+        }
         if let expected {
             #expect(published.inode == expected.inode)
         }
