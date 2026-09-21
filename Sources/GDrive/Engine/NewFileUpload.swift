@@ -1,7 +1,7 @@
 import Foundation
 import os
 
-enum FileUploadReceiptResult: Sendable {
+enum SyncReceiptResult: Sendable, Equatable {
     case applied
     case stale
 }
@@ -146,7 +146,7 @@ extension DurableCreateIntentStore {
         uploadedFile: DriveFile,
         input: StableUploadInput,
         now: Double = Date().timeIntervalSince1970
-    ) async throws -> FileUploadReceiptResult {
+    ) async throws -> SyncReceiptResult {
         try input.version.validate(at: input.sourceURL)
         let applied = OSAllocatedUnfairLock(initialState: false)
         try await store.batchWrite { conn in

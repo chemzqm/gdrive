@@ -150,6 +150,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 | `SyncEngine+BootstrapUpload.swift` | 初始化上传：扫描、目录就绪、传输并发控制、统计与初始化收尾 |
 | `SyncEngine+BootstrapDownload.swift` | 初始化下载：远端递归列举、暂存发布和基线建立 |
 | `NewFileUpload.swift` | 初始化与增量共用的新文件上传：准备持久 intent、执行 multipart/resumable、按预期代次提交回执 |
+| `FileDownload.swift` | 初始化与增量共用的文件下载：校验暂存、目标版本保护发布、按模式提交回执 |
 | `SyncEngine+ResumableUpload.swift` | 分块上传、会话恢复、确认偏移和完成状态持久化 |
 | `SyncEngine+Hashing.swift` | 内存和文件流式 SHA-256，保留现有辅助方法名称 |
 | `IncrementalSyncRun.swift` | 单轮增量状态、根校验与恢复、阶段编排、统计和收尾 |

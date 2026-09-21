@@ -143,72 +143,6 @@ extension SyncEngine {
         }
         let progress = BootstrapDownloadTracker()
 
-        func commitDownloadedFile(
-            _ item: DriveFile, parentItemId: Int64, localURL: URL, published: LocalFileVersion
-        ) async throws -> Bool {
-            let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-            try await self.store.batchWrite { conn in
-                guard (try? LocalFileVersion.read(at: localURL)) == published else { return }
-                let stmt = try conn.cachedStatement("""
-                    INSERT INTO items (
-                        root_id, parent_id, name, entry_kind, remote_file_id,
-                        local_mtime, local_size, local_sha256,
-                        base_sha256, base_size,
-                        remote_sha256, remote_size, remote_status,
-                        local_generation, local_status, phase,
-                        local_device, local_inode,
-                        created_at, updated_at
-                    ) VALUES (
-                        ?, ?, ?, 'file', ?,
-                        ?, ?, ?,
-                        ?, ?,
-                        ?, ?, 'present',
-                        1, 'present', 'committed',
-                        ?, ?,
-                        ?, ?
-                    )
-                    ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
-                    DO UPDATE SET
-                        remote_file_id = excluded.remote_file_id,
-                        local_mtime = excluded.local_mtime, local_size = excluded.local_size,
-                        local_sha256 = excluded.local_sha256,
-                        base_sha256 = excluded.base_sha256, base_size = excluded.base_size,
-                        remote_sha256 = excluded.remote_sha256, remote_size = excluded.remote_size,
-                        remote_status = 'present', local_status = 'present', phase = 'committed',
-                        local_device = excluded.local_device, local_inode = excluded.local_inode,
-                        updated_at = excluded.updated_at
-                    WHERE items.remote_file_id = excluded.remote_file_id;
-                    """)
-                stmt.bindInt64(rootId, at: 1)
-                stmt.bindInt64(parentItemId, at: 2)
-                stmt.bindText(item.name, at: 3)
-                stmt.bindText(item.id, at: 4)
-                stmt.bindInt64(Int64(published.mtime), at: 5)
-                stmt.bindInt64(published.size, at: 6)
-                stmt.bindText(item.sha256Checksum, at: 7)
-                stmt.bindText(item.sha256Checksum, at: 8)
-                stmt.bindInt64(published.size, at: 9)
-                stmt.bindText(item.sha256Checksum, at: 10)
-                stmt.bindInt64(published.size, at: 11)
-                stmt.bindInt64(published.device, at: 12)
-                stmt.bindInt64(published.inode, at: 13)
-                let timestamp = Date().timeIntervalSince1970
-                stmt.bindDouble(timestamp, at: 14)
-                stmt.bindDouble(timestamp, at: 15)
-                _ = try stmt.step()
-                stmt.reset()
-                guard conn.changes == 1 else { return }
-                let inbox = try conn.cachedStatement(
-                    "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;")
-                inbox.bindInt64(rootId, at: 1)
-                inbox.bindText(item.id, at: 2)
-                _ = try inbox.step()
-                inbox.reset()
-                receiptApplied.withLock { $0 = true }
-            }
-            return receiptApplied.withLock { $0 }
-        }
-
         func recoverPublishedFile(
             _ item: DriveFile, parentItemId: Int64, localURL: URL
         ) async throws -> Bool {
@@ -216,8 +150,13 @@ extension SyncEngine {
                   (try? SyncEngine.computeFileSha256(at: localURL).sha256Hex) == item.sha256Checksum,
                   let published = try LocalFileVersion.read(at: localURL),
                   published.size == item.sizeBytes else { return false }
-            return try await commitDownloadedFile(
-                item, parentItemId: parentItemId, localURL: localURL, published: published)
+            let receipt = try await self.store.commitFileDownloadReceipt(
+                expectation: .bootstrap(
+                    rootID: rootId, parentItemID: parentItemId, file: item),
+                localURL: localURL,
+                published: published
+            )
+            return receipt == .applied
         }
 
         let conflictRoot = try SyncConflictStore.directory(
@@ -238,6 +177,98 @@ extension SyncEngine {
                 store: self.store, rootID: rootId, parentItemID: parentItemId, file: item,
                 relativePath: relativePath, localURL: localURL, conflictURL: conflictURL)
             return stored.size
+        }
+
+        func enqueueFileDownload(
+            _ item: DriveFile, parentItemId: Int64, localURL: URL
+        ) async throws {
+            try await RemoteChanges.retainBootstrapObservation(
+                store: self.store, rootID: rootId, file: item)
+            if try await recoverPublishedFile(
+                item, parentItemId: parentItemId, localURL: localURL) {
+                return
+            }
+            let relativePath = String(localURL.path.dropFirst(rootURL.path.count + 1))
+            let downloadBytes = item.sizeBytes ?? 0
+            notifier.addDiscovered(files: 1, bytes: downloadBytes)
+            self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
+            downloadGroup.enter()
+            Task {
+                await downloadSemaphore.wait()
+                defer {
+                    self.monitor.finishDownload(id: item.id)
+                    downloadSemaphore.signal()
+                    downloadGroup.leave()
+                    notifier.addCompleted(files: 1, bytes: downloadBytes)
+                }
+
+                do {
+                    try checkDatabaseFailure()
+                    self.monitor.startDownload(
+                        id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
+                    if FileManager.default.fileExists(atPath: localURL.path) {
+                        let fileSize = try await stageConflict(
+                            item, parentItemId: parentItemId,
+                            localURL: localURL, relativePath: relativePath)
+                        progress.recordDownload(bytes: fileSize, conflict: true)
+                        return
+                    }
+                    let execution: FileDownloadExecutionResult
+                    do {
+                        execution = try await self.executeFileDownload(
+                            remoteID: item.id,
+                            expectedSHA256: item.sha256Checksum,
+                            destination: localURL,
+                            expectedDestination: nil,
+                            temporaryDirectory: downloadDirectory,
+                            onProgress: { delta in
+                                self.monitor.reportDownloadProgress(
+                                    id: item.id, additionalBytes: delta)
+                            }
+                        )
+                    } catch {
+                        // A local creator may win after enumeration but before publication.
+                        if FileManager.default.fileExists(atPath: localURL.path) {
+                            let fileSize = try await stageConflict(
+                                item, parentItemId: parentItemId,
+                                localURL: localURL, relativePath: relativePath)
+                            progress.recordDownload(bytes: fileSize, conflict: true)
+                            return
+                        }
+                        throw error
+                    }
+
+                    let published: LocalFileVersion
+                    switch execution {
+                    case .published(let version):
+                        published = version
+                    case .destinationChanged(let download):
+                        try? FileManager.default.removeItem(at: download.url)
+                        let fileSize = try await stageConflict(
+                            item, parentItemId: parentItemId,
+                            localURL: localURL, relativePath: relativePath)
+                        progress.recordDownload(bytes: fileSize, conflict: true)
+                        return
+                    }
+
+                    let receipt = try await self.store.commitFileDownloadReceipt(
+                        expectation: .bootstrap(
+                            rootID: rootId, parentItemID: parentItemId, file: item),
+                        localURL: localURL,
+                        published: published
+                    )
+                    guard receipt == .applied else {
+                        throw SyncEngineError.general(
+                            "The initial download receipt has expired, retain the existing status: \(item.name)"
+                        )
+                    }
+                    progress.recordDownload(bytes: published.size)
+                } catch {
+                    recordDatabaseFailure(error)
+                    progress.recordFailure()
+                    self.logger.error("Failed to download file [\(item.name)]: \(error)")
+                }
+            }
         }
 
         // 2. Recursive enumeration of remote files and streaming download
@@ -294,78 +325,8 @@ extension SyncEngine {
                     // Recurse to the next level
                     try await traverseRemote(parentRemoteId: item.id, currentLocalURL: itemLocalURL, parentItemId: dirItemId)
                 } else {
-                    try await RemoteChanges.retainBootstrapObservation(
-                        store: self.store, rootID: rootId, file: item)
-                    if try await recoverPublishedFile(
-                        item, parentItemId: parentItemId, localURL: itemLocalURL) {
-                        continue
-                    }
-                    let relativePath = String(itemLocalURL.path.dropFirst(rootURL.path.count + 1))
-                    // File: join concurrent download queue
-                    let downloadBytes = item.sizeBytes ?? 0
-                    notifier.addDiscovered(files: 1, bytes: downloadBytes)
-                    self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
-                    downloadGroup.enter()
-                    Task {
-                        await downloadSemaphore.wait()
-                        defer {
-                            self.monitor.finishDownload(id: item.id)
-                            downloadSemaphore.signal()
-                            downloadGroup.leave()
-                            notifier.addCompleted(files: 1, bytes: downloadBytes)
-                        }
-
-                        do {
-                            try checkDatabaseFailure()
-                            self.monitor.startDownload(id: item.id, name: item.name, totalBytes: item.sizeBytes ?? 0)
-                            if FileManager.default.fileExists(atPath: itemLocalURL.path) {
-                                let fileSize = try await stageConflict(
-                                    item, parentItemId: parentItemId,
-                                    localURL: itemLocalURL, relativePath: relativePath)
-                                progress.recordDownload(bytes: fileSize, conflict: true)
-                                return
-                            }
-                            let published: LocalFileVersion
-                            do {
-                                // Streaming download and verification SHA-256
-                                published = try await self.client.downloadFileSafely(
-                                    remoteId: item.id,
-                                    destinationURL: itemLocalURL,
-                                    expectedSha256: item.sha256Checksum,
-                                    expectedDestination: nil,
-                                    temporaryDirectory: downloadDirectory,
-                                    onProgress: { delta in
-                                        self.monitor.reportDownloadProgress(id: item.id, additionalBytes: delta)
-                                    }
-                                )
-                            } catch {
-                                // A local creator may win after enumeration but before publication.
-                                if FileManager.default.fileExists(atPath: itemLocalURL.path) {
-                                    let fileSize = try await stageConflict(
-                                        item, parentItemId: parentItemId,
-                                        localURL: itemLocalURL, relativePath: relativePath)
-                                    progress.recordDownload(bytes: fileSize, conflict: true)
-                                    return
-                                }
-                                throw error
-                            }
-
-                            // Get metadata after local placement
-                            let fileSize = published.size
-
-                            guard try await commitDownloadedFile(
-                                item, parentItemId: parentItemId,
-                                localURL: itemLocalURL, published: published) else {
-                                throw SyncEngineError.general("The initial download receipt has expired, retain the existing status: \(item.name)")
-                            }
-
-                            progress.recordDownload(bytes: fileSize)
-                        } catch {
-                            recordDatabaseFailure(error)
-                            progress.recordFailure()
-                            self.logger.error("Failed to download file [\(item.name)]: \(error)")
-                        }
-                    }
+                    try await enqueueFileDownload(
+                        item, parentItemId: parentItemId, localURL: itemLocalURL)
                 }
             }
         }

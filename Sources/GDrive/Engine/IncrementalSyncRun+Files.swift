@@ -54,52 +54,6 @@ extension IncrementalSyncRun {
         }
     }
 
-    private func commitDownloadReceipt(
-        item: DirtyRecord, localFileURL: URL, published: LocalFileVersion
-    ) async throws {
-        let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-        try await engine.store.batchWrite { conn in
-            guard (try? LocalFileVersion.read(at: localFileURL)) == published else {
-                return
-            }
-            let stmt = try conn.cachedStatement(
-                """
-                UPDATE items SET
-                    local_sha256 = remote_sha256,
-                    local_size = remote_size,
-                    local_mtime = ?,
-                    local_device = ?,
-                    local_inode = ?,
-                    local_status = 'present',
-                    remote_status = 'present',
-                    base_sha256 = remote_sha256,
-                    base_size = remote_size,
-                    phase = 'committed',
-                    dirty_generation = 0,
-                    updated_at = ?
-                WHERE item_id = ? AND local_generation = ?
-                    AND remote_generation = ? AND dirty_generation = ?;
-                """)
-            stmt.bindInt64(Int64(published.mtime), at: 1)
-            stmt.bindInt64(published.device, at: 2)
-            stmt.bindInt64(published.inode, at: 3)
-            stmt.bindDouble(Date().timeIntervalSince1970, at: 4)
-            stmt.bindInt64(item.itemId, at: 5)
-            stmt.bindInt64(item.localGeneration, at: 6)
-            stmt.bindInt64(item.remoteGeneration, at: 7)
-            stmt.bindInt64(item.dirtyGeneration, at: 8)
-            _ = try stmt.step()
-            stmt.reset()
-            guard conn.changes == 1 else { return }
-            receiptApplied.withLock { $0 = true }
-        }
-        guard receiptApplied.withLock({ $0 }) else {
-            throw SyncEngineError.general(
-                "The download receipt is stale; the newer generation remains pending: \(item.name)"
-            )
-        }
-    }
-
     func processCollidedDownloads() async throws {
         let collided = collidedDownloads.withLock { state -> [CollidedDownload] in
             let all = state
@@ -394,22 +348,6 @@ extension IncrementalSyncRun {
         return nil
     }
 
-    private func fetchVerifiedDownload(
-        remoteFileId: String, expectedSha256: String?, downId: String
-    ) async throws -> DriveClient.VerifiedDownload {
-        if let cached = downloadCache.take(remoteID: remoteFileId, sha256: expectedSha256 ?? "") {
-            return DriveClient.VerifiedDownload(url: cached.url, sha256: cached.sha256, size: cached.size)
-        }
-        return try await engine.client.downloadVerifiedFile(
-            remoteId: remoteFileId,
-            expectedSha256: expectedSha256,
-            temporaryDirectory: downloadDirectory,
-            onProgress: { delta in
-                self.engine.monitor.reportDownloadProgress(id: downId, additionalBytes: delta)
-            }
-        )
-    }
-
     private func scheduleDownload(_ item: DirtyRecord) async throws {
         let downId = item.remoteFileId ?? item.name
         let downSize = item.remote?.size ?? 0
@@ -440,31 +378,61 @@ extension IncrementalSyncRun {
                 let expectedDestination = try validateExpectedDestination(at: localFileURL, item: item)
                 engine.monitor.startDownload(
                     id: downId, name: item.name, totalBytes: downSize)
-                let download = try await fetchVerifiedDownload(
-                    remoteFileId: remoteFileId, expectedSha256: item.remote?.sha256, downId: downId)
-                defer { try? FileManager.default.removeItem(at: download.url) }
-                guard try await downloadPlanIsCurrent(item) else {
-                    throw SyncEngineError.general(
-                        "Download plan has expired, keep local files: \(item.name)")
+                let cached = downloadCache.take(
+                    remoteID: remoteFileId, sha256: item.remote?.sha256 ?? ""
+                ).map {
+                    DriveClient.VerifiedDownload(url: $0.url, sha256: $0.sha256, size: $0.size)
                 }
-                let publication = try LocalFilePublication.publish(
-                    download.url, to: localFileURL, expected: expectedDestination,
-                    expectedSHA256: download.sha256)
-                switch publication {
+                defer {
+                    if let cached { try? FileManager.default.removeItem(at: cached.url) }
+                }
+                let execution = try await engine.executeFileDownload(
+                    remoteID: remoteFileId,
+                    expectedSHA256: item.remote?.sha256,
+                    destination: localFileURL,
+                    expectedDestination: expectedDestination,
+                    temporaryDirectory: downloadDirectory,
+                    cached: cached,
+                    onProgress: { delta in
+                        self.engine.monitor.reportDownloadProgress(
+                            id: downId, additionalBytes: delta)
+                    },
+                    beforePublish: {
+                        guard try await self.downloadPlanIsCurrent(item) else {
+                            throw SyncEngineError.general(
+                                "Download plan has expired, keep local files: \(item.name)")
+                        }
+                    }
+                )
+                switch execution {
                 case .published(let published):
-                    try await commitDownloadReceipt(
-                        item: item, localFileURL: localFileURL, published: published)
+                    let receipt = try await engine.store.commitFileDownloadReceipt(
+                        expectation: .incremental(
+                            itemID: item.itemId,
+                            localGeneration: item.localGeneration,
+                            remoteGeneration: item.remoteGeneration,
+                            dirtyGeneration: item.dirtyGeneration
+                        ),
+                        localURL: localFileURL,
+                        published: published
+                    )
+                    guard receipt == .applied else {
+                        throw SyncEngineError.general(
+                            "The download receipt is stale; the newer generation remains pending: \(item.name)"
+                        )
+                    }
                     scheduled.withLock { _ = $0.remove(item.itemId) }
                     actionTracker.counts.withLock {
                         $0.downloaded += 1
                         $0.bytesDown += published.size
                     }
-                case .destinationChanged:
+                case .destinationChanged(let download):
                     if downloadCache.store(download, remoteID: remoteFileId, temporaryDirectory: downloadDirectory) != nil {
                         collidedDownloads.withLock {
                             $0.append(CollidedDownload(item: item, localFileURL: localFileURL, relPath: relPath))
                         }
                     } else {
+                        try? FileManager.default.removeItem(at: download.url)
                         scheduled.withLock { _ = $0.remove(item.itemId) }
                         throw SyncEngineError.localFileModified(path: localFileURL.path)
                     }
