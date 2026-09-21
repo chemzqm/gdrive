@@ -296,13 +296,37 @@ struct RemoteChanges: Sendable {
     }
 
     private func applyResolvedBatch(_ batch: [Resolved], started: Double) async throws {
+        // Persist the observation boundary before touching the local filesystem.
+        try await retainResolvedBatch(batch, started: started)
+        let prepared = try await prepareResolvedBatch(batch)
+        let completed = executeLocalPathOperations(prepared)
+        try await commitResolvedBatch(completed)
+    }
+
+    private func retainResolvedBatch(_ batch: [Resolved], started: Double) async throws {
         try await store.write { conn in
             for result in batch {
-                // The observation is retained even if a local rename or SQL constraint fails.
                 try enqueue(conn, change: result.entry.change, scanID: result.entry.scanID)
                 try Self.execute(conn, "UPDATE remote_change_inbox SET attempted_at = ? WHERE root_id = ? AND remote_id = ?;",
                     [.text(String(started)), .int(rootID), .text(result.entry.change.fileId)])
-                try conn.execute("SAVEPOINT remote_apply;")
+            }
+        }
+    }
+
+    private struct PreparedResult: Sendable {
+        let result: Resolved
+        let operation: LocalPathOperation?
+    }
+
+    private enum LocalPathPreparation: Sendable {
+        case blocked
+        case ready(LocalPathOperation?)
+    }
+
+    private func prepareResolvedBatch(_ batch: [Resolved]) async throws -> [PreparedResult] {
+        try await store.read { conn in
+            var prepared: [PreparedResult] = []
+            for result in batch {
                 do {
                     let conflict = try Self.statement(conn, """
                         SELECT 1 FROM sync_conflicts
@@ -310,7 +334,39 @@ struct RemoteChanges: Sendable {
                         """, [.int(rootID), .text(result.entry.change.fileId)])
                     let isInitialConflict = try conflict.step()
                     conflict.reset()
-                    if !isInitialConflict, try apply(conn, result) {
+                    guard !isInitialConflict else { continue }
+                    guard case .ready(let operation) = try prepareLocalPathOperation(conn, result)
+                    else { continue }
+                    prepared.append(PreparedResult(result: result, operation: operation))
+                } catch {
+                    if DatabaseFailure.isSQLite(error) { throw error }
+                }
+            }
+            return prepared
+        }
+    }
+
+    private func executeLocalPathOperations(_ prepared: [PreparedResult]) -> [PreparedResult] {
+        var executed: [PreparedResult] = []
+        executed.reserveCapacity(prepared.count)
+        for item in prepared {
+            do {
+                guard try item.operation?.execute() != false else { continue }
+                executed.append(item)
+            } catch {
+                // The durable inbox keeps the observation available for a later retry.
+            }
+        }
+        return executed
+    }
+
+    private func commitResolvedBatch(_ completed: [PreparedResult]) async throws {
+        try await store.write { conn in
+            for item in completed {
+                let result = item.result
+                try conn.execute("SAVEPOINT remote_apply;")
+                do {
+                    if try apply(conn, result, executedPathOperation: item.operation) {
                         try Self.execute(conn, "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;",
                             [.int(rootID), .text(result.entry.change.fileId)])
                     }
@@ -366,14 +422,77 @@ struct RemoteChanges: Sendable {
             """, [.int(itemID)])
     }
 
-    private static func createDirectoryIfNeeded(
-        file: DriveFile, existing: Item?, destination: URL
-    ) throws {
-        guard file.isDirectory, existing == nil else { return }
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+    private func prepareLocalPathOperation(
+        _ conn: SQLiteConnection, _ result: Resolved
+    ) throws -> LocalPathPreparation {
+        let change = result.entry.change
+        let existing = try item(conn, remoteID: change.fileId)
+        if change.removed == true || change.file?.trashed == true {
+            return .ready(nil)
+        }
+        guard result.scope == .inside else {
+            return result.scope == .outside ? .ready(nil) : .blocked
+        }
+        guard let file = change.file, let parentRemote = file.parents?.first,
+              let parent = try item(conn, remoteID: parentRemote), parent.isDirectory,
+              !file.name.isEmpty, file.name != ".", file.name != "..",
+              !file.name.contains("/"), !file.name.contains("\0") else { return .blocked }
+        try RemoteNameMapping.validate(file.name)
+
+        let collision = try Self.statement(conn, """
+            SELECT remote_file_id, name FROM items INDEXED BY idx_items_local_name_key
+            WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?);
+            """, [.int(rootID), .int(parent.id), .text(file.name)])
+        while try collision.step() {
+            if collision.columnText(at: 0) == nil, collision.columnText(at: 1) != file.name {
+                collision.reset()
+                return .blocked
+            }
+            if let remote = collision.columnText(at: 0), remote != file.id {
+                collision.reset()
+                return .blocked
+            }
+        }
+        collision.reset()
+
+        if let existing, let version = existing.version,
+           let incoming = file.versionNumber, incoming < version {
+            return .ready(nil)
+        }
+        let parentPath = try path(conn, itemID: parent.id)
+        let destination = rootURL
+            .appendingPathComponent(parentPath)
+            .appendingPathComponent(file.name)
+        try RemoteNameMapping.validateDestination(destination, root: rootURL)
+        let moved = existing.map { $0.parentID != parent.id || $0.name != file.name } ?? false
+        if let existing, moved {
+            let source = rootURL.appendingPathComponent(try path(conn, itemID: existing.id))
+            return .ready(.move(
+                source: source,
+                destination: destination,
+                device: existing.device,
+                inode: existing.inode))
+        }
+        if file.isDirectory, existing == nil {
+            return .ready(.createDirectory(destination))
+        }
+        return .ready(nil)
     }
 
-    private func apply(_ conn: SQLiteConnection, _ result: Resolved) throws -> Bool {
+    private func apply(
+        _ conn: SQLiteConnection,
+        _ result: Resolved,
+        executedPathOperation: LocalPathOperation?
+    ) throws -> Bool {
+        let conflict = try Self.statement(conn, """
+            SELECT 1 FROM sync_conflicts
+            WHERE root_id = ? AND remote_file_id = ?;
+            """, [.int(rootID), .text(result.entry.change.fileId)])
+        let isInitialConflict = try conflict.step()
+        conflict.reset()
+        guard !isInitialConflict else { return false }
+        guard case .ready(let currentPathOperation) = try prepareLocalPathOperation(conn, result),
+              currentPathOperation == executedPathOperation else { return false }
         let change = result.entry.change
         let existing = try item(conn, remoteID: change.fileId) // identity BEFORE parent classification
         func applyRemovalOrExclusion() throws -> Bool? {
@@ -419,23 +538,6 @@ struct RemoteChanges: Sendable {
         guard collisionAccepted else { return false }
         if let existing, let version = existing.version, let incoming = file.versionNumber, incoming < version { return true }
         let moved = existing.map { $0.parentID != parent.id || $0.name != file.name } ?? false
-        func moveExistingItem() throws -> Bool {
-            if let existing, moved {
-                let source = rootURL.appendingPathComponent(try path(conn, itemID: existing.id))
-                if FileManager.default.fileExists(atPath: source.path) {
-                    try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try FileManager.default.moveItem(at: source, to: destination)
-                } else if FileManager.default.fileExists(atPath: destination.path) {
-                    // A previous process may have moved it before its receipt committed.
-                    let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
-                    guard (attrs[.systemNumber] as? NSNumber)?.int64Value == existing.device,
-                          (attrs[.systemFileNumber] as? NSNumber)?.int64Value == existing.inode else { return false }
-                }
-            }
-            return true
-        }
-        guard try moveExistingItem() else { return false }
-        try Self.createDirectoryIfNeeded(file: file, existing: existing, destination: destination)
         let id: Int64
         if let existing { id = existing.id } else if let localOnlyID { id = localOnlyID } else {
             try Self.execute(conn, """

@@ -338,34 +338,22 @@ extension IncrementalSyncRun {
             seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
             do {
                 try self.actionTracker.throwIfDatabaseFailure()
-                if let remoteID = existing.remoteId {
-                    let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
-                    let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
-                    let moving = parentItemId != existing.parentId
-                    _ = try await engine.client.updateMetadata(
-                        remoteId: remoteID, newName: name,
-                        addParentId: moving ? newParentRemoteID : nil,
-                        removeParentId: moving ? oldParentRemoteID : nil)
-                }
-                try await engine.store.write { conn in
-                    let statement = try conn.cachedStatement(
-                        """
-                        UPDATE items SET
-                            name = ?, parent_id = ?,
-                            local_status = 'present', local_device = ?, local_inode = ?,
-                            phase = CASE WHEN remote_status = 'trashed' THEN phase ELSE 'committed' END,
-                            dirty_generation = CASE WHEN remote_status = 'trashed' THEN dirty_generation ELSE 0 END,
-                            updated_at = ?
-                        WHERE item_id = ?;
-                        """)
-                    statement.bindText(name, at: 1)
-                    statement.bindInt64(parentItemId, at: 2)
-                    statement.bindInt64(dev, at: 3)
-                    statement.bindInt64(ino, at: 4)
-                    statement.bindDouble(now, at: 5)
-                    statement.bindInt64(existing.itemId, at: 6)
-                    _ = try statement.step()
-                    statement.reset()
+                let receipt = try await engine.executeRemotePathOperation(
+                    remoteID: existing.remoteId,
+                    oldParentRemoteID: directoryContext.getRemoteId(for: existing.parentId),
+                    newParentRemoteID: directoryContext.getRemoteId(for: parentItemId),
+                    expectation: RemotePathReceiptExpectation(
+                        itemID: existing.itemId,
+                        parentItemID: existing.parentId,
+                        name: existing.name),
+                    newParentItemID: parentItemId,
+                    newName: name,
+                    payload: .directory(device: dev, inode: ino),
+                    now: now
+                )
+                guard receipt == .applied else {
+                    throw SyncEngineError.general(
+                        "The directory path receipt is stale: \(existing.name)")
                 }
                 seenDirTracker.markSeen(parentId: parentItemId, name: name)
                 directoryContext.register(
@@ -531,24 +519,22 @@ extension IncrementalSyncRun {
                 // Local files are renamed or moved
                 seenTracker.markSeen(parentId: existing.parentId, name: existing.name)
                 do {
-                    if let remoteID = existing.remoteId {
-                        let oldParentRemoteID = directoryContext.getRemoteId(for: existing.parentId)
-                        let newParentRemoteID = directoryContext.getRemoteId(for: parentItemId)
-                        let moving = parentItemId != existing.parentId
-                        _ = try await engine.client.updateMetadata(
-                            remoteId: remoteID, newName: name,
-                            addParentId: moving ? newParentRemoteID : nil,
-                            removeParentId: moving ? oldParentRemoteID : nil)
-                    }
-                    try await engine.store.write { conn in
-                        let statement = try conn.cachedStatement(
-                            "UPDATE items SET name = ?, parent_id = ?, updated_at = ? WHERE item_id = ?;")
-                        statement.bindText(name, at: 1)
-                        statement.bindInt64(parentItemId, at: 2)
-                        statement.bindDouble(now, at: 3)
-                        statement.bindInt64(existing.itemId, at: 4)
-                        _ = try statement.step()
-                        statement.reset()
+                    let receipt = try await engine.executeRemotePathOperation(
+                        remoteID: existing.remoteId,
+                        oldParentRemoteID: directoryContext.getRemoteId(for: existing.parentId),
+                        newParentRemoteID: directoryContext.getRemoteId(for: parentItemId),
+                        expectation: RemotePathReceiptExpectation(
+                            itemID: existing.itemId,
+                            parentItemID: existing.parentId,
+                            name: existing.name),
+                        newParentItemID: parentItemId,
+                        newName: name,
+                        payload: .file,
+                        now: now
+                    )
+                    guard receipt == .applied else {
+                        throw SyncEngineError.general(
+                            "The file path receipt is stale: \(existing.name)")
                     }
                     seenTracker.markSeen(parentId: parentItemId, name: name)
                     renamedOrMoved = true
