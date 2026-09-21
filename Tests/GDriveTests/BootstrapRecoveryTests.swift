@@ -292,6 +292,96 @@ struct BootstrapRecoveryTests {
 
     // MARK: - Bootstrap download recovery
 
+    @Test("Bootstrap adoption rejects an edit between hashing and version validation")
+    func bootstrapAdoptionRejectsEditBetweenHashAndVersion() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-adoption-race-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let localFile = local.appendingPathComponent("file.txt")
+        let remoteBody = Data("remote-A".utf8)
+        let replacement = Data("local--B".utf8)
+        #expect(remoteBody.count == replacement.count)
+        try remoteBody.write(to: localFile)
+        let remoteSHA = SyncEngine.computeSha256(of: remoteBody)
+        let replacementSHA = SyncEngine.computeSha256(of: replacement)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"C0"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/file") { return (response, remoteBody) }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [[
+                    "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                    "size": String(remoteBody.count), "sha256Checksum": remoteSHA,
+                    "parents": ["root"]
+                ]]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let didReplace = OSAllocatedUnfairLock(initialState: false)
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"),
+            incrementalScan: SyncEngine.defaultDirectoryScan,
+            stableFileDigestCapture: { url in
+                try StableLocalFileDigest.capture(at: url) {
+                    let shouldReplace = didReplace.withLock { replaced in
+                        guard !replaced else { return false }
+                        replaced = true
+                        return true
+                    }
+                    guard shouldReplace else { return }
+                    let handle = try FileHandle(forWritingTo: url)
+                    defer { try? handle.close() }
+                    try handle.seek(toOffset: 0)
+                    try handle.write(contentsOf: replacement)
+                    try handle.truncate(atOffset: UInt64(replacement.count))
+                    try handle.synchronize()
+                }
+            })
+
+        let stats = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+
+        #expect(didReplace.withLock { $0 })
+        #expect(try Data(contentsOf: localFile) == replacement)
+        #expect(stats.conflicts.count == 1)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == remoteBody)
+        let state = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT phase, local_sha256, remote_sha256, local_mtime, local_size,
+                    (SELECT COUNT(*) FROM sync_conflicts WHERE root_id = items.root_id)
+                FROM items WHERE remote_file_id = 'file';
+                """)
+            _ = try #require(try query.step())
+            return (query.columnText(at: 0), query.columnText(at: 1), query.columnText(at: 2),
+                query.columnInt64(at: 3), query.columnInt64(at: 4), query.columnInt64(at: 5))
+        }
+        let replacementVersion = try #require(try LocalFileVersion.read(at: localFile))
+        #expect(state.0 == "blocked")
+        #expect(state.1 == replacementSHA)
+        #expect(state.2 == remoteSHA)
+        #expect(state.3 == replacementVersion.mtime)
+        #expect(state.4 == replacementVersion.size)
+        #expect(state.5 == 1)
+    }
+
     @Test("A bootstrap download receipt database failure remains recoverable after reopening")
     func downloadReceiptDatabaseFailureThrows() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("download-db-\(UUID().uuidString)")

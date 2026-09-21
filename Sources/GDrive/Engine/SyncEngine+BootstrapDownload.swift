@@ -167,15 +167,14 @@ extension SyncEngine {
         func recoverPublishedFile(
             _ item: DriveFile, parentItemId: Int64, localURL: URL
         ) async throws -> Bool {
-            guard FileManager.default.fileExists(atPath: localURL.path),
-                  (try? SyncEngine.computeFileSha256(at: localURL).sha256Hex) == item.sha256Checksum,
-                  let published = try LocalFileVersion.read(at: localURL),
-                  published.size == item.sizeBytes else { return false }
+            guard let snapshot = try? self.stableFileDigestCapture(localURL),
+                  snapshot.sha256Hex == item.sha256Checksum,
+                  snapshot.fileSize == item.sizeBytes else { return false }
             let receipt = try await self.store.commitFileDownloadReceipt(
                 expectation: .bootstrap(
                     rootID: rootId, parentItemID: parentItemId, file: item),
                 localURL: localURL,
-                published: published
+                published: snapshot.version
             )
             return receipt == .applied
         }

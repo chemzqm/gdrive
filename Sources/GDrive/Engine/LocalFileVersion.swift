@@ -45,6 +45,31 @@ struct LocalFileVersion: Sendable, Equatable {
     }
 }
 
+struct StableLocalFileDigest: Sendable, Equatable {
+    let sha256Hex: String
+    let fileSize: Int64
+    let version: LocalFileVersion
+
+    static func capture(
+        at url: URL,
+        afterHash: @Sendable () throws -> Void = {}
+    ) throws -> StableLocalFileDigest {
+        guard let version = try LocalFileVersion.read(at: url) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        let digest = try SyncEngine.computeFileSha256(at: url)
+        try afterHash()
+        guard digest.fileSize == version.size else {
+            throw SyncEngineError.localFileModified(path: url.path)
+        }
+        try version.validate(at: url)
+        return StableLocalFileDigest(
+            sha256Hex: digest.sha256Hex,
+            fileSize: digest.fileSize,
+            version: version)
+    }
+}
+
 /// A transfer owns either immutable bytes or a copy-on-write filesystem clone.
 /// The clone path is never the mutable user path, and is removed on all exits.
 final class StableUploadInput: Sendable {

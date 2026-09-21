@@ -130,6 +130,8 @@ public final class SyncEngine: Sendable {
         _ = try await DirectoryScanner().scan(request, consume: consume)
     }
     let directoryScan: DirectoryScan
+    typealias StableFileDigestCapture = @Sendable (URL) throws -> StableLocalFileDigest
+    let stableFileDigestCapture: StableFileDigestCapture
 
     public convenience init(
         auth: Auth,
@@ -141,13 +143,17 @@ public final class SyncEngine: Sendable {
     ) async throws {
         try await self.init(auth: auth, store: store, client: client, idPool: idPool,
             downloadTemporaryDirectory: downloadTemporaryDirectory,
-            conflictDirectory: conflictDirectory, incrementalScan: Self.defaultDirectoryScan)
+            conflictDirectory: conflictDirectory, incrementalScan: Self.defaultDirectoryScan,
+            stableFileDigestCapture: { try StableLocalFileDigest.capture(at: $0) })
     }
 
     init(auth: Auth, store: StateStore? = nil, client: DriveClient? = nil, idPool: IDPool? = nil,
          downloadTemporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
          conflictDirectory: URL = DriveClient.defaultConflictDirectory,
-         incrementalScan: @escaping IncrementalScan) async throws {
+         incrementalScan: @escaping IncrementalScan,
+         stableFileDigestCapture: @escaping StableFileDigestCapture = {
+             try StableLocalFileDigest.capture(at: $0)
+         }) async throws {
         guard downloadTemporaryDirectory.isFileURL else {
             throw SyncEngineError.general("The temporary download directory must be a local file path")
         }
@@ -157,6 +163,7 @@ public final class SyncEngine: Sendable {
         }
         self.conflictDirectory = conflictDirectory
         self.directoryScan = incrementalScan
+        self.stableFileDigestCapture = stableFileDigestCapture
         self.auth = auth
         let effectiveClient = client ?? DriveClient(auth: auth)
         self.client = effectiveClient
