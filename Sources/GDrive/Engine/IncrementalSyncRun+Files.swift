@@ -321,172 +321,37 @@ extension IncrementalSyncRun {
                 guard input.size == fSize, input.sha256 == sha256Hex else {
                     throw SyncEngineError.localFileModified(path: localFileURL.path)
                 }
-                let mtime = input.version.mtime
-                let dev = input.version.device
-                let ino = input.version.inode
-                func uploadBody() async throws -> DriveFile {
-                    if fSize > 8 * 1024 * 1024 {
-                        let target: DurableCreateIntent
-                        if let pending = createIntent {
-                            guard pending.totalBytes == fSize,
-                                let expectedSHA256 = pending.expectedSHA256,
-                                expectedSHA256.caseInsensitiveCompare(sha256Hex)
-                                    == .orderedSame
-                            else {
-                                throw SyncEngineError.general(
-                                    "Unfinished large file creation intent input changed: \(item.name)"
-                                )
-                            }
-                            target = pending
-                        } else {
-                            let newRemoteId = try await engine.idPool.nextId()
-                            target = try await DurableCreateIntentStore.prepareFileUpload(
-                                store: engine.store,
-                                rootID: rootID,
-                                itemID: item.itemId,
-                                parentItemID: item.parentId,
-                                name: item.name,
-                                targetParentRemoteID: remoteParentId,
-                                candidateRemoteID: newRemoteId,
-                                device: dev,
-                                inode: ino,
-                                mtime: Int64(mtime),
-                                size: fSize,
-                                sha256: sha256Hex,
-                                transport: .resumable
-                            )
-                            createIntent = target
-                        }
-                        return try await engine.performResumableUpload(
-                            rootId: rootID,
-                            itemId: target.itemID,
-                            fileURL: input.fileURL,
-                            fileSize: fSize,
-                            expectedSha256: sha256Hex,
-                            remoteId: target.targetRemoteID,
-                            parentId: target.targetParentRemoteID,
-                            name: item.name,
-                            isUpdate: false
-                        )
-                    } else if let pending = createIntent {
-                        guard pending.totalBytes == fSize,
-                            let expectedSHA256 = pending.expectedSHA256,
-                            expectedSHA256.caseInsensitiveCompare(sha256Hex) == .orderedSame
-                        else {
-                            throw SyncEngineError.general(
-                                "Unfinished small file creation intent input has changed: \(item.name)"
-                            )
-                        }
-                        guard let fileData = input.data else {
-                            throw SyncEngineError.general(
-                                "Stable small-file input is missing its in-memory body: \(item.name)"
-                            )
-                        }
-                        return try await engine.client.uploadMultipart(
-                            name: item.name,
-                            parentId: pending.targetParentRemoteID,
-                            remoteId: pending.targetRemoteID,
-                            content: fileData,
-                            expectedSha256: sha256Hex
-                        )
-                    } else if let existingRemoteId = item.remoteFileId {
-                        guard let fileData = input.data else {
-                            throw SyncEngineError.general(
-                                "Stable small-file input is missing its in-memory body: \(item.name)"
-                            )
-                        }
-                        return try await engine.client.updateMultipart(
-                            remoteId: existingRemoteId,
-                            content: fileData,
-                            expectedSha256: sha256Hex
-                        )
-                    } else {
-                        guard let fileData = input.data else {
-                            throw SyncEngineError.general(
-                                "Stable small-file input is missing its in-memory body: \(item.name)"
-                            )
-                        }
-                        let newRemoteId = try await engine.idPool.nextId()
-                        let prepared = try await DurableCreateIntentStore.prepareFileUpload(
-                            store: engine.store,
-                            rootID: rootID,
-                            itemID: item.itemId,
-                            parentItemID: item.parentId,
-                            name: item.name,
-                            targetParentRemoteID: remoteParentId,
-                            candidateRemoteID: newRemoteId,
-                            device: dev,
-                            inode: ino,
-                            mtime: Int64(mtime),
-                            size: fSize,
-                            sha256: sha256Hex,
-                            transport: .multipart
-                        )
-                        createIntent = prepared
-                        return try await engine.client.uploadMultipart(
-                            name: item.name,
-                            parentId: prepared.targetParentRemoteID,
-                            remoteId: prepared.targetRemoteID,
-                            content: fileData,
-                            expectedSha256: sha256Hex
-                        )
-                    }
-                }
-                let uploadedFile = try await uploadBody()
+                let intent = try await engine.prepareNewFileUpload(
+                    rootID: rootID,
+                    itemID: item.itemId,
+                    parentItemID: item.parentId,
+                    name: item.name,
+                    parentRemoteID: remoteParentId,
+                    input: input,
+                    pendingIntent: createIntent
+                )
+                createIntent = intent
+                let uploadedFile = try await engine.performNewFileUpload(
+                    rootID: rootID,
+                    intent: intent,
+                    input: input,
+                    name: item.name,
+                    multipartRecovery: .verifyExisting
+                )
+                let receipt = try await DurableCreateIntentStore.commitFileUploadReceipt(
+                    store: engine.store,
+                    expectation: FileUploadReceiptExpectation(
+                        intent: intent,
+                        localGeneration: item.localGeneration,
+                        remoteGeneration: item.remoteGeneration,
+                        dirtyGeneration: item.dirtyGeneration
+                    ),
+                    uploadedFile: uploadedFile,
+                    input: input,
+                    now: self.now
+                )
 
-                let completedCreateIntent = createIntent
-                try input.version.validate(at: localFileURL)
-                let receiptApplied = OSAllocatedUnfairLock(initialState: false)
-                try await engine.store.batchWrite { conn in
-                    guard (try? LocalFileVersion.read(at: localFileURL)) == input.version
-                    else { return }
-                    let stmt = try conn.cachedStatement(
-                        """
-                        UPDATE items SET
-                            remote_file_id = ?,
-                            local_device = ?,
-                            local_inode = ?,
-                            local_mtime = ?,
-                            local_size = ?,
-                            base_sha256 = ?,
-                            base_size = ?,
-                            remote_sha256 = ?,
-                            remote_size = ?,
-                            remote_status = 'present',
-                            phase = 'committed',
-                            dirty_generation = 0,
-                            updated_at = ?
-                        WHERE item_id = ? AND local_generation = ?
-                            AND remote_generation = ? AND dirty_generation = ?;
-                        """)
-                    stmt.bindText(uploadedFile.id, at: 1)
-                    stmt.bindInt64(dev, at: 2)
-                    stmt.bindInt64(ino, at: 3)
-                    stmt.bindInt64(Int64(mtime), at: 4)
-                    stmt.bindInt64(fSize, at: 5)
-                    stmt.bindText(sha256Hex, at: 6)
-                    stmt.bindInt64(fSize, at: 7)
-                    stmt.bindText(sha256Hex, at: 8)
-                    stmt.bindInt64(fSize, at: 9)
-                    stmt.bindDouble(self.now, at: 10)
-                    stmt.bindInt64(item.itemId, at: 11)
-                    stmt.bindInt64(item.localGeneration, at: 12)
-                    stmt.bindInt64(item.remoteGeneration, at: 13)
-                    stmt.bindInt64(item.dirtyGeneration, at: 14)
-                    _ = try stmt.step()
-                    stmt.reset()
-                    guard conn.changes == 1 else { return }
-                    receiptApplied.withLock { $0 = true }
-                    if let createIntent = completedCreateIntent {
-                        try DurableCreateIntentStore.completeOperation(
-                            conn: conn,
-                            operationID: createIntent.operationID,
-                            now: self.now
-                        )
-                    }
-                }
-
-                guard receiptApplied.withLock({ $0 }) else {
+                guard case .applied = receipt else {
                     throw SyncEngineError.general(
                         "The upload receipt is stale; the newer generation remains pending: \(item.name)"
                     )

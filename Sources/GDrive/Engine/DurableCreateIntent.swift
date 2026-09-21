@@ -50,7 +50,7 @@ enum DurableCreateIntentStore {
         var operationType: String {
             switch self {
             case .multipart: "uploadMultipart"
-            case .resumable: "createResumableUpload"
+            case .resumable: "uploadResumable"
             }
         }
     }
@@ -349,7 +349,8 @@ enum DurableCreateIntentStore {
             expectedKind: "file")
         let pending = try loadActiveOperation(conn: conn, itemID: item.itemID, operationType: operationType)
         if let pending, let persistedSHA = pending.expectedSHA256,
-           persistedSHA.caseInsensitiveCompare(sha256) != .orderedSame {
+           persistedSHA.caseInsensitiveCompare(sha256) != .orderedSame,
+           operationType != FileUploadTransport.resumable.operationType {
             throw SyncEngineError.general("Incomplete file creation intent does not match the current content digest: \(name)")
         }
         return item

@@ -42,7 +42,7 @@ extension IncrementalSyncRun {
                     SELECT candidate.operation_id
                     FROM operations candidate
                     WHERE candidate.item_id = items.item_id
-                      AND candidate.operation_type IN ('createDirectory', 'uploadMultipart', 'createResumableUpload')
+                      AND candidate.operation_type IN ('createDirectory', 'uploadMultipart', 'uploadResumable')
                       AND candidate.state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
                     ORDER BY candidate.created_at DESC
                     LIMIT 1

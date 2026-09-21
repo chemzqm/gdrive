@@ -23,10 +23,11 @@ extension SyncEngine {
         parentId: String,
         name: String,
         isUpdate: Bool,
+        operationID: String? = nil,
         chunkSize: Int64 = 8 * 1024 * 1024 // 8MB chunked,256KB Integer multiple
     ) async throws -> DriveFile {
         if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteId) }
-        let opId = "resumable_\(remoteId)"
+        let opId = operationID ?? "resumable_\(remoteId)"
         var sessionURL: URL?
         var currentOffset: Int64 = 0
         var completedFile: DriveFile?
@@ -43,7 +44,7 @@ extension SyncEngine {
             let stmt = try conn.cachedStatement("""
             SELECT session_uri, confirmed_offset, expected_sha256, total_bytes
             FROM operations
-            WHERE operation_id = ? AND state = 'inFlight';
+            WHERE operation_id = ? AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
             """)
             stmt.bindText(opId, at: 1)
             defer { stmt.reset() }
@@ -281,11 +282,12 @@ extension SyncEngine {
         let now = Date().timeIntervalSince1970
         try await store.write { conn in
             let stmt = try conn.cachedStatement("""
-            UPDATE operations SET state = 'completed', confirmed_offset = ?, updated_at = ? WHERE operation_id = ?;
+            UPDATE operations SET state = ?, confirmed_offset = ?, updated_at = ? WHERE operation_id = ?;
             """)
-            stmt.bindInt64(fileSize, at: 1)
-            stmt.bindDouble(now, at: 2)
-            stmt.bindText(opId, at: 3)
+            stmt.bindText(operationID == nil ? "completed" : "inFlight", at: 1)
+            stmt.bindInt64(fileSize, at: 2)
+            stmt.bindDouble(now, at: 3)
+            stmt.bindText(opId, at: 4)
             _ = try stmt.step()
             stmt.reset()
         }
