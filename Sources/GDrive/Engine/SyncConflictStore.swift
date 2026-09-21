@@ -433,47 +433,16 @@ extension SyncEngine {
               digest.fileSize == conflict.remoteSize else {
             throw SyncEngineError.general("The stored remote conflict file changed: \(storedURL.path)")
         }
-        guard let expected = try LocalFileVersion.read(at: localURL),
-              let storedVersion = try LocalFileVersion.read(at: storedURL) else {
+        guard let expected = try LocalFileVersion.read(at: localURL) else {
             throw DriveError.fileModifiedDuringUpload(path: localURL.path)
         }
-        let publicationURL: URL
-        let replacementDirectory: URL?
-        if storedVersion.device == expected.device {
-            publicationURL = storedURL
-            replacementDirectory = nil
-        } else {
-            let directory = try FileManager.default.url(
-                for: .itemReplacementDirectory, in: .userDomainMask,
-                appropriateFor: localURL, create: true)
-            publicationURL = directory.appendingPathComponent(localURL.lastPathComponent)
-            try FileManager.default.copyItem(at: storedURL, to: publicationURL)
-            replacementDirectory = directory
-        }
-        defer {
-            if let replacementDirectory {
-                try? FileManager.default.removeItem(at: replacementDirectory)
-            }
-        }
-        let exchange = try LocalFilePublication.exchangeOwnedFile(
-            publicationURL, with: localURL, expected: expected)
-        do {
-            try await commitRemoteConflictResolution(
-                record, published: exchange.published,
-                remotePresent: conflict.remoteStatus == .present)
-        } catch {
-            do {
-                try exchange.rollback()
-            } catch let rollbackError {
-                throw SyncEngineError.general(
-                    "Conflict database update failed and publication rollback failed: \(rollbackError)")
-            }
-            throw error
-        }
-        try exchange.deleteDisplacedFile()
-        if publicationURL != storedURL {
-            try FileManager.default.removeItem(at: storedURL)
-        }
+        let published = try LocalFilePublication.publish(
+            storedURL, to: localURL, expected: expected,
+            expectedSHA256: conflict.remoteSHA256)
+        try await commitRemoteConflictResolution(
+            record, published: published,
+            remotePresent: conflict.remoteStatus == .present)
+        try FileManager.default.removeItem(at: storedURL)
     }
 
     private func commitRemoteConflictResolution(

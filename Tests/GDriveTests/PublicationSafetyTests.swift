@@ -49,7 +49,7 @@ struct PublicationSafetyTests {
             Issue.record("Unconditional overwrite was allowed")
         } catch DriveError.unsafeOverwrite { }
         do {
-            _ = try await client.initiateResumableUpdate(remoteId: "existing", totalBytes: 9 * 1024 * 1024)
+            _ = try await client.initiateResumableUpdate(remoteId: "existing", totalBytes: 1)
             Issue.record("Unconditional resumable update was allowed")
         } catch DriveError.unsafeOverwrite { }
         #expect(BlockedPublicationURLProtocol.requests.withLock { $0 } == 0)
@@ -83,7 +83,8 @@ struct PublicationSafetyTests {
         #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 
-    @Test("Captured small and large inputs do not follow later source writes", arguments: [12, 9 * 1024 * 1024])
+    @Test("Captured small and large inputs do not follow later source writes",
+          arguments: [12, 8 * 1024 * 1024 + 1])
     func stableInput(size: Int) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-input-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -116,14 +117,16 @@ struct PublicationSafetyTests {
         try newer.write(to: destination)
         try Data("remote version".utf8).write(to: download)
         #expect(throws: (any Error).self) {
-            try LocalFilePublication.publish(download, to: destination, expected: expected)
+            try LocalFilePublication.publish(
+                download, to: destination, expected: expected,
+                expectedSHA256: SyncEngine.computeSha256(of: Data("remote version".utf8)))
         }
         #expect(try Data(contentsOf: destination) == newer)
         #expect(FileManager.default.fileExists(atPath: download.path))
     }
 
-    @Test("Unchanged destination publishes the downloaded inode", arguments: [false, true])
-    func publishesAtomically(existing: Bool) throws {
+    @Test("Downloaded bytes are written through the destination path", arguments: [false, true])
+    func writesThroughDestination(existing: Bool) throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a11-publish-ok-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -135,11 +138,14 @@ struct PublicationSafetyTests {
         let expected = try LocalFileVersion.read(at: destination)
         let content = Data("remote version".utf8)
         try content.write(to: download)
-        let inode = try #require(try LocalFileVersion.read(at: download)).inode
-        let published = try LocalFilePublication.publish(download, to: destination, expected: expected)
-        #expect(published.inode == inode)
+        let published = try LocalFilePublication.publish(
+            download, to: destination, expected: expected,
+            expectedSHA256: SyncEngine.computeSha256(of: content))
+        if let expected {
+            #expect(published.inode == expected.inode)
+        }
         #expect(try Data(contentsOf: destination) == content)
-        #expect(!FileManager.default.fileExists(atPath: download.path))
+        #expect(FileManager.default.fileExists(atPath: download.path))
     }
 
     @Test("Checksum and pre-publication cancellation clean the configured staging folder", arguments: [false, true])

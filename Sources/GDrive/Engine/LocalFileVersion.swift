@@ -16,6 +16,18 @@ struct LocalFileVersion: Sendable, Equatable {
             if errno == ENOENT { return nil }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
+        return try fromStat(value)
+    }
+
+    static func read(fileDescriptor: Int32) throws -> LocalFileVersion {
+        var value = stat()
+        guard fstat(fileDescriptor, &value) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return try fromStat(value)
+    }
+
+    private static func fromStat(_ value: stat) throws -> LocalFileVersion {
         guard value.st_mode & S_IFMT == S_IFREG else {
             throw CocoaError(.fileReadUnsupportedScheme)
         }

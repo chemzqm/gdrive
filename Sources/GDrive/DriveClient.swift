@@ -910,7 +910,7 @@ public final class DriveClient: Sendable {
         guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
             throw DriveError.fileModifiedDuringUpload(path: destinationURL.path)
         }
-        try DownloadStaging.prepare(temporaryDirectory, destination: destinationURL)
+        try DownloadStaging.prepare(temporaryDirectory)
         let token = try await getValidToken()
         var components = URLComponents(string: "https://www.googleapis.com/drive/v3/files/\(remoteId)")!
         components.queryItems = [
@@ -922,11 +922,8 @@ public final class DriveClient: Sendable {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
 
         let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
-        var publishedSuccessfully = false
         defer {
-            if !publishedSuccessfully {
-                try? FileManager.default.removeItem(at: tempURL)
-            }
+            try? FileManager.default.removeItem(at: tempURL)
         }
 
         let (asyncBytes, http) = try await executeStreamingRequest(req)
@@ -973,9 +970,9 @@ public final class DriveClient: Sendable {
         }
 
         try await beforePublish?()
-        let published = try LocalFilePublication.publish(tempURL, to: destinationURL, expected: expectedDestination)
-        publishedSuccessfully = true
-        return published
+        return try LocalFilePublication.publish(
+            tempURL, to: destinationURL, expected: expectedDestination,
+            expectedSHA256: actualSha256)
     }
 
     // MARK: - Changes Incremental Changes

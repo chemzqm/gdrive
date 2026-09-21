@@ -1538,7 +1538,8 @@ struct ChangesRecoveryTests {
         let mebibyte = Data(repeating: 0x5a, count: 1024 * 1024)
         FileManager.default.createFile(atPath: file.path, contents: nil)
         let handle = try FileHandle(forWritingTo: file)
-        for _ in 0..<9 { try handle.write(contentsOf: mebibyte) }
+        for _ in 0..<8 { try handle.write(contentsOf: mebibyte) }
+        try handle.write(contentsOf: Data([0x5a]))
         try handle.close()
 
         let result = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path, maxConcurrency: 1)
@@ -1553,7 +1554,7 @@ struct ChangesRecoveryTests {
             #expect(try item.step())
             #expect(item.columnText(at: 0) == "committed")
             #expect(item.columnInt64(at: 1) == 0)
-            #expect(item.columnInt64(at: 2) == Int64(9 * 1024 * 1024))
+            #expect(item.columnInt64(at: 2) == Int64(8 * 1024 * 1024 + 1))
         }
     }
 

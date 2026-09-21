@@ -44,19 +44,9 @@ enum DownloadStaging {
         return resolvedDirectory
     }
 
-    /// Atomic publication requires both directories to be on the same filesystem.
-    static func prepare(_ directory: URL, destination: URL) throws {
+    static func prepare(_ directory: URL) throws {
         guard directory.isFileURL else { throw SyncEngineError.general("Download temporary directory must be local file path") }
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        var staging = stat()
-        var target = stat()
-        guard stat(directory.path, &staging) == 0,
-              stat(destination.deletingLastPathComponent().path, &target) == 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
-        }
-        guard staging.st_dev == target.st_dev else {
-            throw SyncEngineError.general("The download temporary directory must be on the same file system as the target, please configure downloadTemporaryDirectory: \(directory.path)")
-        }
     }
 }
 

@@ -470,14 +470,15 @@ struct SyncEngineTests {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        // Create 9MB File (9 * 1024 * 1024 Bytes)
-        let largeFilePath = tempDir.appendingPathComponent("large_9mb.bin")
+        // Cross the 8 MiB resumable threshold by the smallest possible amount.
+        let largeFilePath = tempDir.appendingPathComponent("large.bin")
         let chunkPattern = Data(repeating: 0x42, count: 1024 * 1024) // 1MB block
         FileManager.default.createFile(atPath: largeFilePath.path, contents: nil)
         let writeHandle = try FileHandle(forWritingTo: largeFilePath)
-        for _ in 0..<9 {
+        for _ in 0..<8 {
             try writeHandle.write(contentsOf: chunkPattern)
         }
+        try writeHandle.write(contentsOf: Data([0x42]))
         try writeHandle.close()
 
         let remoteTestDirName = "sync_large_\(UUID().uuidString.prefix(8))"
@@ -524,8 +525,8 @@ struct SyncEngineTests {
 
             #expect(completedOps.count == 1)
             if let operationStatement = completedOps.first {
-                #expect(operationStatement.confirmedOffset == 9 * 1024 * 1024)
-                #expect(operationStatement.totalBytes == 9 * 1024 * 1024)
+                #expect(operationStatement.confirmedOffset == 8 * 1024 * 1024 + 1)
+                #expect(operationStatement.totalBytes == 8 * 1024 * 1024 + 1)
                 #expect(operationStatement.state == "completed")
             }
 
@@ -533,8 +534,8 @@ struct SyncEngineTests {
             let remoteChildren = try await client.listChildren(parentId: remoteRoot.id)
             #expect(remoteChildren.count == 1)
             let remoteChild = try #require(remoteChildren.first)
-            #expect(remoteChild.name == "large_9mb.bin")
-            #expect(remoteChild.sizeBytes == Int64(9 * 1024 * 1024))
+            #expect(remoteChild.name == "large.bin")
+            #expect(remoteChild.sizeBytes == Int64(8 * 1024 * 1024 + 1))
             print("✅ [LargeFile] Chunked upload of large files with SQLite Status record verification successful!")
     }
         }
@@ -555,23 +556,26 @@ struct SyncEngineTests {
             try? FileManager.default.removeItem(at: tempDir)
         }
 
-        let largeFilePath = tempDir.appendingPathComponent("large_stale_9mb.bin")
+        let largeFilePath = tempDir.appendingPathComponent("large_stale.bin")
         let chunkPattern = Data(repeating: 0x55, count: 1024 * 1024)
         FileManager.default.createFile(atPath: largeFilePath.path, contents: nil)
         let writeHandle = try FileHandle(forWritingTo: largeFilePath)
-        for _ in 0..<9 {
+        for _ in 0..<8 {
             try writeHandle.write(contentsOf: chunkPattern)
         }
+        try writeHandle.write(contentsOf: Data([0x55]))
         try writeHandle.close()
         let expectedSHA256 = try SyncEngine.computeFileSha256(at: largeFilePath).sha256Hex
         let oldChunkPattern = Data(repeating: 0x44, count: 1024 * 1024)
         var oldSHAContext = CC_SHA256_CTX()
         CC_SHA256_Init(&oldSHAContext)
-        for _ in 0..<9 {
+        for _ in 0..<8 {
             _ = oldChunkPattern.withUnsafeBytes {
                 CC_SHA256_Update(&oldSHAContext, $0.baseAddress, CC_LONG(oldChunkPattern.count))
             }
         }
+        var oldTail: UInt8 = 0x44
+        CC_SHA256_Update(&oldSHAContext, &oldTail, 1)
         var oldDigest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
         CC_SHA256_Final(&oldDigest, &oldSHAContext)
         let oldExpectedSHA256 = oldDigest.map { String(format: "%02x", $0) }.joined()
@@ -585,17 +589,17 @@ struct SyncEngineTests {
             // Seed a real, incomplete Drive session for the same preallocated object ID using
             // different content. This covers changed-hash invalidation, not process-crash recovery.
             let staleSessionURL = try await client.initiateResumableUpload(
-                name: "large_stale_9mb.bin",
+                name: "large_stale.bin",
                 parentId: remoteRoot.id,
                 remoteId: try #require(remoteRootGenIds.dropFirst().first),
-                totalBytes: 9 * 1024 * 1024
+                totalBytes: 8 * 1024 * 1024 + 1
             )
             let stalePrefix = Data(repeating: 0x44, count: 4 * 1024 * 1024)
             let staleChunkResult = try await client.uploadResumableChunk(
                 sessionURL: staleSessionURL,
                 chunkData: stalePrefix,
                 offset: 0,
-                totalBytes: 9 * 1024 * 1024
+                totalBytes: 8 * 1024 * 1024 + 1
             )
             switch staleChunkResult {
             case .incomplete(let confirmedOffset):
@@ -636,8 +640,8 @@ struct SyncEngineTests {
                     local_device, local_inode, local_mtime, local_size, local_sha256,
                     local_generation, local_status, phase, dirty_generation, created_at, updated_at
                 ) VALUES (
-                    100, 1, 1, 'large_stale_9mb.bin', 'file', '\(retainedRemoteID)',
-                    1, 1, 0, 9437184, '\(oldExpectedSHA256)',
+                    100, 1, 1, 'large_stale.bin', 'file', '\(retainedRemoteID)',
+                    1, 1, 0, 8388609, '\(oldExpectedSHA256)',
                     1, 'present', 'inFlight', 1, 0, 0
                 );
                 INSERT INTO operations (
@@ -647,7 +651,7 @@ struct SyncEngineTests {
                 ) VALUES (
                     'resumable_\(retainedRemoteID)', 1, 100, 'uploadResumable', 'inFlight',
                     '\(oldExpectedSHA256)', '\(retainedRemoteID)', '\(remoteRoot.id)',
-                    '\(staleSessionURL.absoluteString)', 4194304, 9437184, 0, 0
+                    '\(staleSessionURL.absoluteString)', 4194304, 8388609, 0, 0
                 );
                 INSERT INTO cursors (
                     root_id, account_id, cursor_kind, token_value, updated_at
@@ -714,7 +718,7 @@ struct SyncEngineTests {
                 )
             }
             let expectedOperationID = "resumable_\(retainedRemoteID)"
-            let expectedByteCount: Int64 = 9 * 1024 * 1024
+            let expectedByteCount: Int64 = 8 * 1024 * 1024 + 1
             #expect(persisted.operationID == expectedOperationID)
             #expect(persisted.operationItemID == 100)
             #expect(persisted.expectedSHA256?.lowercased() == expectedSHA256)
@@ -738,7 +742,7 @@ struct SyncEngineTests {
             #expect(remoteChildren.count == 1)
             let uploaded = try #require(remoteChildren.first)
             #expect(uploaded.id == retainedRemoteID)
-            #expect(uploaded.name == "large_stale_9mb.bin")
+            #expect(uploaded.name == "large_stale.bin")
             #expect(uploaded.sizeBytes == expectedByteCount)
             #expect(uploaded.sha256Checksum?.lowercased() == expectedSHA256)
             print("✅ [StaleSession] Dirty breakpoints are automatically and safely discarded, reset and uploaded successfully!")

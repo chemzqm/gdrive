@@ -538,18 +538,19 @@ struct BootstrapResumeSafetyTests {
         let localRootDir = tempDir.appendingPathComponent("local_root")
         try FileManager.default.createDirectory(at: localRootDir, withIntermediateDirectories: true)
 
-        // Create a 9MB Large local files
-        let largeFilePath = localRootDir.appendingPathComponent("large_9mb.bin")
+        // Cross the 8 MiB resumable threshold by the smallest possible amount.
+        let largeFilePath = localRootDir.appendingPathComponent("large.bin")
         let chunk1MB = Data(repeating: 0x42, count: 1024 * 1024)
         FileManager.default.createFile(atPath: largeFilePath.path, contents: nil)
         let handle = try FileHandle(forWritingTo: largeFilePath)
-        for _ in 0..<9 {
+        for _ in 0..<8 {
             try handle.write(contentsOf: chunk1MB)
         }
+        try handle.write(contentsOf: Data([0x42]))
         try handle.close()
 
         let (expectedSha256, totalSize) = try SyncEngine.computeFileSha256(at: largeFilePath)
-        #expect(totalSize == 9 * 1024 * 1024)
+        #expect(totalSize == 8 * 1024 * 1024 + 1)
 
         let dbPath = tempDir.appendingPathComponent("state.sqlite").path
         let store = try await StateStore(path: dbPath)
@@ -580,7 +581,7 @@ struct BootstrapResumeSafetyTests {
                 local_device, local_inode, local_mtime, local_size, local_sha256,
                 local_generation, local_status, phase, dirty_generation, created_at, updated_at
             ) VALUES (
-                100, 1, 1, 'large_9mb.bin', 'file', '\(persistentRemoteId)',
+                100, 1, 1, 'large.bin', 'file', '\(persistentRemoteId)',
                 1, 1, 0, \(totalSize), '\(expectedSha256)',
                 1, 'present', 'inFlight', 1, 1, 1
             );
@@ -637,7 +638,7 @@ struct BootstrapResumeSafetyTests {
                         } else if contentRange.starts(with: "bytes 6291456-") {
                             recorder.recordResumedRange(start: 6291456)
                             let json = Data("""
-                            {"id": "\(persistentRemoteId)", "name": "large_9mb.bin", "size": "\(totalSize)", "sha256Checksum": "\(expectedSha256)"}
+                            {"id": "\(persistentRemoteId)", "name": "large.bin", "size": "\(totalSize)", "sha256Checksum": "\(expectedSha256)"}
                             """.utf8)
                             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, json)
                         }
@@ -678,7 +679,7 @@ struct BootstrapResumeSafetyTests {
             let finalRemoteId: String?
         }
         let storedFile: FileState = try await store.read { conn in
-            let statement = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256, remote_file_id FROM items WHERE name = 'large_9mb.bin';")
+            let statement = try conn.cachedStatement("SELECT phase, dirty_generation, base_sha256, remote_file_id FROM items WHERE name = 'large.bin';")
             defer { statement.reset() }
             if try statement.step() {
                 return FileState(phase: statement.columnText(at: 0), dirtyGen: statement.columnInt64(at: 1), baseSha: statement.columnText(at: 2), finalRemoteId: statement.columnText(at: 3))

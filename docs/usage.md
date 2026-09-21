@@ -83,7 +83,7 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
 ### 2.3 设置下载临时目录
 
-默认下载到 `~/.gdrive/remotes/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后原子发布到同步目录。
+默认下载到 `~/.gdrive/remotes/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后通过目标原路径分块写入同步目录。
 
 如果同步目录中的同路径文件与远端 SHA-256 不同，远端版本保存在
 `~/.gdrive/conflicts/<remoteRootId>/<relativePath>`。冲突会出现在 `SyncStats.conflicts`，进程重启后
@@ -132,11 +132,10 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 `setDownloadTemporaryDirectory(_ directory: URL) throws` 接受本地文件 URL，配置由引擎实例持有，
 不写入数据库。同步轮次选定目录后，后续设置变更不会移动或重定向该轮在途下载。
 目录不能位于当前同步根或同一 StateStore 中其他已激活的同步根内（包括符号链接指向这些目录的情况）。
-临时目录与下载目标必须位于同一文件系统，以保持原子发布；跨卷会明确失败，
-应将基目录设置到目标卷上、所有同步目录之外。配置多个目标卷时，分别使用对应配置的引擎实例。
+临时目录可以与下载目标位于不同文件系统，但必须位于所有同步目录之外。
 
-普通失败会清理未发布的下载临时文件。替换本地文件时的恢复文件也保留在该临时目录：
-成功后旧版本移至废纸篓，若无法移入废纸篓或检测到发布竞态，则保留恢复文件。
+普通失败会清理未发布的下载临时文件。覆盖已有文件时保留原 inode，通过截断和分块写入更新正文；
+成功后复核目标 SHA-256，不生成恢复文件，也不把旧版本移入废纸篓。
 同步结束（包括失败或取消）后删除空的远程根暂存目录；含有残留或恢复文件的目录保留。
 进程异常终止留下的临时文件不会在启动时自动清扫。
 
@@ -248,7 +247,7 @@ print("  - 下载字节: \(stats.bytesDownloaded) bytes")
 print("  - 本地建目录: \(stats.directoriesCreated)")
 ```
 
-- **特性**：流式递归遍历，原子临时文件落地校验 SHA-256 后发布，建立完整的 SQLite 共同基线。
+- **特性**：流式递归遍历，临时文件落地校验 SHA-256 后通过目标原路径分块写入，建立完整的 SQLite 共同基线。
 - **保护**：不覆盖本地已有的不同内容；远端版本写入 conflicts 目录并等待调用方显式选择。
 - **失败恢复**：首次调用在下载前持久化远端观察。文件下载、校验或发布失败会计入
   `filesFailed`，保留待恢复观察且不把初始化标记为完成；再次调用 `sync()` 会继续已绑定的

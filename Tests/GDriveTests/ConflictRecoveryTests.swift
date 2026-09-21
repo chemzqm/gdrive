@@ -206,8 +206,7 @@ struct ConflictRecoveryTests {
         #expect(stats.filesFailed == 0)
         let conflict = try #require(stats.conflicts.first)
         let conflictPath = try #require(conflict.conflictPath)
-        let storedVersion = try #require(
-            try LocalFileVersion.read(at: URL(fileURLWithPath: conflictPath)))
+        let localVersion = try #require(try LocalFileVersion.read(at: testFixture.original))
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == Data("remote edited content".utf8))
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == stats.conflicts)
@@ -217,7 +216,7 @@ struct ConflictRecoveryTests {
         #expect(context.value.state.withLock { $0.downloads } == downloads)
         try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
         #expect(try Data(contentsOf: testFixture.original) == Data("remote edited content".utf8))
-        #expect(try LocalFileVersion.read(at: testFixture.original)?.inode == storedVersion.inode)
+        #expect(try LocalFileVersion.read(at: testFixture.original)?.inode == localVersion.inode)
         #expect(!FileManager.default.fileExists(atPath: conflictPath))
         let localEntries = try FileManager.default.contentsOfDirectory(
             at: testFixture.local, includingPropertiesForKeys: nil)
@@ -250,7 +249,8 @@ struct ConflictRecoveryTests {
 
     @Test("Large incremental conflict is downloaded without uploading a conflict copy")
     func largeConflict() async throws {
-        let testFixture = try await fixture(localContent: Data(repeating: 65, count: 9 * 1024 * 1024))
+        let testFixture = try await fixture(
+            localContent: Data(repeating: 65, count: 8 * 1024 * 1024 + 1))
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(stats.conflicts.count == 1)
