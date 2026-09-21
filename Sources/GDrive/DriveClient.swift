@@ -69,7 +69,6 @@ public enum DriveError: Error, Sendable, CustomStringConvertible, Equatable {
     case sizeMismatch(expected: Int64, actual: Int64?)
     case serverError(statusCode: Int, message: String)
     case invalidResponse(message: String)
-    case fileModifiedDuringUpload(path: String)
     case unsafeOverwrite(fileId: String)
     case stableInputUnavailable(path: String)
 
@@ -91,8 +90,6 @@ public enum DriveError: Error, Sendable, CustomStringConvertible, Equatable {
             return "Server-side error (\(code)): \(msg)"
         case .invalidResponse(let msg):
             return "Invalid API Response: \(msg)"
-        case .fileModifiedDuringUpload(let path):
-            return "Local file changed during transfer or publication: \(path)"
         case .unsafeOverwrite(let id):
             return "Remote body overlay blocked,Drive Conditional write has not been verified, keep pending sync: \(id)"
         case .stableInputUnavailable(let path):
@@ -908,7 +905,7 @@ public final class DriveClient: Sendable {
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws -> LocalFileVersion {
         guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
-            throw DriveError.fileModifiedDuringUpload(path: destinationURL.path)
+            throw SyncEngineError.localFileModified(path: destinationURL.path)
         }
         try DownloadStaging.prepare(temporaryDirectory)
         let token = try await getValidToken()

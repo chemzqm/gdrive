@@ -243,7 +243,7 @@ extension SyncEngine {
             published = originalVersion
         } else {
             guard digest.sha256Hex == conflictOperation.localSHA else {
-                throw DriveError.fileModifiedDuringUpload(path: original.path)
+                throw SyncEngineError.localFileModified(path: original.path)
             }
             published = try await client.downloadFileSafely(remoteId: conflictOperation.remoteID,
                 destinationURL: original, expectedSha256: conflictOperation.remoteSHA,

@@ -434,7 +434,7 @@ extension SyncEngine {
             throw SyncEngineError.general("The stored remote conflict file changed: \(storedURL.path)")
         }
         guard let expected = try LocalFileVersion.read(at: localURL) else {
-            throw DriveError.fileModifiedDuringUpload(path: localURL.path)
+            throw SyncEngineError.localFileModified(path: localURL.path)
         }
         let published = try LocalFilePublication.publish(
             storedURL, to: localURL, expected: expected,

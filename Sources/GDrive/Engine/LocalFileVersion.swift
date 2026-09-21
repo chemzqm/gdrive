@@ -40,7 +40,7 @@ struct LocalFileVersion: Sendable, Equatable {
 
     func validate(at url: URL) throws {
         guard try Self.read(at: url) == self else {
-            throw DriveError.fileModifiedDuringUpload(path: url.path)
+            throw SyncEngineError.localFileModified(path: url.path)
         }
     }
 }

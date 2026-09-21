@@ -10,23 +10,31 @@ enum LocalFilePublication {
         expected: LocalFileVersion?,
         expectedSHA256: String
     ) throws -> LocalFileVersion {
-        guard let sourceVersion = try LocalFileVersion.read(at: source),
-              try LocalFileVersion.read(at: destination) == expected else {
-            throw DriveError.fileModifiedDuringUpload(path: destination.path)
+        guard let sourceVersion = try LocalFileVersion.read(at: source) else {
+            throw CocoaError(.fileNoSuchFile)
+        }
+        guard try LocalFileVersion.read(at: destination) == expected else {
+            throw SyncEngineError.localFileModified(path: destination.path)
         }
 
         let descriptor = try openDestination(destination, expected: expected)
         try writeContents(of: source, version: sourceVersion, to: descriptor)
-        try sourceVersion.validate(at: source)
+        guard try LocalFileVersion.read(at: source) == sourceVersion else {
+            throw SyncEngineError.localFilePublicationFailed(path: source.path)
+        }
 
         guard let beforeHash = try LocalFileVersion.read(at: destination) else {
-            throw DriveError.fileModifiedDuringUpload(path: destination.path)
+            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
         }
         let digest = try SyncEngine.computeFileSha256(at: destination)
-        guard digest.sha256Hex.caseInsensitiveCompare(expectedSHA256) == .orderedSame,
-              digest.fileSize == sourceVersion.size,
-              try LocalFileVersion.read(at: destination) == beforeHash else {
-            throw DriveError.fileModifiedDuringUpload(path: destination.path)
+        guard digest.sha256Hex.caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
+            throw DriveError.checksumMismatch(expected: expectedSHA256, actual: digest.sha256Hex)
+        }
+        guard digest.fileSize == sourceVersion.size else {
+            throw DriveError.sizeMismatch(expected: sourceVersion.size, actual: digest.fileSize)
+        }
+        guard try LocalFileVersion.read(at: destination) == beforeHash else {
+            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
         }
         return beforeHash
     }
@@ -47,7 +55,7 @@ enum LocalFilePublication {
         do {
             guard try LocalFileVersion.read(fileDescriptor: descriptor) == expected,
                   try LocalFileVersion.read(at: destination) == expected else {
-                throw DriveError.fileModifiedDuringUpload(path: destination.path)
+                throw SyncEngineError.localFileModified(path: destination.path)
             }
             return descriptor
         } catch {
@@ -64,7 +72,7 @@ enum LocalFilePublication {
         guard input >= 0 else { throw posixError() }
         defer { close(input) }
         guard try LocalFileVersion.read(fileDescriptor: input) == version else {
-            throw DriveError.fileModifiedDuringUpload(path: source.path)
+            throw SyncEngineError.localFilePublicationFailed(path: source.path)
         }
         guard ftruncate(descriptor, 0) == 0 else { throw posixError() }
         guard fcopyfile(input, descriptor, nil, copyfile_flags_t(COPYFILE_DATA)) == 0 else {
@@ -72,7 +80,7 @@ enum LocalFilePublication {
         }
         guard fsync(descriptor) == 0 else { throw posixError() }
         guard try LocalFileVersion.read(fileDescriptor: input) == version else {
-            throw DriveError.fileModifiedDuringUpload(path: source.path)
+            throw SyncEngineError.localFilePublicationFailed(path: source.path)
         }
     }
 

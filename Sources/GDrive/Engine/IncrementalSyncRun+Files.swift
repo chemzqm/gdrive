@@ -196,7 +196,7 @@ extension IncrementalSyncRun {
 
                 let input = try StableUploadInput.capture(at: localFileURL)
                 guard input.size == fSize, input.sha256 == sha256Hex else {
-                    throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                    throw SyncEngineError.localFileModified(path: localFileURL.path)
                 }
                 let mtime = input.version.mtime
                 let dev = input.version.device
@@ -422,10 +422,10 @@ extension IncrementalSyncRun {
                         expectedDestination.mtime == item.localMtime,
                         expectedDestination.size == item.local?.size
                     else {
-                        throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                        throw SyncEngineError.localFileModified(path: localFileURL.path)
                     }
                 } else if expectedDestination != nil {
-                    throw DriveError.fileModifiedDuringUpload(path: localFileURL.path)
+                    throw SyncEngineError.localFileModified(path: localFileURL.path)
                 }
                 engine.monitor.startDownload(
                     id: downId, name: item.name, totalBytes: downSize)

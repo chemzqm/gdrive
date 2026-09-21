@@ -77,7 +77,7 @@ struct PublicationSafetyTests {
                     }
                 })
             Issue.record("Changed destination was replaced")
-        } catch DriveError.fileModifiedDuringUpload { }
+        } catch SyncEngineError.localFileModified { }
         #expect(try Data(contentsOf: destination) == newer)
         #expect(try FileManager.default.contentsOfDirectory(atPath: directory.path).allSatisfy { !$0.hasPrefix(".tmp_") })
         #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
@@ -117,7 +117,7 @@ struct PublicationSafetyTests {
         try newer.write(to: destination)
         try Data("remote version".utf8).write(to: download)
         #expect(throws: (any Error).self) {
-            try LocalFilePublication.publish(
+            _ = try LocalFilePublication.publish(
                 download, to: destination, expected: expected,
                 expectedSHA256: SyncEngine.computeSha256(of: Data("remote version".utf8)))
         }
@@ -146,6 +146,28 @@ struct PublicationSafetyTests {
         }
         #expect(try Data(contentsOf: destination) == content)
         #expect(FileManager.default.fileExists(atPath: download.path))
+    }
+
+    @Test("A failure after publication starts is not reported as a local modification")
+    func postWriteFailureClassification() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "a11-publish-failure-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        let source = directory.appendingPathComponent("download")
+        let remote = Data("remote version".utf8)
+        try Data("original".utf8).write(to: destination)
+        try remote.write(to: source)
+
+        do {
+            _ = try LocalFilePublication.publish(
+                source, to: destination, expected: try LocalFileVersion.read(at: destination),
+                expectedSHA256: "incorrect")
+            Issue.record("Publication with an incorrect checksum unexpectedly succeeded")
+        } catch DriveError.checksumMismatch { }
+
+        #expect(try Data(contentsOf: destination) == remote)
     }
 
     @Test("Checksum and pre-publication cancellation clean the configured staging folder", arguments: [false, true])

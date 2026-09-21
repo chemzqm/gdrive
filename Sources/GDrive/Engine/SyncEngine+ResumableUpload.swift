@@ -168,7 +168,7 @@ extension SyncEngine {
                         _ = try stmt.step()
                         stmt.reset()
                     }
-                    throw DriveError.fileModifiedDuringUpload(path: fileURL.path)
+                    throw SyncEngineError.localFileModified(path: fileURL.path)
                 }
             }
         }

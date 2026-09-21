@@ -64,6 +64,8 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
     case remoteRootLost(remoteId: String, reason: String)
     case rootNotConfigured(remoteId: String)
     case invalidDirectory(path: String)
+    case localFileModified(path: String)
+    case localFilePublicationFailed(path: String)
     case general(String)
 
     public var errorDescription: String? {
@@ -82,6 +84,10 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
             return "No matching sync root was found. Run initial sync first: \(remoteId)"
         case .invalidDirectory(let path):
             return "Path is not a valid directory: \(path)"
+        case .localFileModified(let path):
+            return "Local file changed during synchronization: \(path)"
+        case .localFilePublicationFailed(let path):
+            return "Local file publication could not be verified after writing began: \(path)"
         case .general(let msg):
             return msg
         }
