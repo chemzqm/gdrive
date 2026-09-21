@@ -2,13 +2,15 @@ import Darwin
 import Foundation
 
 enum LocalFilePublication {
+    private static let atomicRenameThreshold: Int64 = 8 * 1024 * 1024
+
     enum Result: Sendable, Equatable {
         case published(LocalFileVersion)
         case destinationChanged
     }
 
-    /// Writes source bytes through the destination path so filesystem watchers
-    /// observe a content change. The caller retains ownership of `source`.
+    /// Small or cross-filesystem sources are written through the destination
+    /// path. Large same-filesystem sources use atomic namespace publication.
     static func publish(
         _ source: URL,
         to destination: URL,
@@ -20,6 +22,12 @@ enum LocalFilePublication {
         }
         guard try LocalFileVersion.read(at: destination) == expected else {
             return .destinationChanged
+        }
+
+        if sourceVersion.size > atomicRenameThreshold,
+           sourceVersion.device == publicationDevice(destination: destination, expected: expected) {
+            return try publishByRename(
+                source, to: destination, expected: expected)
         }
 
         guard let descriptor = try openDestination(destination, expected: expected) else {
@@ -44,6 +52,46 @@ enum LocalFilePublication {
             throw SyncEngineError.localFilePublicationFailed(path: destination.path)
         }
         return .published(beforeHash)
+    }
+
+    private static func publicationDevice(
+        destination: URL, expected: LocalFileVersion?
+    ) -> Int64? {
+        if let expected { return expected.device }
+        var value = stat()
+        guard lstat(destination.deletingLastPathComponent().path, &value) == 0 else { return nil }
+        return Int64(value.st_dev)
+    }
+
+    private static func publishByRename(
+        _ source: URL,
+        to destination: URL,
+        expected: LocalFileVersion?
+    ) throws -> Result {
+        if expected != nil {
+            guard renameatx_np(
+                AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) == 0
+            else {
+                if errno == ENOENT { return .destinationChanged }
+                throw posixError()
+            }
+            try FileManager.default.removeItem(at: source)
+            guard let published = try LocalFileVersion.read(at: destination) else {
+                throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+            }
+            return .published(published)
+        }
+
+        guard renameatx_np(
+            AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_EXCL)) == 0
+        else {
+            if errno == EEXIST { return .destinationChanged }
+            throw posixError()
+        }
+        guard let published = try LocalFileVersion.read(at: destination) else {
+            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+        }
+        return .published(published)
     }
 
     private static func openDestination(

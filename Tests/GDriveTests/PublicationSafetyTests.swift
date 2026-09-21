@@ -195,6 +195,34 @@ struct PublicationSafetyTests {
         #expect(FileManager.default.fileExists(atPath: download.path))
     }
 
+    @Test("Large downloads use atomic namespace publication", arguments: [false, true])
+    func atomicallyPublishesLargeDownload(existing: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "a11-publish-large-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        let download = directory.appendingPathComponent("download")
+        if existing { try Data("original".utf8).write(to: destination) }
+        let expected = try LocalFileVersion.read(at: destination)
+        let content = Data(repeating: 0x52, count: 8 * 1024 * 1024 + 1)
+        try content.write(to: download)
+        let downloaded = try #require(try LocalFileVersion.read(at: download))
+
+        let result = try LocalFilePublication.publish(
+            download, to: destination, expected: expected,
+            expectedSHA256: SyncEngine.computeSha256(of: content))
+        guard case .published(let published) = result else {
+            Issue.record("Unchanged destination was rejected")
+            return
+        }
+
+        #expect(published.inode == downloaded.inode)
+        if let expected { #expect(published.inode != expected.inode) }
+        #expect(try Data(contentsOf: destination) == content)
+        #expect(!FileManager.default.fileExists(atPath: download.path))
+    }
+
     @Test("A failure after publication starts is not reported as a local modification")
     func postWriteFailureClassification() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
