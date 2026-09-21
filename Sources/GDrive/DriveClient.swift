@@ -143,6 +143,145 @@ private struct GoogleAPIErrorEnvelope: Decodable, Sendable {
     let error: GoogleAPIErrorBody?
 }
 
+private final class DownloadTaskBox: @unchecked Sendable {
+    private struct State {
+        var task: URLSessionDataTask?
+        var cancelled = false
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func store(_ task: URLSessionDataTask) {
+        let shouldCancel = state.withLock { state in
+            state.task = task
+            return state.cancelled
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    func cancel() {
+        let task = state.withLock { state in
+            state.cancelled = true
+            return state.task
+        }
+        task?.cancel()
+    }
+}
+
+private struct DownloadContextState {
+    var response: HTTPURLResponse?
+    var writeError: Error?
+    var errorBodyBytesWritten = 0
+}
+
+private final class DownloadSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private final class Context: @unchecked Sendable {
+        let handle: FileHandle
+        let onProgress: (@Sendable (Int64) -> Void)?
+        let continuation: CheckedContinuation<HTTPURLResponse, Error>
+        let state = OSAllocatedUnfairLock(initialState: DownloadContextState())
+
+        init(
+            handle: FileHandle,
+            onProgress: (@Sendable (Int64) -> Void)?,
+            continuation: CheckedContinuation<HTTPURLResponse, Error>
+        ) {
+            self.handle = handle
+            self.onProgress = onProgress
+            self.continuation = continuation
+        }
+    }
+
+    private let contexts = OSAllocatedUnfairLock<[Int: Context]>(initialState: [:])
+
+    func download(
+        using session: URLSession,
+        request: URLRequest,
+        destinationURL: URL,
+        onProgress: (@Sendable (Int64) -> Void)?
+    ) async throws -> HTTPURLResponse {
+        _ = FileManager.default.createFile(atPath: destinationURL.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: destinationURL)
+        let taskBox = DownloadTaskBox()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let task = session.dataTask(with: request)
+                let context = Context(
+                    handle: handle, onProgress: onProgress, continuation: continuation)
+                contexts.withLock { $0[task.taskIdentifier] = context }
+                taskBox.store(task)
+                task.resume()
+            }
+        } onCancel: {
+            taskBox.cancel()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping @Sendable (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let context = contexts.withLock({ $0[dataTask.taskIdentifier] }) else {
+            completionHandler(.cancel)
+            return
+        }
+        context.state.withLock { $0.response = response as? HTTPURLResponse }
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let context = contexts.withLock({ $0[dataTask.taskIdentifier] }) else { return }
+        let shouldReport = context.state.withLock { state in
+            guard state.writeError == nil else { return false }
+            let isSuccessfulResponse = state.response.map {
+                (200..<300).contains($0.statusCode)
+            } ?? false
+            let dataToWrite: Data
+            if isSuccessfulResponse {
+                dataToWrite = data
+            } else {
+                let remaining = max(0, 4096 - state.errorBodyBytesWritten)
+                guard remaining > 0 else { return false }
+                dataToWrite = Data(data.prefix(remaining))
+            }
+            do {
+                try context.handle.write(contentsOf: dataToWrite)
+                if !isSuccessfulResponse {
+                    state.errorBodyBytesWritten += dataToWrite.count
+                }
+                return isSuccessfulResponse
+            } catch {
+                state.writeError = error
+                return false
+            }
+        }
+        if shouldReport { context.onProgress?(Int64(data.count)) }
+        if context.state.withLock({ $0.writeError != nil }) { dataTask.cancel() }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        guard let context = contexts.withLock({ $0.removeValue(forKey: task.taskIdentifier) }) else {
+            return
+        }
+        try? context.handle.close()
+        let result = context.state.withLock { state -> Result<HTTPURLResponse, Error> in
+            if let writeError = state.writeError { return .failure(writeError) }
+            if let error { return .failure(error) }
+            guard let response = state.response else {
+                return .failure(DriveError.invalidResponse(message: "Response is not HTTP"))
+            }
+            return .success(response)
+        }
+        context.continuation.resume(with: result)
+    }
+}
+
 /// Google Drive Core communication and transport client
 /// Follow the v1.md Transmission specification:
 /// - Single-session multiplexing URLSession
@@ -156,6 +295,8 @@ public final class DriveClient: Sendable {
     public let auth: Auth
     public let rateLimiter: DriveRateLimiter
     private let session: URLSession
+    private let downloadDelegate: DownloadSessionDelegate
+    private let downloadSession: URLSession
     private let retrySleep: RetrySleep
     private let retryLimitOverride: Int?
     private let logger = Logger(label: "gdrive.client")
@@ -190,6 +331,10 @@ public final class DriveClient: Sendable {
     ) {
         self.auth = auth
         self.session = session
+        let downloadDelegate = DownloadSessionDelegate()
+        self.downloadDelegate = downloadDelegate
+        self.downloadSession = URLSession(
+            configuration: session.configuration, delegate: downloadDelegate, delegateQueue: nil)
         self.rateLimiter = rateLimiter
         self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = nil
@@ -208,6 +353,10 @@ public final class DriveClient: Sendable {
     ) {
         self.auth = auth
         self.session = session
+        let downloadDelegate = DownloadSessionDelegate()
+        self.downloadDelegate = downloadDelegate
+        self.downloadSession = URLSession(
+            configuration: session.configuration, delegate: downloadDelegate, delegateQueue: nil)
         self.rateLimiter = rateLimiter
         self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = max(0, maxRetries)
@@ -391,67 +540,13 @@ public final class DriveClient: Sendable {
         request.setValue("Bearer \(freshToken)", forHTTPHeaderField: "Authorization")
     }
 
-    private func handleStreamingError(
-        http: HTTPURLResponse,
-        bytes: URLSession.AsyncBytes,
-        attempt: Int,
-        retryLimit: Int
-    ) async throws {
-        let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-        if http.statusCode == 429 {
-            guard attempt <= retryLimit else {
-                throw DriveError.rateLimited429(retryAfter: retryAfter)
-            }
-            let jitter = Double.random(in: 0.2...0.8)
-            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-            let backoff = max(retryAfter ?? 0, exponential)
-            await rateLimiter.reportRateLimit(retryAfter: backoff)
-            try await retrySleep(backoff)
-            return
-        }
-
-        if [500, 502, 503, 504].contains(http.statusCode) {
-            guard attempt <= retryLimit else {
-                throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
-            }
-            let jitter = Double.random(in: 0.2...0.8)
-            let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-            let backoff = max(retryAfter ?? 0, exponential)
-            if http.statusCode == 503 {
-                await rateLimiter.reportRateLimit(retryAfter: backoff)
-            }
-            try await retrySleep(backoff)
-            return
-        }
-
-        if http.statusCode == 403 {
-            var errorBuffer = [UInt8]()
-            for try await byte in bytes {
-                errorBuffer.append(byte)
-                if errorBuffer.count >= 4096 { break }
-            }
-            let errorData = Data(errorBuffer)
-            if let encounter = parseRateLimit(data: errorData, response: http),
-               case .rateLimited403(let reason, let delay) = encounter {
-                guard attempt <= retryLimit else {
-                    throw DriveError.rateLimited403(reason: reason, retryAfter: delay)
-                }
-                let jitter = Double.random(in: 0.2...0.8)
-                let exponential = min(16.0, pow(2.0, Double(attempt)) + jitter)
-                let backoff = max(delay ?? 0, exponential)
-                await rateLimiter.reportRateLimit(retryAfter: backoff)
-                try await retrySleep(backoff)
-                return
-            }
-            let detail = (String(bytes: errorData, encoding: .utf8) ?? "Invalid UTF-8 data")
-            throw DriveError.serverError(statusCode: 403, message: detail)
-        }
-    }
-
-    private func executeStreamingRequest(
+    private func executeDownloadRequest(
         _ request: URLRequest,
+        remoteId: String,
+        destinationURL: URL,
+        onProgress: (@Sendable (Int64) -> Void)?,
         maxRetries: Int = 5
-    ) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+    ) async throws -> HTTPURLResponse {
         let retryLimit = retryLimitOverride ?? maxRetries
         var attempt = 0
         var currentRequest = request
@@ -462,13 +557,21 @@ public final class DriveClient: Sendable {
             try await rateLimiter.acquire()
 
             try await requestGate.wait()
-            let bytes: URLSession.AsyncBytes
-            let response: URLResponse
+            let http: HTTPURLResponse
             do {
-                (bytes, response) = try await session.bytes(for: currentRequest)
+                http = try await downloadDelegate.download(
+                    using: downloadSession,
+                    request: currentRequest,
+                    destinationURL: destinationURL,
+                    onProgress: onProgress)
             } catch {
+                let receivedBytes = (try? FileManager.default.attributesOfItem(
+                    atPath: destinationURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+                try? FileManager.default.removeItem(at: destinationURL)
                 try Task.checkCancellation()
-                guard attempt <= retryLimit else { throw error }
+                // A partial 2xx body has already contributed progress. Retrying it would
+                // double-count bytes, and the previous AsyncBytes path did not retry here.
+                guard receivedBytes == 0, attempt <= retryLimit else { throw error }
                 let jitter = Double.random(in: 0.1...0.5)
                 let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
                 await rateLimiter.reportRateLimit(retryAfter: delay)
@@ -476,23 +579,33 @@ public final class DriveClient: Sendable {
                 continue
             }
 
-            guard let http = response as? HTTPURLResponse else {
-                throw DriveError.invalidResponse(message: "Response is not HTTP")
-            }
             if http.statusCode == 401 && !didRefreshAfterUnauthorized {
+                try? FileManager.default.removeItem(at: destinationURL)
                 didRefreshAfterUnauthorized = true
                 try await refreshAuthorization(in: &currentRequest)
                 continue
             }
 
-            if http.statusCode == 429 || http.statusCode == 403 || [500, 502, 503, 504].contains(http.statusCode) {
-                try await handleStreamingError(
-                    http: http, bytes: bytes, attempt: attempt, retryLimit: retryLimit
+            guard (200..<300).contains(http.statusCode) else {
+                let handle = try? FileHandle(forReadingFrom: destinationURL)
+                let errorData = (try? handle?.read(upToCount: 4096)) ?? Data()
+                try? handle?.close()
+                try? FileManager.default.removeItem(at: destinationURL)
+                let decision = try await handleRateLimitOrTransientError(
+                    data: errorData, http: http, attempt: attempt, retryLimit: retryLimit
                 )
-                continue
+                if decision == .shouldRetry { continue }
+                let detail = String(bytes: errorData, encoding: .utf8) ?? "Invalid UTF-8 data"
+                if http.statusCode == 404 {
+                    throw DriveError.notFound(fileId: remoteId)
+                }
+                if http.statusCode == 403 {
+                    throw DriveError.serverError(statusCode: 403, message: detail)
+                }
+                throw DriveError.serverError(statusCode: http.statusCode, message: detail)
             }
 
-            return (bytes, http)
+            return http
         }
     }
 
@@ -690,20 +803,11 @@ public final class DriveClient: Sendable {
         throw DriveError.unsafeOverwrite(fileId: remoteId)
     }
 
-    /// Existing Documents Resumable The override is currently blocked safely from creating an upload session.
-    public func initiateResumableUpdate(
-        remoteId: String,
-        totalBytes: Int64,
-        mimeType: String = "application/octet-stream"
-    ) async throws -> URL {
-        // Session initiation alone would not prove an atomic condition on the
-        // final chunk. Keep updates blocked until that separate contract is proven.
-        throw DriveError.unsafeOverwrite(fileId: remoteId)
-    }
-
     // MARK: - Large Files Resumable Upload (> 8MB)
 
-    /// Initiate large files Resumable Upload session, return to for block continuation sessionURI
+    /// Initiate a create-only resumable upload session for a preallocated remote ID.
+    /// Existing remote body overwrites remain prohibited because Drive has no validated
+    /// atomic conditional-write contract for the final resumable chunk.
     public func initiateResumableUpload(
         name: String,
         parentId: String,
@@ -946,41 +1050,21 @@ public final class DriveClient: Sendable {
 
         let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
         do {
-            let (asyncBytes, http) = try await executeStreamingRequest(req)
-            if http.statusCode == 404 {
-                throw DriveError.notFound(fileId: remoteId)
-            }
-            if !(200..<300).contains(http.statusCode) {
-                throw DriveError.serverError(statusCode: http.statusCode, message: "Download failed")
-            }
+            _ = try await executeDownloadRequest(
+                req, remoteId: remoteId, destinationURL: tempURL, onProgress: onProgress)
 
-            FileManager.default.createFile(atPath: tempURL.path, contents: nil)
-            let fileHandle = try FileHandle(forWritingTo: tempURL)
+            let fileHandle = try FileHandle(forReadingFrom: tempURL)
             defer { try? fileHandle.close() }
 
             var ctx = CC_SHA256_CTX()
             CC_SHA256_Init(&ctx)
             var byteCount: Int64 = 0
-            var buffer = [UInt8]()
-            buffer.reserveCapacity(64 * 1024)
-
-            for try await byte in asyncBytes {
-                buffer.append(byte)
-                if buffer.count >= 64 * 1024 {
-                    CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
-                    try fileHandle.write(contentsOf: buffer)
-                    byteCount += Int64(buffer.count)
-                    onProgress?(Int64(buffer.count))
-                    buffer.removeAll(keepingCapacity: true)
+            while let data = try fileHandle.read(upToCount: 8 * 1024 * 1024), !data.isEmpty {
+                _ = data.withUnsafeBytes { bytes in
+                    CC_SHA256_Update(&ctx, bytes.baseAddress, CC_LONG(data.count))
                 }
+                byteCount += Int64(data.count)
             }
-            if !buffer.isEmpty {
-                CC_SHA256_Update(&ctx, buffer, CC_LONG(buffer.count))
-                try fileHandle.write(contentsOf: buffer)
-                byteCount += Int64(buffer.count)
-                onProgress?(Int64(buffer.count))
-            }
-            try fileHandle.close()
 
             var digest = [UInt8](repeating: 0, count: Int(CC_SHA256_DIGEST_LENGTH))
             CC_SHA256_Final(&digest, &ctx)

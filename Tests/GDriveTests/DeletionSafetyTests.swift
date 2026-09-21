@@ -69,26 +69,6 @@ struct DeletionSafetyTests {
         #expect(try String(contentsOf: file, encoding: .utf8) == "baseline")
     }
 
-    @Test("Hidden directory entries and enumeration failures block deletion")
-    func directoryDeletionRequiresConfirmedEmptyDirectory() throws {
-        let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("directory-delete-safety-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
-        let hidden = directory.appendingPathComponent(".secret")
-        try Data("keep".utf8).write(to: hidden)
-
-        let hiddenResult = try LocalDeletionSafety.trashDirectoryIfEmpty(at: directory)
-        #expect(!hiddenResult)
-        #expect(FileManager.default.fileExists(atPath: hidden.path))
-
-        enum EnumerationFailure: Error { case denied }
-        let failureResult = try? LocalDeletionSafety.trashDirectoryIfEmpty(
-            at: directory, contents: { _ in throw EnumerationFailure.denied })
-        #expect(failureResult == nil)
-        #expect(FileManager.default.fileExists(atPath: directory.path))
-    }
-
     @Test("change.removed == true does NOT trash or delete local file, sets phase to blocked")
     func testRemovedDoesNotDeleteLocal() async throws {
         let tempDB = FileManager.default.temporaryDirectory

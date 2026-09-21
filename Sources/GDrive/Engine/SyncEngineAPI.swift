@@ -261,14 +261,14 @@ public final class SyncEngine: Sendable {
         try await verifyDatabaseConnection()
         let resolvedLocalPath = Self.normalizedPath(localPath)
         try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
+        let result: Result<T, any Error>
         do {
-            let result = try await operation()
-            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
-            return result
+            result = .success(try await operation())
         } catch {
-            await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
-            throw error
+            result = .failure(error)
         }
+        await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+        return try result.get()
     }
 
     private func verifyDatabaseConnection() async throws {

@@ -395,21 +395,7 @@ extension SyncEngine {
                 throw SyncEngineError.general("Cleanup plan is stale: \(itemID)")
             }
 
-            let path = try conn.prepare(
-                """
-                WITH RECURSIVE ancestry(item_id, parent_id, path) AS (
-                    SELECT item_id, parent_id,
-                        CASE WHEN parent_id IS NULL THEN '' ELSE name END
-                    FROM items WHERE item_id = ?
-                    UNION ALL
-                    SELECT i.item_id, i.parent_id,
-                        CASE WHEN i.parent_id IS NULL THEN a.path ELSE i.name || '/' || a.path END
-                    FROM items i JOIN ancestry a ON i.item_id = a.parent_id
-                ) SELECT path FROM ancestry WHERE parent_id IS NULL;
-                """)
-            defer { path.reset() }
-            path.bindInt64(itemID, at: 1)
-            guard try path.step(), let relativePath = path.columnText(at: 0) else {
+            guard let relativePath = try conn.itemRelativePath(itemID: itemID) else {
                 throw SyncEngineError.general("Unable to resolve cleanup path: \(itemID)")
             }
             let localURL = relativePath.isEmpty ? URL(fileURLWithPath: localRootPath) :
@@ -603,14 +589,6 @@ extension SyncEngine {
 
     private func deleteCleanupRows(_ plan: ItemCleanupPlan, operationID: String) async throws {
         try await store.batchWrite { conn in
-            let clearBase = try conn.prepare(
-                "UPDATE items SET base_parent_id = NULL, base_name = NULL WHERE base_parent_id = ?;")
-            defer { clearBase.reset() }
-            for node in plan.nodes {
-                clearBase.bindInt64(node.id, at: 1)
-                _ = try clearBase.step()
-                clearBase.reset()
-            }
             for remoteID in Set(plan.nodes.compactMap(\.remoteID)) {
                 for table in ["remote_change_inbox", "remote_directory_scans"] {
                     let stmt = try conn.prepare(

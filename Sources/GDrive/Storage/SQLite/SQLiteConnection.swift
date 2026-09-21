@@ -1,6 +1,28 @@
 import Foundation
 import SQLite3
 
+enum SQLiteError {
+    struct Connection: Error, CustomNSError, CustomStringConvertible, Sendable {
+        let code: Int
+        let message: String
+
+        static var errorDomain: String { "SQLiteConnection" }
+        var errorCode: Int { code }
+        var errorUserInfo: [String: Any] { [NSLocalizedDescriptionKey: message] }
+        var description: String { message }
+    }
+
+    struct Statement: Error, CustomNSError, CustomStringConvertible, Sendable {
+        let code: Int
+        let message: String
+
+        static var errorDomain: String { "SQLiteStatement" }
+        var errorCode: Int { code }
+        var errorUserInfo: [String: Any] { [NSLocalizedDescriptionKey: message] }
+        var description: String { message }
+    }
+}
+
 /// Lightweight SQLite Connect wrapper, encapsulate libsqlite3 C Interface
 public final class SQLiteConnection: @unchecked Sendable {
     private var database: OpaquePointer?
@@ -14,7 +36,7 @@ public final class SQLiteConnection: @unchecked Sendable {
         guard resultCode == SQLITE_OK, let pointer else {
             let msg = pointer.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Failed to open database (code \(resultCode))"
             if let pointer { sqlite3_close(pointer) }
-            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: msg])
+            throw SQLiteError.Connection(code: Int(resultCode), message: msg)
         }
         self.database = pointer
 
@@ -27,7 +49,8 @@ public final class SQLiteConnection: @unchecked Sendable {
                 key.withCString { sqlite3_result_text(context, $0, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self)) }
             }, nil, nil, nil)
         guard functionRC == SQLITE_OK else {
-            throw NSError(domain: "SQLiteConnection", code: Int(functionRC))
+            throw SQLiteError.Connection(
+                code: Int(functionRC), message: "Unable to register gdrive_name_key")
         }
 
         // Basic Performance and Stability Configuration
@@ -67,23 +90,28 @@ public final class SQLiteConnection: @unchecked Sendable {
     }
 
     public func execute(_ sql: String) throws {
-        guard let database else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
+        guard let database else {
+            throw SQLiteError.Connection(code: 1, message: "Database is closed")
+        }
         var errMsg: UnsafeMutablePointer<CChar>?
         let resultCode = sqlite3_exec(database, sql, nil, nil, &errMsg)
         if resultCode != SQLITE_OK {
             let msg = errMsg.flatMap { String(cString: $0) } ?? "Execution SQL Failed"
             sqlite3_free(errMsg)
-            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "\(msg): \(sql)"])
+            throw SQLiteError.Connection(code: Int(resultCode), message: "\(msg): \(sql)")
         }
     }
 
     public func prepare(_ sql: String) throws -> SQLiteStatement {
-        guard let database else { throw NSError(domain: "SQLiteConnection", code: 1, userInfo: [NSLocalizedDescriptionKey: "Database is closed"]) }
+        guard let database else {
+            throw SQLiteError.Connection(code: 1, message: "Database is closed")
+        }
         var stmt: OpaquePointer?
         let resultCode = sqlite3_prepare_v2(database, sql, -1, &stmt, nil)
         guard resultCode == SQLITE_OK, let stmt else {
             let msg = String(cString: sqlite3_errmsg(database))
-            throw NSError(domain: "SQLiteConnection", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "Prepare failed: \(msg) [\(sql)]"])
+            throw SQLiteError.Connection(
+                code: Int(resultCode), message: "Prepare failed: \(msg) [\(sql)]")
         }
         return SQLiteStatement(stmt: stmt, database: database)
     }
@@ -109,6 +137,24 @@ public final class SQLiteConnection: @unchecked Sendable {
     public var changes: Int {
         guard let database else { return 0 }
         return Int(sqlite3_changes(database))
+    }
+
+    func itemRelativePath(itemID: Int64) throws -> String? {
+        let statement = try cachedStatement("""
+        WITH RECURSIVE ancestry(item_id, parent_id, path) AS (
+            SELECT item_id, parent_id,
+                CASE WHEN parent_id IS NULL THEN '' ELSE name END
+            FROM items WHERE item_id = ?
+            UNION ALL
+            SELECT i.item_id, i.parent_id,
+                CASE WHEN i.parent_id IS NULL THEN a.path ELSE i.name || '/' || a.path END
+            FROM items i JOIN ancestry a ON i.item_id = a.parent_id
+        ) SELECT path FROM ancestry WHERE parent_id IS NULL;
+        """)
+        defer { statement.reset() }
+        statement.bindInt64(itemID, at: 1)
+        guard try statement.step() else { return nil }
+        return statement.columnText(at: 0)
     }
 }
 
@@ -181,7 +227,7 @@ public final class SQLiteStatement: @unchecked Sendable {
             return false
         } else {
             let msg = String(cString: sqlite3_errmsg(database))
-            throw NSError(domain: "SQLiteStatement", code: Int(resultCode), userInfo: [NSLocalizedDescriptionKey: "Step failed: \(msg)"])
+            throw SQLiteError.Statement(code: Int(resultCode), message: "Step failed: \(msg)")
         }
     }
 

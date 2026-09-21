@@ -400,16 +400,9 @@ struct RemoteChanges: Sendable {
                     device: queryStatement.columnInt64(at: 4), inode: queryStatement.columnInt64(at: 5), version: queryStatement.columnInt64(at: 6))
     }
     private func path(_ conn: SQLiteConnection, itemID: Int64) throws -> String {
-        let queryStatement = try Self.statement(conn, """
-            WITH RECURSIVE ancestry(item_id, parent_id, path) AS (
-                SELECT item_id, parent_id, CASE WHEN parent_id IS NULL THEN '' ELSE name END FROM items WHERE item_id = ?
-                UNION ALL SELECT i.item_id, i.parent_id,
-                    CASE WHEN i.parent_id IS NULL THEN a.path ELSE i.name || '/' || a.path END
-                FROM items i JOIN ancestry a ON i.item_id = a.parent_id
-            ) SELECT path FROM ancestry WHERE parent_id IS NULL;
-            """, [.int(itemID)])
-        defer { queryStatement.reset() }
-        guard try queryStatement.step(), let path = queryStatement.columnText(at: 0) else { throw SyncEngineError.general("Unable to resolve local path for remote observation") }
+        guard let path = try conn.itemRelativePath(itemID: itemID) else {
+            throw SyncEngineError.general("Unable to resolve local path for remote observation")
+        }
         return path
     }
     private func exclude(_ conn: SQLiteConnection, itemID: Int64) throws {
@@ -669,10 +662,8 @@ struct RemoteChanges: Sendable {
                     AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name')) WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_directory_scans d JOIN items i
                     ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id WHERE d.root_id = ? AND d.state = 'pending'
-                UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?
-                UNION SELECT item_id FROM items
-                    WHERE root_id = ? AND phase = 'conflict';
-                """, Array(repeating: .int(rootID), count: 7))
+                UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?;
+                """, Array(repeating: .int(rootID), count: 6))
             var ids: Set<Int64> = []
             while try queryStatement.step() { if let id = queryStatement.columnInt64(at: 0) { ids.insert(id) } }
             queryStatement.reset()

@@ -25,6 +25,25 @@ private final class BlockedPublicationURLProtocol: PublicationURLProtocol, @unch
     }
 }
 
+private final class NonRetryableDownloadURLProtocol: URLProtocol, @unchecked Sendable {
+    static let errorBody = Data(repeating: 0x78, count: 64 * 1024)
+
+    override static func canInit(with request: URLRequest) -> Bool { true }
+    override static func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        client?.urlProtocol(
+            self,
+            didReceive: HTTPURLResponse(
+                url: request.url!, statusCode: 400, httpVersion: nil, headerFields: nil)!,
+            cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.errorBody)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
 @Suite("Stable transfer inputs and local publication (A11)")
 struct PublicationSafetyTests {
     private func client(in directory: URL, protocolClass: URLProtocol.Type = PublicationURLProtocol.self) throws -> DriveClient {
@@ -48,11 +67,36 @@ struct PublicationSafetyTests {
             _ = try await client.updateMultipart(remoteId: "existing", content: Data(), expectedSha256: "unused")
             Issue.record("Unconditional overwrite was allowed")
         } catch DriveError.unsafeOverwrite { }
-        do {
-            _ = try await client.initiateResumableUpdate(remoteId: "existing", totalBytes: 1)
-            Issue.record("Unconditional resumable update was allowed")
-        } catch DriveError.unsafeOverwrite { }
         #expect(BlockedPublicationURLProtocol.requests.withLock { $0 } == 0)
+    }
+
+    @Test("Non-retryable download errors throw and discard their body")
+    func nonRetryableDownloadError() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("a11-download-error-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let staging = directory.appendingPathComponent("downloads")
+        let destination = directory.appendingPathComponent("file")
+        let client = try client(in: directory, protocolClass: NonRetryableDownloadURLProtocol.self)
+        let progress = OSAllocatedUnfairLock(initialState: Int64(0))
+
+        do {
+            try await client.downloadFile(
+                remoteId: "remote",
+                destinationURL: destination,
+                expectedSha256: nil,
+                temporaryDirectory: staging,
+                onProgress: { count in progress.withLock { $0 += count } })
+            Issue.record("Non-retryable HTTP error was returned as a successful download")
+        } catch DriveError.serverError(let statusCode, let message) {
+            #expect(statusCode == 400)
+            #expect(message.utf8.count == 4096)
+        }
+
+        #expect(progress.withLock { $0 } == 0)
+        #expect(!FileManager.default.fileExists(atPath: destination.path))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).isEmpty)
     }
 
     @Test("A modification during streaming download survives publication and temporary cleanup")

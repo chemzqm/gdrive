@@ -12,6 +12,7 @@ extension SyncEngine {
     /// - towards Google Drive The server detects the confirmed receipt offset (queryResumableOffset)
     /// - Using constant memory FileHandle Streaming slice reading (Default 8MB,must be 256KB an integer multiple of)
     /// - Each time a chunk is completed, the new offset persist to SQLite operations meter, power outage/Seamless transmission can be resumed after changing threads
+    /// - This path only creates a new file with a pre-generated remote ID; overwriting existing remote content remains blocked.
     @discardableResult
     func performResumableUpload(
         rootId: Int64,
@@ -22,11 +23,9 @@ extension SyncEngine {
         remoteId: String,
         parentId: String,
         name: String,
-        isUpdate: Bool,
         operationID: String? = nil,
         chunkSize: Int64 = 8 * 1024 * 1024 // 8MB chunked,256KB Integer multiple
     ) async throws -> DriveFile {
-        if isUpdate { throw DriveError.unsafeOverwrite(fileId: remoteId) }
         let opId = operationID ?? "resumable_\(remoteId)"
         var sessionURL: URL?
         var currentOffset: Int64 = 0
@@ -99,11 +98,8 @@ extension SyncEngine {
         if let sURL = sessionURL {
             activeSessionURL = sURL
         } else {
-            if isUpdate {
-                activeSessionURL = try await client.initiateResumableUpdate(remoteId: remoteId, totalBytes: fileSize)
-            } else {
-                activeSessionURL = try await client.initiateResumableUpload(name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
-            }
+            activeSessionURL = try await client.initiateResumableUpload(
+                name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
             currentOffset = 0
 
             let now = Date().timeIntervalSince1970
@@ -213,9 +209,8 @@ extension SyncEngine {
                     currentOffset = fileSize
                     finalDriveFile = file
                 case .expired:
-                    activeSessionURL = isUpdate
-                        ? try await client.initiateResumableUpdate(remoteId: remoteId, totalBytes: fileSize)
-                        : try await client.initiateResumableUpload(name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
+                    activeSessionURL = try await client.initiateResumableUpload(
+                        name: name, parentId: parentId, remoteId: remoteId, totalBytes: fileSize)
                     currentOffset = 0
                     repeatedNoProgress = false
                 }

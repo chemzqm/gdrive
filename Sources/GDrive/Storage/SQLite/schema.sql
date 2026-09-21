@@ -58,8 +58,6 @@ CREATE TABLE IF NOT EXISTS items (
     base_sha256 TEXT CHECK (base_sha256 IS NULL OR length(base_sha256) = 64),
     base_size INTEGER CHECK (base_size IS NULL OR base_size >= 0),
     base_version INTEGER CHECK (base_version IS NULL OR base_version >= 0),
-    base_parent_id INTEGER REFERENCES items(item_id),
-    base_name TEXT,
 
     -- Local Observation (L)
     local_sha256 TEXT CHECK (local_sha256 IS NULL OR length(local_sha256) = 64),
@@ -78,9 +76,9 @@ CREATE TABLE IF NOT EXISTS items (
 
     -- Lifecycle & Scheduling Phase (§10.1)
     phase TEXT NOT NULL DEFAULT 'discovered' CHECK (phase IN (
-        'discovered', 'waitingEvidence', 'waitingParent', 'waitingInput',
+        'discovered', 'waitingEvidence',
         'ready', 'inFlight', 'verify', 'unknownOutcome',
-        'committed', 'conflict', 'blocked'
+        'committed', 'blocked'
     )),
     dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK (dirty_generation >= 0),
     created_at REAL NOT NULL,
@@ -136,7 +134,7 @@ CREATE TABLE IF NOT EXISTS operations (
     )),
     state TEXT NOT NULL CHECK (state IN (
         'ready', 'inFlight', 'verify', 'unknownOutcome',
-        'completed', 'failed', 'cancelled'
+        'completed', 'failed'
     )),
     expected_local_generation INTEGER NOT NULL DEFAULT 0 CHECK (expected_local_generation >= 0),
     expected_sha256 TEXT CHECK (expected_sha256 IS NULL OR length(expected_sha256) = 64),

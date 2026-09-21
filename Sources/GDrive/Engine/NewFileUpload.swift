@@ -132,7 +132,6 @@ extension SyncEngine {
             remoteId: intent.targetRemoteID,
             parentId: intent.targetParentRemoteID,
             name: name,
-            isUpdate: false,
             operationID: intent.operationID
         )
     }

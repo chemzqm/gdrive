@@ -1,23 +1,6 @@
 import Foundation
 
 enum LocalDeletionSafety {
-    static func trashDirectoryIfEmpty(
-        at url: URL,
-        contents: (String) throws -> [String] = FileManager.default.contentsOfDirectory,
-        trash: (URL, AutoreleasingUnsafeMutablePointer<NSURL?>?) throws -> Void = {
-            try FileManager.default.trashItem(at: $0, resultingItemURL: $1)
-        }
-    ) throws -> Bool {
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
-            return true
-        }
-        guard isDirectory.boolValue, try contents(url.path).isEmpty else { return false }
-        var trashURL: NSURL?
-        try trash(url, &trashURL)
-        return true
-    }
-
     static func trashFileIfUnchanged(
         at url: URL,
         expectedDevice: Int64?,

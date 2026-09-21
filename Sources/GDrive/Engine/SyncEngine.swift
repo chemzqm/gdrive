@@ -77,7 +77,8 @@ extension SyncEngine {
             throw SyncEngineError.remoteRootLost(remoteId: remoteFolderId, reason: "trashed")
         }
         guard remoteFile.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 101, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a valid directory: \(remoteFolderId)"])
+            throw SyncEngineError.general(
+                "The remote target is not a valid directory: \(remoteFolderId)")
         }
         // Probe only the top level; hidden entries are included, only .git directories are pruned.
         let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
@@ -145,9 +146,10 @@ extension SyncEngine {
             return SyncStats()
         } else {
             // Both ends are not empty
-            throw NSError(domain: "SyncEngine", code: 103, userInfo: [
-                NSLocalizedDescriptionKey: "Initial bidirectional sync requires one side to be empty. Both the local path (\(resolvedLocalPath)) and remote folder (\(remoteFolderId)) contain files. Use an empty directory for initialization to avoid overwrites or widespread conflicts."
-            ])
+            throw SyncEngineError.general(
+                "Initial bidirectional sync requires one side to be empty. Both the local path "
+                    + "(\(resolvedLocalPath)) and remote folder (\(remoteFolderId)) contain files. "
+                    + "Use an empty directory for initialization to avoid overwrites or widespread conflicts.")
         }
     }
 
