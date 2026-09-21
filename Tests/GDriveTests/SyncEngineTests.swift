@@ -594,7 +594,8 @@ struct SyncEngineTests {
                 remoteId: try #require(remoteRootGenIds.dropFirst().first),
                 totalBytes: 8 * 1024 * 1024 + 1
             )
-            let stalePrefix = Data(repeating: 0x44, count: 4 * 1024 * 1024)
+            let stalePrefixByteCount: Int64 = 256 * 1024
+            let stalePrefix = Data(repeating: 0x44, count: Int(stalePrefixByteCount))
             let staleChunkResult = try await client.uploadResumableChunk(
                 sessionURL: staleSessionURL,
                 chunkData: stalePrefix,
@@ -603,9 +604,14 @@ struct SyncEngineTests {
             )
             switch staleChunkResult {
             case .incomplete(let confirmedOffset):
-                try #require(confirmedOffset == 4 * 1024 * 1024, "Drive must confirm the 4 MiB stale-session prefix.")
+                try #require(
+                    confirmedOffset == stalePrefixByteCount,
+                    "Drive must confirm the 256 KiB stale-session prefix."
+                )
             case .complete, .expired:
-                throw DriveError.invalidResponse(message: "Expected a live incomplete resumable session after uploading its 4 MiB prefix.")
+                throw DriveError.invalidResponse(
+                    message: "Expected a live incomplete resumable session after uploading its 256 KiB prefix."
+                )
             }
 
             let testDbPath = "/tmp/test_sync_stale_\(UUID().uuidString.prefix(8)).sqlite"
@@ -651,7 +657,7 @@ struct SyncEngineTests {
                 ) VALUES (
                     'resumable_\(retainedRemoteID)', 1, 100, 'uploadResumable', 'inFlight',
                     '\(oldExpectedSHA256)', '\(retainedRemoteID)', '\(remoteRoot.id)',
-                    '\(staleSessionURL.absoluteString)', 4194304, 8388609, 0, 0
+                    '\(staleSessionURL.absoluteString)', \(stalePrefixByteCount), 8388609, 0, 0
                 );
                 INSERT INTO cursors (
                     root_id, account_id, cursor_kind, token_value, updated_at
