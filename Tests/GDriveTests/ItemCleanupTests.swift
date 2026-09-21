@@ -357,4 +357,108 @@ struct ItemCleanupTests {
         #expect(!FileManager.default.fileExists(atPath: child.path))
         #expect(try Data(contentsOf: sibling) == Data("sibling".utf8))
     }
+
+    @Test("Remote trash survives a database cleanup failure and resumes from its intent")
+    func remoteTrashIntentRecovery() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_status, remote_status, phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'gone.txt', 'file', 'remote-gone', 'absent', 'present',
+                    'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            _ = try stmt.step()
+            let id = conn.lastInsertRowId
+            try conn.execute(
+                "CREATE TRIGGER fail_cleanup BEFORE DELETE ON items WHEN OLD.item_id = \(id) " +
+                    "BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;")
+            return id
+        }
+
+        await #expect(throws: Error.self) {
+            try await fixture.engine.cleanupLocalDeletionToRemote(
+                itemID: itemID,
+                expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+                taskRegistry: ItemTaskRegistry())
+        }
+        #expect(context.value.withLock { $0.trashed } == ["remote-gone"])
+        try await fixture.store.read { conn in
+            let stmt = try conn.prepare(
+                "SELECT COUNT(*) FROM operations WHERE item_id = \(itemID) " +
+                    "AND operation_type = 'trashRemote';")
+            #expect(try stmt.step())
+            #expect(stmt.columnInt64(at: 0) == 1)
+        }
+
+        try await fixture.store.write { try $0.execute("DROP TRIGGER fail_cleanup;") }
+        #expect(try await fixture.engine.recoverPendingItemCleanups(
+            rootID: fixture.rootID, taskRegistry: ItemTaskRegistry()) == 1)
+        #expect(context.value.withLock { $0.trashed } == ["remote-gone", "remote-gone"])
+        try await fixture.store.read { conn in
+            for table in ["items", "operations"] {
+                let stmt = try conn.prepare(
+                    "SELECT COUNT(*) FROM \(table) WHERE item_id = \(itemID);")
+                #expect(try stmt.step())
+                #expect(stmt.columnInt64(at: 0) == 0)
+            }
+        }
+    }
+
+    @Test("Local trash survives a database cleanup failure and resumes from its intent")
+    func localTrashIntentRecovery() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let local = fixture.localRoot.appendingPathComponent("gone.txt")
+        let data = Data("baseline".utf8)
+        try data.write(to: local)
+        let version = try #require(try LocalFileVersion.read(at: local))
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_mtime, local_size, local_sha256,
+                    local_status, remote_status, phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'gone.txt', 'file', 'remote-gone', ?, ?, ?, ?, ?, 'present',
+                    'trashed', 'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            stmt.bindInt64(version.device, at: 3)
+            stmt.bindInt64(version.inode, at: 4)
+            stmt.bindInt64(version.mtime, at: 5)
+            stmt.bindInt64(version.size, at: 6)
+            stmt.bindText(SyncEngine.computeSha256(of: data), at: 7)
+            _ = try stmt.step()
+            let id = conn.lastInsertRowId
+            try conn.execute(
+                "CREATE TRIGGER fail_cleanup BEFORE DELETE ON items WHEN OLD.item_id = \(id) " +
+                    "BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;")
+            return id
+        }
+
+        await #expect(throws: Error.self) {
+            try await fixture.engine.cleanupRemoteDeletionToLocal(
+                itemID: itemID,
+                expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+                taskRegistry: ItemTaskRegistry())
+        }
+        #expect(!FileManager.default.fileExists(atPath: local.path))
+
+        try await fixture.store.write { try $0.execute("DROP TRIGGER fail_cleanup;") }
+        #expect(try await fixture.engine.recoverPendingItemCleanups(
+            rootID: fixture.rootID, taskRegistry: ItemTaskRegistry()) == 1)
+        try await fixture.store.read { conn in
+            for table in ["items", "operations"] {
+                let stmt = try conn.prepare(
+                    "SELECT COUNT(*) FROM \(table) WHERE item_id = \(itemID);")
+                #expect(try stmt.step())
+                #expect(stmt.columnInt64(at: 0) == 0)
+            }
+        }
+    }
 }

@@ -28,6 +28,7 @@ final class IncrementalSyncRun: Sendable {
     let scanProgress: ScanProgress
     let startTime: DispatchTime
     let recoveredConflicts: Int
+    let recoveredCleanups: Int
     let localChangeScope: LocalChangeScope?
 
     private init(
@@ -56,6 +57,7 @@ final class IncrementalSyncRun: Sendable {
         scanProgress: ScanProgress,
         startTime: DispatchTime,
         recoveredConflicts: Int,
+        recoveredCleanups: Int,
         localChangeScope: LocalChangeScope?
     ) {
         self.engine = engine
@@ -83,6 +85,7 @@ final class IncrementalSyncRun: Sendable {
         self.scanProgress = scanProgress
         self.startTime = startTime
         self.recoveredConflicts = recoveredConflicts
+        self.recoveredCleanups = recoveredCleanups
         self.localChangeScope = localChangeScope
     }
 }
@@ -139,10 +142,13 @@ extension IncrementalSyncRun {
         try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
             remoteRootID: remoteRootID, localRoot: rootURL)
+        let itemTaskRegistry = ItemTaskRegistry()
         var prepared = false
         defer {
             if !prepared { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
         }
+        let recoveredCleanups = try await engine.recoverPendingItemCleanups(
+            rootID: rootID, taskRegistry: itemTaskRegistry)
         let pendingConflicts = try await ConflictOperation.pending(
             store: engine.store, rootID: rootID)
         var recoverableConflicts: [ConflictOperation] = []
@@ -198,13 +204,14 @@ extension IncrementalSyncRun {
             remoteChanges: remoteChanges, remoteGate: remoteGate,
             directoryContext: directoryContext,
             syncSemaphore: AsyncSemaphore(count: effectiveSyncConcurrency),
-            syncGroup: DispatchGroup(), itemTaskRegistry: ItemTaskRegistry(),
+            syncGroup: DispatchGroup(), itemTaskRegistry: itemTaskRegistry,
             actionTracker: ActionTracker(),
             scheduled: OSAllocatedUnfairLock(initialState: Set<Int64>()),
             startedTransfers: OSAllocatedUnfairLock(initialState: false),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
             startTime: startTime, recoveredConflicts: recoveredConflicts.withLock { $0 },
+            recoveredCleanups: recoveredCleanups,
             localChangeScope: localChanges.map { LocalChangeScope(rootURL: rootURL, changes: $0) }
         )
         prepared = true
@@ -283,7 +290,7 @@ extension IncrementalSyncRun {
         stats.bytesUploaded = actionTracker.bytesUp
         stats.filesDownloaded = actionTracker.downloaded
         stats.bytesDownloaded = actionTracker.bytesDown
-        stats.filesDeleted = actionTracker.deleted
+        stats.filesDeleted = recoveredCleanups + actionTracker.deleted
         stats.conflictsResolved = recoveredConflicts + actionTracker.conflicts.withLock { $0 }
         stats.conflicts = try await SyncConflictStore.list(store: engine.store, rootID: rootID)
         stats.remoteWorkPending += stats.conflicts.count

@@ -639,6 +639,10 @@ extension SyncEngine {
                 defer { directorySemaphore.signal() }
                 try Task.checkCancellation()
                 if let error = databaseError.withLock({ $0 }) { throw error }
+                let localAttributes = try FileManager.default.attributesOfItem(
+                    atPath: rootURL.appendingPathComponent(relPath).path)
+                let localDevice = (localAttributes[.systemNumber] as? NSNumber)?.int64Value
+                let localInode = (localAttributes[.systemFileNumber] as? NSNumber)?.int64Value
                 let candidateRemoteId = try await self.idPool.nextId()
                 let intent = try await DurableCreateIntentStore.prepareDirectory(
                     store: self.store,
@@ -647,8 +651,10 @@ extension SyncEngine {
                     name: name,
                     targetParentRemoteID: parentTarget.remoteID,
                     candidateRemoteID: candidateRemoteId,
-                    device: Int64(metadata?.identity.device ?? 1),
-                    inode: Int64(metadata?.identity.inode ?? 0)
+                    device: metadata.map { Int64($0.identity.device) }
+                        ?? localDevice ?? 1,
+                    inode: metadata.map { Int64($0.identity.inode) }
+                        ?? localInode ?? 0
                 )
                 createIntent = intent
                 try Task.checkCancellation()

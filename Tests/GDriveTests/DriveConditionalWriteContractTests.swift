@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import GDrive
 
-/// Explicit opt-in: operates only on a newly allocated file in the configured root.
+/// Explicit opt-in: operates only inside a newly allocated temporary directory.
 @Suite("Drive conditional write contract", .enabled(if: ProcessInfo.processInfo.environment["GDRIVE_CONDITIONAL_CONTRACT"] == "1"))
 struct DriveConditionalWriteContractTests {
     @Test("Real Drive conditionally trashes metadata with ETag")
@@ -11,39 +11,46 @@ struct DriveConditionalWriteContractTests {
         let config = await auth.authData()
         let root = try #require(config.rootID)
         let client = DriveClient(auth: auth, requestsPerSecond: nil)
-        let id = try #require(try await client.generateIds(count: 1).first)
-        let initial = Data("conditional trash".utf8)
-        _ = try await client.uploadMultipart(
-            name: "trash-contract-\(UUID().uuidString).txt", parentId: root, remoteId: id,
-            content: initial, expectedSha256: SyncEngine.computeSha256(of: initial))
-        defer { Task { try? await client.trash(remoteId: id) } }
+        let ids = try await client.generateIds(count: 2)
+        let directoryID = try #require(ids.first)
+        let fileID = try #require(ids.dropFirst().first)
 
-        let token = try await client.getValidToken()
-        var read = URLRequest(
-            url: URL(string: "https://www.googleapis.com/drive/v3/files/\(id)?fields=id,version,trashed")!)
-        read.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let (_, response) = try await client.executeRequest(read)
-        let etag = try #require(response.value(forHTTPHeaderField: "ETag"))
+        try await withRemoteTestDirectoryCleanup(client: client, remoteID: directoryID) {
+            _ = try await client.createDirectory(
+                name: "conditional-trash-\(UUID().uuidString)", parentId: root,
+                remoteId: directoryID)
+            let initial = Data("conditional trash".utf8)
+            _ = try await client.uploadMultipart(
+                name: "trash-contract.txt", parentId: directoryID, remoteId: fileID,
+                content: initial, expectedSha256: SyncEngine.computeSha256(of: initial))
 
-        var invalid = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(id)")!)
-        invalid.httpMethod = "PATCH"
-        invalid.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        invalid.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        invalid.setValue("\"never-valid\"", forHTTPHeaderField: "If-Match")
-        invalid.httpBody = try JSONSerialization.data(withJSONObject: ["trashed": true])
-        let (_, rejected) = try await client.executeRequest(
-            invalid, maxRetries: 0, acceptableStatusCodes: [200, 412])
-        #expect(rejected.statusCode == 412)
-        #expect(try await client.getFile(remoteId: id).trashed == false)
+            let token = try await client.getValidToken()
+            var read = URLRequest(
+                url: URL(string: "https://www.googleapis.com/drive/v3/files/\(fileID)?fields=id,version,trashed")!)
+            read.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let (_, response) = try await client.executeRequest(read)
+            let etag = try #require(response.value(forHTTPHeaderField: "ETag"))
 
-        var matching = invalid
-        matching.setValue(etag, forHTTPHeaderField: "If-Match")
-        let (_, accepted) = try await client.executeRequest(
-            matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
-        #expect(accepted.statusCode == 200)
-        let (_, stale) = try await client.executeRequest(
-            matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
-        #expect(stale.statusCode == 412)
+            var invalid = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(fileID)")!)
+            invalid.httpMethod = "PATCH"
+            invalid.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            invalid.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            invalid.setValue("\"never-valid\"", forHTTPHeaderField: "If-Match")
+            invalid.httpBody = try JSONSerialization.data(withJSONObject: ["trashed": true])
+            let (_, rejected) = try await client.executeRequest(
+                invalid, maxRetries: 0, acceptableStatusCodes: [200, 412])
+            #expect(rejected.statusCode == 412)
+            #expect(try await client.getFile(remoteId: fileID).trashed == false)
+
+            var matching = invalid
+            matching.setValue(etag, forHTTPHeaderField: "If-Match")
+            let (_, accepted) = try await client.executeRequest(
+                matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
+            #expect(accepted.statusCode == 200)
+            let (_, stale) = try await client.executeRequest(
+                matching, maxRetries: 0, acceptableStatusCodes: [200, 412])
+            #expect(stale.statusCode == 412)
+        }
     }
 
     @Test("Real Drive rejects stale media writes and accepts a matching ETag")
@@ -52,48 +59,49 @@ struct DriveConditionalWriteContractTests {
         let config = await auth.authData()
         let root = try #require(config.rootID)
         let client = DriveClient(auth: auth, requestsPerSecond: nil)
-        let id = try #require(try await client.generateIds(count: 1).first)
-        let initial = Data("A11 original".utf8)
-        _ = try await client.uploadMultipart(
-            name: "a11-contract-\(UUID().uuidString).txt", parentId: root, remoteId: id,
-            content: initial, expectedSha256: SyncEngine.computeSha256(of: initial)
-        )
-        do {
+        let ids = try await client.generateIds(count: 2)
+        let directoryID = try #require(ids.first)
+        let fileID = try #require(ids.dropFirst().first)
+
+        try await withRemoteTestDirectoryCleanup(client: client, remoteID: directoryID) {
+            _ = try await client.createDirectory(
+                name: "conditional-media-\(UUID().uuidString)", parentId: root,
+                remoteId: directoryID)
+            let initial = Data("A11 original".utf8)
+            _ = try await client.uploadMultipart(
+                name: "a11-contract.txt", parentId: directoryID, remoteId: fileID,
+                content: initial, expectedSha256: SyncEngine.computeSha256(of: initial))
+
             let token = try await client.getValidToken()
-            var read = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(id)?fields=id,name,version,sha256Checksum")!)
+            var read = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files/\(fileID)?fields=id,name,version,sha256Checksum")!)
             read.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             let (_, response) = try await client.executeRequest(read)
             let etag = response.value(forHTTPHeaderField: "ETag")
             print("A11 contract: metadata GET ETag present = \(etag != nil)")
 
-            var update = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files/\(id)?uploadType=media&fields=id,name,sha256Checksum")!)
+            var update = URLRequest(url: URL(string: "https://www.googleapis.com/upload/drive/v3/files/\(fileID)?uploadType=media&fields=id,name,sha256Checksum")!)
             update.httpMethod = "PATCH"
             update.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
             update.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
             update.setValue("\"a11-never-valid\"", forHTTPHeaderField: "If-Match")
             update.httpBody = Data("A11 concurrent overwrite".utf8)
-            let (_, rejected) = try await client.executeRequest(update, maxRetries: 0, acceptableStatusCodes: [200, 412])
-            print("A11 contract: invalid If-Match media PATCH status = \(rejected.statusCode)")
+            let (_, rejected) = try await client.executeRequest(
+                update, maxRetries: 0, acceptableStatusCodes: [200, 412])
             #expect(rejected.statusCode == 412)
-            let after = try await client.getFile(remoteId: id)
+            let after = try await client.getFile(remoteId: fileID)
             #expect(after.sha256Checksum == SyncEngine.computeSha256(of: initial))
 
             if let etag, rejected.statusCode == 412 {
                 update.setValue(etag, forHTTPHeaderField: "If-Match")
-                let (_, accepted) = try await client.executeRequest(update, maxRetries: 0, acceptableStatusCodes: [200, 412])
-                print("A11 contract: matching If-Match media PATCH status = \(accepted.statusCode)")
+                let (_, accepted) = try await client.executeRequest(
+                    update, maxRetries: 0, acceptableStatusCodes: [200, 412])
                 #expect(accepted.statusCode == 200)
-                let (_, stale) = try await client.executeRequest(update, maxRetries: 0, acceptableStatusCodes: [200, 412])
-                print("A11 contract: stale If-Match media PATCH status = \(stale.statusCode)")
+                let (_, stale) = try await client.executeRequest(
+                    update, maxRetries: 0, acceptableStatusCodes: [200, 412])
                 #expect(stale.statusCode == 412)
             } else {
                 Issue.record("Drive has not demonstrated usable conditional media writes")
             }
-        } catch {
-            try await client.trash(remoteId: id)
-            throw error
         }
-        try await client.trash(remoteId: id)
-        print("A11 contract: isolated test file moved to Drive trash")
     }
 }

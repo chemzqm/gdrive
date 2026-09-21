@@ -133,11 +133,17 @@ struct LocalChangesLiveTests {
         )
 
         let remoteID = try #require(try await client.generateIds(count: 1).first)
-        let remoteRoot = try await client.createDirectory(
-            name: "local_changes_live_\(UUID().uuidString)",
-            parentId: configuredRootID,
-            remoteId: remoteID
-        )
+        let remoteRoot: DriveFile
+        do {
+            remoteRoot = try await client.createDirectory(
+                name: "local_changes_live_\(UUID().uuidString)",
+                parentId: configuredRootID,
+                remoteId: remoteID
+            )
+        } catch {
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteID)
+            throw error
+        }
 
         var bootstrapTask: Task<SyncStats, Error>?
         do {
@@ -325,7 +331,7 @@ struct LocalChangesLiveTests {
             #expect(finalScopedFile.phase == "committed")
 
             await gate.releaseAll()
-            try await client.trash(remoteId: remoteRoot.id)
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
         } catch {
             await gate.releaseAll()
             if let bootstrapTask {
@@ -333,7 +339,7 @@ struct LocalChangesLiveTests {
                 _ = try? await bootstrapTask.value
             }
             do {
-                try await client.trash(remoteId: remoteRoot.id)
+                try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
             } catch {
                 Issue.record("Failed to clean up real Drive pending-local-changes fixture \(remoteRoot.id): \(error)")
             }
@@ -371,11 +377,17 @@ struct LocalChangesLiveTests {
         let store = try await StateStore(path: databasePath)
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         let remoteID = try #require(try await client.generateIds(count: 1).first)
-        let remoteRoot = try await client.createDirectory(
-            name: "local_changes_a11_live_\(UUID().uuidString)",
-            parentId: configuredRootID,
-            remoteId: remoteID
-        )
+        let remoteRoot: DriveFile
+        do {
+            remoteRoot = try await client.createDirectory(
+                name: "local_changes_a11_live_\(UUID().uuidString)",
+                parentId: configuredRootID,
+                remoteId: remoteID
+            )
+        } catch {
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteID)
+            throw error
+        }
 
         do {
             _ = try await engine.syncLocalToRemoteEmpty(
@@ -529,7 +541,7 @@ struct LocalChangesLiveTests {
             }
             #expect(!deletedRecordExists)
 
-            try await client.trash(remoteId: remoteRoot.id)
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
         } catch {
             // Do not remove the local fixture or database while a notification
             // round is still active and could touch either one.
@@ -542,7 +554,7 @@ struct LocalChangesLiveTests {
                 return !status.isRunning
             }
             do {
-                try await client.trash(remoteId: remoteRoot.id)
+                try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
             } catch {
                 Issue.record("Failed to clean up real Drive A11 pending-local-changes fixture \(remoteRoot.id): \(error)")
             }

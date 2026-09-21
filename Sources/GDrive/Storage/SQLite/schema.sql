@@ -170,6 +170,11 @@ CREATE INDEX IF NOT EXISTS idx_operations_target_remote
     ON operations(target_remote_id)
     WHERE target_remote_id IS NOT NULL;
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_cleanup_pending_item
+    ON operations(item_id)
+    WHERE operation_type IN ('trashRemote', 'deleteLocal')
+        AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
+
 -- -----------------------------------------------------------------------------
 -- Cursors: Change Feed & Event Cursors
 -- Tracks Google Drive Changes token (C0...) and local FSEvents stream IDs (§3.3, §9.4, §10.3).

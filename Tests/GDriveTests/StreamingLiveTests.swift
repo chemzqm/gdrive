@@ -98,11 +98,17 @@ struct StreamingLiveTests {
         // every subsequent exit path can await its cleanup explicitly.
         let remoteID = try #require(try await client.generateIds(count: 1).first)
         let remoteName = "streaming_live_\(UUID().uuidString)"
-        let remoteRoot = try await client.createDirectory(
-            name: remoteName,
-            parentId: configuredRootID,
-            remoteId: remoteID
-        )
+        let remoteRoot: DriveFile
+        do {
+            remoteRoot = try await client.createDirectory(
+                name: remoteName,
+                parentId: configuredRootID,
+                remoteId: remoteID
+            )
+        } catch {
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteID)
+            throw error
+        }
 
         let syncTask = Task {
             try await engine.syncLocalToRemoteEmpty(
@@ -166,14 +172,14 @@ struct StreamingLiveTests {
             finalChildren = try await client.listChildren(parentId: remoteRoot.id)
         } catch {
             do {
-                try await client.trash(remoteId: remoteRoot.id)
+                try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
             } catch {
                 Issue.record("Failed to clean up real Drive streaming fixture \(remoteRoot.id): \(error)")
             }
             throw error
         }
         do {
-            try await client.trash(remoteId: remoteRoot.id)
+            try await removeTestRemoteDirectory(client: client, remoteID: remoteRoot.id)
         } catch {
             Issue.record("Failed to clean up real Drive streaming fixture \(remoteRoot.id): \(error)")
         }

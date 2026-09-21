@@ -47,7 +47,9 @@ extension IncrementalSyncRun {
                     ORDER BY candidate.created_at DESC
                     LIMIT 1
                 )
-                WHERE items.root_id = ?1 AND items.dirty_generation > 0;
+                WHERE items.root_id = ?1
+                  AND items.dirty_generation > 0
+                  AND items.phase <> 'blocked';
                 """)
             stmt.bindInt64(self.rootID, at: 1)
             if let encodedIDs { stmt.bindText(encodedIDs, at: 2) }

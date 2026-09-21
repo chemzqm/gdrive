@@ -248,9 +248,13 @@ ID，避免扫描后的父状态变化产生错误层级。
     `listTrashedLocalChanges(localPath:)` 查询这些记录；记录不依赖随后删除的 `items` 行。
     `FileManager.trashItem(at:resultingItemURL:)` 成功后，以返回的实际废纸篓目录路径和文件在原目录内的
     相对路径生成每个文件的 `trash_path` 并回填。记录先以 pending 状态写入，trash 成功并回填路径后
-    改为 committed，避免文件已经移走却完全没有数据库记录。本地删除扩散到远端时直接调用 Google
-    Drive trash，不等待条件元数据 PATCH 契约；若并发远端修改或新增内容随目录一起被移入垃圾桶，
-    用户从 Google Drive 垃圾桶恢复。
+    改为 committed，避免文件已经移走却完全没有数据库记录。两种删除扩散都先在 `operations` 提交
+    `trashRemote` 或 `deleteLocal` intent，再执行外部 trash，最后在一个 SQLite 事务中删除 item 子树
+    和全部关联行；intent 随 item 级联删除。外部操作后数据库提交失败时，下轮同步在 Changes、扫描和
+    冲突恢复之前重放 intent。远端 trash 可幂等重试；本地原路径不存在视为已经完成，若同路径出现不同
+    inode、元数据或 SHA-256 的新文件则停止恢复。Trash 路径回填失败时，最终事务仍保留 committed、
+    `trash_path` 为空的修改记录。本地删除扩散到远端时直接调用 Google Drive trash，不等待条件元数据
+    PATCH 契约；若并发远端修改或新增内容随目录一起被移入垃圾桶，用户从 Google Drive 垃圾桶恢复。
   * 新增大文件的扫描哈希与稳定输入哈希均使用 1 MiB 固定缓冲，正文通过 8 MiB resumable 分块上传；不会构造与文件大小相等的 `Data`。初始化与增量的内存边界见 [A17 验收记录](a17-validation.md)。
   * 单个已枚举文件在哈希前消失或读取失败时，只将该项计入失败并保留既有数据库状态；
     同批及后续健康文件继续同步。该路径仍记为本轮已见，缺失检测不会把读取失败误判为删除。

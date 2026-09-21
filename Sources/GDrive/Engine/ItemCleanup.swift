@@ -6,6 +6,23 @@ struct ItemCleanupGenerations: Sendable, Equatable {
     let dirty: Int64
 }
 
+private struct ItemCleanupIntentPayload: Codable, Sendable, Equatable {
+    let localGeneration: Int64
+    let remoteGeneration: Int64
+    let dirtyGeneration: Int64
+
+    var generations: ItemCleanupGenerations {
+        ItemCleanupGenerations(
+            local: localGeneration, remote: remoteGeneration, dirty: dirtyGeneration)
+    }
+}
+
+private struct PendingItemCleanup: Sendable {
+    let itemID: Int64
+    let operationType: String
+    let generations: ItemCleanupGenerations
+}
+
 actor ItemTaskRegistry {
     private actor StartGate {
         private var continuation: CheckedContinuation<Void, Never>?
@@ -137,8 +154,9 @@ extension SyncEngine {
         taskRegistry: ItemTaskRegistry
     ) async throws {
         try await executeCleanup(
-            initial: initial, expected: expected, taskRegistry: taskRegistry,
-            removePrimary: { plan in
+            initial: initial, expected: expected, operationType: "trashRemote",
+            taskRegistry: taskRegistry,
+            removePrimary: { plan, _ in
                 if let remoteID = plan.remoteID {
                     try await self.client.trash(remoteId: remoteID)
                 }
@@ -176,12 +194,13 @@ extension SyncEngine {
         taskRegistry: ItemTaskRegistry
     ) async throws {
         try await executeCleanup(
-            initial: initial, expected: expected, taskRegistry: taskRegistry,
-            removePrimary: { plan in
+            initial: initial, expected: expected, operationType: "deleteLocal",
+            taskRegistry: taskRegistry,
+            removePrimary: { plan, operationID in
                     if plan.entryKind == "directory" {
                         if FileManager.default.fileExists(atPath: plan.localURL.path) {
                             let changes = try self.modifiedFilesBeforeDirectoryTrash(plan)
-                            let batchID = UUID().uuidString
+                            let batchID = operationID
                             try await self.insertPendingTrashedLocalChanges(
                                 changes, batchID: batchID, plan: plan)
                             var trashURL: NSURL?
@@ -215,22 +234,118 @@ extension SyncEngine {
     private func executeCleanup(
         initial: ItemCleanupPlan,
         expected: ItemCleanupGenerations,
+        operationType: String,
         taskRegistry: ItemTaskRegistry,
-        removePrimary: @Sendable (ItemCleanupPlan) async throws -> Void
+        removePrimary: @Sendable (ItemCleanupPlan, String) async throws -> Void
     ) async throws {
         let ids = Set(initial.nodes.map(\.id))
         await taskRegistry.blockCancelAndDrain(itemIDs: ids)
         do {
             let plan = try await makeCleanupPlan(itemID: initial.itemID, expected: expected)
+            let operationID = try await prepareCleanupIntent(
+                plan: plan, operationType: operationType)
             await RootSyncCoordinator.shared.discardPendingChanges(
                 for: plan.localRootPath, under: plan.localURL.path)
-            try await removePrimary(plan)
+            try await removePrimary(plan, operationID)
             try removeCleanupArtifacts(plan)
-            try await deleteCleanupRows(plan)
+            try await deleteCleanupRows(plan, operationID: operationID)
             await taskRegistry.unblock(itemIDs: ids)
         } catch {
             await taskRegistry.unblock(itemIDs: ids)
             throw error
+        }
+    }
+
+    func recoverPendingItemCleanups(
+        rootID: Int64, taskRegistry: ItemTaskRegistry
+    ) async throws -> Int {
+        let pending = try await store.read { conn -> [PendingItemCleanup] in
+            let stmt = try conn.prepare(
+                """
+                SELECT item_id, operation_type, payload FROM operations
+                WHERE root_id = ? AND operation_type IN ('trashRemote', 'deleteLocal')
+                    AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
+                ORDER BY created_at, operation_id;
+                """)
+            defer { stmt.reset() }
+            stmt.bindInt64(rootID, at: 1)
+            var result: [PendingItemCleanup] = []
+            while try stmt.step(), let itemID = stmt.columnInt64(at: 0),
+                  let operationType = stmt.columnText(at: 1),
+                  let payload = stmt.columnText(at: 2) {
+                let decoded = try JSONDecoder().decode(
+                    ItemCleanupIntentPayload.self, from: Data(payload.utf8))
+                result.append(PendingItemCleanup(
+                    itemID: itemID, operationType: operationType,
+                    generations: decoded.generations))
+            }
+            return result
+        }
+        for cleanup in pending {
+            if cleanup.operationType == "trashRemote" {
+                try await cleanupLocalDeletionToRemoteUnlocked(
+                    itemID: cleanup.itemID, expected: cleanup.generations,
+                    taskRegistry: taskRegistry)
+            } else {
+                try await cleanupRemoteDeletionToLocalUnlocked(
+                    itemID: cleanup.itemID, expected: cleanup.generations,
+                    taskRegistry: taskRegistry)
+            }
+        }
+        return pending.count
+    }
+
+    private func prepareCleanupIntent(
+        plan: ItemCleanupPlan, operationType: String
+    ) async throws -> String {
+        let payload = ItemCleanupIntentPayload(
+            localGeneration: plan.generations.local,
+            remoteGeneration: plan.generations.remote,
+            dirtyGeneration: plan.generations.dirty)
+        guard let payloadText = String(
+            bytes: try JSONEncoder().encode(payload), encoding: .utf8) else {
+            throw SyncEngineError.general("Unable to encode cleanup intent: \(plan.itemID)")
+        }
+        return try await store.write { conn in
+            let existing = try conn.prepare(
+                """
+                SELECT operation_id, operation_type, payload FROM operations
+                WHERE item_id = ? AND operation_type IN ('trashRemote', 'deleteLocal')
+                    AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
+                """)
+            defer { existing.reset() }
+            existing.bindInt64(plan.itemID, at: 1)
+            if try existing.step(), let operationID = existing.columnText(at: 0),
+               let storedType = existing.columnText(at: 1),
+               let storedPayload = existing.columnText(at: 2) {
+                let decoded = try JSONDecoder().decode(
+                    ItemCleanupIntentPayload.self, from: Data(storedPayload.utf8))
+                guard storedType == operationType, decoded == payload else {
+                    throw SyncEngineError.general(
+                        "Existing cleanup intent does not match item: \(plan.itemID)")
+                }
+                return operationID
+            }
+            let operationID = UUID().uuidString
+            let now = Date().timeIntervalSince1970
+            let insert = try conn.prepare(
+                """
+                INSERT INTO operations(operation_id, root_id, item_id, operation_type, state,
+                    expected_local_generation, target_remote_id, payload, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'ready', ?, ?, ?, ?, ?);
+                """)
+            defer { insert.reset() }
+            insert.bindText(operationID, at: 1)
+            insert.bindInt64(plan.rootID, at: 2)
+            insert.bindInt64(plan.itemID, at: 3)
+            insert.bindText(operationType, at: 4)
+            insert.bindInt64(plan.generations.local, at: 5)
+            insert.bindText(plan.remoteID, at: 6)
+            insert.bindText(payloadText, at: 7)
+            insert.bindDouble(now, at: 8)
+            insert.bindDouble(now, at: 9)
+            _ = try insert.step()
+            return operationID
         }
     }
 
@@ -326,12 +441,24 @@ extension SyncEngine {
         conn: SQLiteConnection, rootID: Int64, nodes: inout [ItemCleanupPlan.Node]
     ) throws -> ItemCleanupRelations {
         let subtreeIDs = Set(nodes.map(\.id))
-        let subtreeList = subtreeIDs.map(String.init).joined(separator: ",")
+        try conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS cleanup_item_ids " +
+                "(item_id INTEGER PRIMARY KEY NOT NULL) WITHOUT ROWID;")
+        try conn.execute("DELETE FROM cleanup_item_ids;")
+        defer { try? conn.execute("DELETE FROM cleanup_item_ids;") }
+        let insertID = try conn.prepare(
+            "INSERT OR IGNORE INTO cleanup_item_ids(item_id) VALUES (?);")
+        defer { insertID.reset() }
+        for itemID in subtreeIDs {
+            insertID.bindInt64(itemID, at: 1)
+            _ = try insertID.step()
+            insertID.reset()
+        }
         let copies = try conn.prepare(
             """
             SELECT json_extract(payload, '$.copyItemID'), json_extract(payload, '$.copyPath')
-            FROM operations
-            WHERE item_id IN (\(subtreeList)) AND operation_type = 'resolveConflict'
+            FROM operations op JOIN cleanup_item_ids ids ON ids.item_id = op.item_id
+            WHERE operation_type = 'resolveConflict'
                 AND payload IS NOT NULL;
             """)
         defer { copies.reset() }
@@ -354,13 +481,18 @@ extension SyncEngine {
                 nodes.append(.init(
                     id: copyID, depth: Int64.max, remoteID: remoteID, relativePath: "",
                     entryKind: "file", baseSHA256: nil))
+                insertID.bindInt64(copyID, at: 1)
+                _ = try insertID.step()
+                insertID.reset()
                 if let remoteID { remoteIDs.append(remoteID) }
             }
             copy.reset()
         }
-        let ids = nodes.map(\.id).map(String.init).joined(separator: ",")
         let conflicts = try conn.prepare(
-            "SELECT conflict_path FROM sync_conflicts WHERE item_id IN (\(ids));")
+            """
+            SELECT conflict_path FROM sync_conflicts conflicts
+            JOIN cleanup_item_ids ids ON ids.item_id = conflicts.item_id;
+            """)
         defer { conflicts.reset() }
         var conflictPaths: [URL] = []
         while try conflicts.step() {
@@ -494,14 +626,16 @@ extension SyncEngine {
         }
     }
 
-    private func deleteCleanupRows(_ plan: ItemCleanupPlan) async throws {
+    private func deleteCleanupRows(_ plan: ItemCleanupPlan, operationID: String) async throws {
         try await store.batchWrite { conn in
-            let ids = plan.nodes.map(\.id)
-            let idList = ids.map(String.init).joined(separator: ",")
             let clearBase = try conn.prepare(
-                "UPDATE items SET base_parent_id = NULL, base_name = NULL WHERE base_parent_id IN (\(idList));")
-            _ = try clearBase.step()
-            clearBase.reset()
+                "UPDATE items SET base_parent_id = NULL, base_name = NULL WHERE base_parent_id = ?;")
+            defer { clearBase.reset() }
+            for node in plan.nodes {
+                clearBase.bindInt64(node.id, at: 1)
+                _ = try clearBase.step()
+                clearBase.reset()
+            }
             for remoteID in Set(plan.nodes.compactMap(\.remoteID)) {
                 for table in ["remote_change_inbox", "remote_directory_scans"] {
                     let stmt = try conn.prepare(
@@ -519,9 +653,15 @@ extension SyncEngine {
                 _ = try stmt.step()
                 stmt.reset()
             }
-            guard conn.changes == 1 else {
-                throw SyncEngineError.general("Cleanup database receipt is stale")
-            }
+            let pendingTrash = try conn.prepare(
+                """
+                UPDATE trashed_local_changes SET state = 'committed', trashed_at = ?
+                WHERE batch_id = ? AND state = 'pending';
+                """)
+            pendingTrash.bindDouble(Date().timeIntervalSince1970, at: 1)
+            pendingTrash.bindText(operationID, at: 2)
+            _ = try pendingTrash.step()
+            pendingTrash.reset()
         }
     }
 
