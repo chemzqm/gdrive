@@ -59,14 +59,14 @@ extension SyncEngine {
         let rootExists = try await store.read { conn in
             let queryStatement = try conn.cachedStatement("""
                 SELECT 1 FROM roots
-                WHERE account_id = 'default' AND local_root_path = ? AND remote_root_id = ?
-                    AND initial_sync_direction = 'remoteToLocalEmpty' AND is_active = 1;
+                WHERE account_id = 'default' AND remote_root_id = ? AND is_active = 1;
                 """)
             defer { queryStatement.reset() }
-            queryStatement.bindText(resolvedLocalPath, at: 1)
-            queryStatement.bindText(remoteRootId, at: 2)
+            queryStatement.bindText(remoteRootId, at: 1)
             return try queryStatement.step()
         }
+        let newRootCursor = try await RemoteChanges.initialBootstrapCursor(
+            client: client, rootExists: rootExists, initialToken: initialCursor)
 
         // Existing local entries are preserved. Equal content is adopted and
         // divergent same-path content is recorded as a durable conflict.
@@ -144,10 +144,16 @@ extension SyncEngine {
             }
             itemQuery.reset()
 
+            try RemoteChanges.insertInitialCursor(
+                conn: conn, rootID: rId, token: newRootCursor, now: now)
+
             return (rId, rItemId)
         }
 
-        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists, initialToken: initialCursor)
+        try await RemoteChanges(
+            store: store, client: client, rootID: rootId, remoteRootID: remoteRootId,
+            rootURL: rootURL
+        ).recoverBootstrapCursorIfNeeded(maxConcurrency: maxDownloadConcurrency)
 
         let effectiveDownloadConcurrency = max(1, min(64, maxDownloadConcurrency))
         let downloadSemaphore = AsyncSemaphore(count: effectiveDownloadConcurrency)

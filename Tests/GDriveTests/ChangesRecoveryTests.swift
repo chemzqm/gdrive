@@ -504,6 +504,64 @@ struct ChangesRecoveryTests {
         try await RemoteChanges.saveInitialCursor(store: testFixture.store, client: testFixture.client, rootID: testFixture.rootID)
         #expect(try await token(testFixture) == "older-boundary")
     }
+
+    @Test("Bootstrap cursor failure can resume through sync", arguments: ["network", "interrupted"])
+    func bootstrapCursorFailureCanResumeWithSync(scenario: String) async throws {
+        let testFixture = try await fixture(cursor: false)
+        defer { testFixture.cleanup() }
+        let localData = Data("local bootstrap".utf8)
+        try localData.write(to: testFixture.local.appendingPathComponent("local.txt"))
+
+        if scenario == "network" {
+            try await testFixture.store.write { try $0.execute("DELETE FROM roots;") }
+            context.value.state.withLock { $0.failStart = true }
+            await #expect(throws: (any Error).self) {
+                try await testFixture.engine.sync(
+                    localPath: testFixture.local.path, remoteFolderId: "root")
+            }
+            try await testFixture.store.read { conn in
+                let queryStatement = try conn.prepare(
+                    "SELECT (SELECT COUNT(*) FROM roots) + (SELECT COUNT(*) FROM cursors);")
+                #expect(try queryStatement.step())
+                #expect(queryStatement.columnInt64(at: 0) == 0)
+            }
+            context.value.state.withLock { $0.failStart = false }
+        } else {
+            try await testFixture.store.write {
+                try $0.execute("UPDATE roots SET bootstrap_state = 'freshCreated';")
+            }
+            remoteFile("historical", parent: "root", content: "remote before recovery")
+        }
+
+        let resumed = try await testFixture.engine.sync(
+            localPath: testFixture.local.path, remoteFolderId: "root")
+        #expect(resumed.filesUploaded == 1)
+        try await testFixture.store.read { conn in
+            let queryStatement = try conn.prepare(
+                """
+                SELECT (SELECT COUNT(*) FROM roots),
+                    (SELECT COUNT(*) FROM cursors),
+                    (SELECT bootstrap_state FROM roots LIMIT 1),
+                    (SELECT COUNT(*) FROM items WHERE remote_file_id = 'historical');
+                """)
+            #expect(try queryStatement.step())
+            #expect(queryStatement.columnInt64(at: 0) == 1)
+            #expect(queryStatement.columnInt64(at: 1) == 1)
+            #expect(queryStatement.columnText(at: 2) == "existingKnown")
+            #expect(queryStatement.columnInt64(at: 3) == (scenario == "interrupted" ? 1 : 0))
+        }
+        #expect(context.value.state.withLock {
+            $0.files.values.contains { $0.name == "local.txt" }
+        })
+
+        if scenario == "interrupted" {
+            _ = try await testFixture.engine.sync(
+                localPath: testFixture.local.path, remoteFolderId: "root")
+            #expect(try String(
+                contentsOf: testFixture.local.appendingPathComponent("historical"),
+                encoding: .utf8) == "remote before recovery")
+        }
+    }
     @Test("Cursor commit failure rolls back the page observations")
     func atomicPage() async throws {
         let testFixture = try await fixture()

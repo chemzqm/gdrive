@@ -44,6 +44,8 @@ extension SyncEngine {
             defer { stmt.reset() }
             return try stmt.step()
         }
+        let initialCursor = try await RemoteChanges.initialBootstrapCursor(
+            client: client, rootExists: rootExists, initialToken: nil)
         if !rootExists {
             let existingChildren = try await client.listChildren(parentId: remoteRootId)
             guard existingChildren.isEmpty else {
@@ -111,10 +113,16 @@ extension SyncEngine {
             }
             itemQuery.reset()
 
+            try RemoteChanges.insertInitialCursor(
+                conn: conn, rootID: rId, token: initialCursor, now: now)
+
             return (rId, rItemId)
         }
 
-        try await RemoteChanges.saveInitialCursor(store: store, client: client, rootID: rootId, requireExisting: rootExists)
+        try await RemoteChanges(
+            store: store, client: client, rootID: rootId, remoteRootID: remoteRootId,
+            rootURL: rootURL
+        ).recoverBootstrapCursorIfNeeded(maxConcurrency: maxUploadConcurrency)
 
         // A directory is registered in this table before its children can be emitted.
         // Its value becomes available only after remote creation and the local commit succeed.

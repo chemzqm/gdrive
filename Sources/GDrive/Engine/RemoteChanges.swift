@@ -10,13 +10,14 @@ struct RemoteChanges: Sendable {
     let remoteRootID: String
     let rootURL: URL
 
-    private enum Value { case text(String?), int(Int64?) }
+    private enum Value { case text(String?), int(Int64?), double(Double) }
     private static func statement(_ conn: SQLiteConnection, _ sql: String, _ values: [Value]) throws -> SQLiteStatement {
         let queryStatement = try conn.cachedStatement(sql)
         for (index, value) in values.enumerated() {
             switch value {
             case .text(let text): queryStatement.bindText(text, at: Int32(index + 1))
             case .int(let int): queryStatement.bindInt64(int, at: Int32(index + 1))
+            case .double(let double): queryStatement.bindDouble(double, at: Int32(index + 1))
             }
         }
         return queryStatement
@@ -25,6 +26,27 @@ struct RemoteChanges: Sendable {
         let queryStatement = try statement(conn, sql, values)
         defer { queryStatement.reset() }
         _ = try queryStatement.step()
+    }
+
+    static func initialBootstrapCursor(
+        client: DriveClient, rootExists: Bool, initialToken: String?
+    ) async throws -> String? {
+        guard !rootExists else { return nil }
+        if let initialToken { return initialToken }
+        return try await client.getStartPageToken()
+    }
+
+    static func insertInitialCursor(
+        conn: SQLiteConnection, rootID: Int64, token: String?, now: Double
+    ) throws {
+        guard let token else { return }
+        try execute(
+            conn,
+            """
+            INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
+            VALUES (?, 'default', 'drive_changes', ?, ?);
+            """,
+            [.int(rootID), .text(token), .double(now)])
     }
 
     static func saveInitialCursor(store: StateStore, client: DriveClient, rootID: Int64, requireExisting: Bool = false, initialToken: String? = nil) async throws {
@@ -45,6 +67,44 @@ struct RemoteChanges: Sendable {
                 INSERT OR IGNORE INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
                 VALUES (?, 'default', 'drive_changes', ?, strftime('%s','now'));
                 """, [.int(rootID), .text(token)])
+        }
+    }
+
+    func recoverBootstrapCursorIfNeeded(maxConcurrency: Int) async throws {
+        let hasCursor = try await store.read { conn in
+            let queryStatement = try Self.statement(
+                conn,
+                "SELECT 1 FROM cursors WHERE root_id = ? AND cursor_kind = 'drive_changes' AND is_valid = 1;",
+                [.int(rootID)])
+            defer { queryStatement.reset() }
+            return try queryStatement.step()
+        }
+        let hasRebuildCheckpoint = try await store.read { conn in
+            let queryStatement = try Self.statement(
+                conn,
+                "SELECT 1 FROM remote_directory_scans WHERE root_id = ? LIMIT 1;",
+                [.int(rootID)])
+            defer { queryStatement.reset() }
+            return try queryStatement.step()
+        }
+        if hasCursor, !hasRebuildCheckpoint { return }
+        if !hasCursor {
+            _ = try await startRebuild()
+        }
+        try await consume()
+        while try await enumeratePending(limit: maxConcurrency) {
+            try await applyPending()
+        }
+        try await applyPending()
+        guard try await pendingCount() == 0 else {
+            throw SyncEngineError.general(
+                "The missing Changes cursor recovery still has remote observations pending")
+        }
+        try await store.write { conn in
+            try Self.execute(
+                conn,
+                "DELETE FROM remote_directory_scans WHERE root_id = ?;",
+                [.int(rootID)])
         }
     }
 
