@@ -180,6 +180,116 @@ struct BootstrapRecoveryTests {
         #expect(stats.bytesDownloaded == contents.values.reduce(0) { $0 + Int64($1.count) })
     }
 
+    @Test("Bootstrap-downloaded directories are ready parents for later uploads")
+    func bootstrapDownloadThenCreateNestedFileUploads() async throws {
+        final class UploadRequests: @unchecked Sendable {
+            private let lock = NSLock()
+            private var bodies: [String] = []
+
+            func append(_ body: String) { lock.withLock { bodies.append(body) } }
+            func snapshot() -> [String] { lock.withLock { bodies } }
+        }
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "bootstrap-directory-readiness-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        let requests = UploadRequests()
+        let firstContent = Data("first nested upload".utf8)
+        let secondContent = Data("second nested upload".utf8)
+
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"C0"}"#.utf8))
+            }
+            if url.path.hasSuffix("/changes") {
+                return (response, Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/generateIds") {
+                let ids = (0..<100).map { "upload-id-\($0)" }
+                return (response, try JSONSerialization.data(withJSONObject: ["ids": ids]))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if request.httpMethod == "GET", url.path.hasSuffix("/files") {
+                let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                    .queryItems?.first(where: { $0.name == "q" })?.value ?? ""
+                let files: [[String: Any]]
+                if query.contains("'root' in parents") {
+                    files = [[
+                        "id": "folder-one", "name": "one",
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "parents": ["root"], "version": "11"
+                    ]]
+                } else if query.contains("'folder-one' in parents") {
+                    files = [[
+                        "id": "folder-two", "name": "two",
+                        "mimeType": "application/vnd.google-apps.folder",
+                        "parents": ["folder-one"], "version": "12"
+                    ]]
+                } else {
+                    files = []
+                }
+                return (response, try JSONSerialization.data(withJSONObject: ["files": files]))
+            }
+            if request.httpMethod == "POST", url.path.hasSuffix("/upload/drive/v3/files") {
+                let body = String(data: request.extractBodyData ?? Data(), encoding: .utf8) ?? ""
+                requests.append(body)
+                let isFirst = body.contains("first nested upload")
+                let content = isFirst ? firstContent : secondContent
+                let name = isFirst ? "first.txt" : "second.txt"
+                let id = isFirst ? "uploaded-first" : "uploaded-second"
+                return (response, Data("""
+                    {"id":"\(id)","name":"\(name)","size":"\(content.count)",
+                     "sha256Checksum":"\(SyncEngine.computeSha256(of: content))","version":"1"}
+                    """.utf8))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
+
+        let initial = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+        #expect(initial.filesFailed == 0)
+        let readyDirectories = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT COUNT(*) FROM items
+                WHERE remote_file_id IN ('folder-one', 'folder-two')
+                    AND local_device IS NOT NULL AND local_inode IS NOT NULL
+                    AND local_status = 'present' AND remote_status = 'present'
+                    AND remote_parent_file_id IS NOT NULL AND remote_name IS NOT NULL
+                    AND remote_version IS NOT NULL AND phase = 'committed'
+                    AND dirty_generation = 0;
+                """)
+            defer { query.reset() }
+            return try query.step() ? query.columnInt64(at: 0) : nil
+        }
+        #expect(readyDirectories == 2)
+
+        try firstContent.write(to: local.appendingPathComponent("one/first.txt"))
+        try secondContent.write(to: local.appendingPathComponent("one/two/second.txt"))
+        let incremental = try await engine.syncIncremental(localPath: local.path)
+
+        #expect(incremental.filesUploaded == 2)
+        let uploadBodies = requests.snapshot()
+        #expect(uploadBodies.count == 2)
+        #expect(uploadBodies.contains { $0.contains("first.txt") && $0.contains("folder-one") })
+        #expect(uploadBodies.contains { $0.contains("second.txt") && $0.contains("folder-two") })
+    }
+
     // MARK: - Bootstrap download recovery
 
     @Test("A bootstrap download receipt database failure remains recoverable after reopening")

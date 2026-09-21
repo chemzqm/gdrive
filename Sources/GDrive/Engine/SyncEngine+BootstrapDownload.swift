@@ -297,6 +297,17 @@ extension SyncEngine {
                 if item.isDirectory {
                     // Create local directory
                     try FileManager.default.createDirectory(at: itemLocalURL, withIntermediateDirectories: true)
+                    var directoryStat = stat()
+                    guard lstat(itemLocalURL.path, &directoryStat) == 0 else {
+                        throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                    }
+                    guard directoryStat.st_mode & S_IFMT == S_IFDIR else {
+                        throw SyncEngineError.general(
+                            "The downloaded directory path is not a directory: \(itemLocalURL.path)"
+                        )
+                    }
+                    let directoryDevice = Int64(directoryStat.st_dev)
+                    let directoryInode = Int64(directoryStat.st_ino)
                     progress.recordDirectory()
 
                     // write SQLite
@@ -304,18 +315,37 @@ extension SyncEngine {
                         let stmt = try conn.cachedStatement("""
                         INSERT INTO items (
                             root_id, parent_id, name, entry_kind, remote_file_id,
-                            phase, created_at, updated_at
-                        ) VALUES (?, ?, ?, 'directory', ?, 'committed', ?, ?)
+                            local_device, local_inode, local_status,
+                            remote_parent_file_id, remote_name, remote_version, remote_status,
+                            phase, dirty_generation, created_at, updated_at
+                        ) VALUES (?, ?, ?, 'directory', ?, ?, ?, 'present', ?, ?, ?, 'present',
+                            'committed', 0, ?, ?)
                         ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
-                        DO UPDATE SET updated_at = excluded.updated_at WHERE items.remote_file_id = excluded.remote_file_id;
+                        DO UPDATE SET
+                            local_device = excluded.local_device,
+                            local_inode = excluded.local_inode,
+                            local_status = 'present',
+                            remote_parent_file_id = excluded.remote_parent_file_id,
+                            remote_name = excluded.remote_name,
+                            remote_version = COALESCE(excluded.remote_version, items.remote_version),
+                            remote_status = 'present',
+                            phase = 'committed',
+                            dirty_generation = 0,
+                            updated_at = excluded.updated_at
+                        WHERE items.remote_file_id = excluded.remote_file_id;
                         """)
                         stmt.bindInt64(rootId, at: 1)
                         stmt.bindInt64(parentItemId, at: 2)
                         stmt.bindText(item.name, at: 3)
                         stmt.bindText(item.id, at: 4)
+                        stmt.bindInt64(directoryDevice, at: 5)
+                        stmt.bindInt64(directoryInode, at: 6)
+                        stmt.bindText(parentRemoteId, at: 7)
+                        stmt.bindText(item.name, at: 8)
+                        stmt.bindInt64(item.versionNumber, at: 9)
                         let timestamp = Date().timeIntervalSince1970
-                        stmt.bindDouble(timestamp, at: 5)
-                        stmt.bindDouble(timestamp, at: 6)
+                        stmt.bindDouble(timestamp, at: 10)
+                        stmt.bindDouble(timestamp, at: 11)
                         _ = try stmt.step()
                         stmt.reset()
                         guard conn.changes == 1 else {
