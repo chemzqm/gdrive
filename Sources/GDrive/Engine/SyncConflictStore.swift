@@ -418,6 +418,95 @@ extension SyncEngine {
         try await commitConflictDeletion(record, storedURL: storedURL)
     }
 
+    private func resolveRemoteConflict(
+        _ record: SyncConflictStore.Record, localURL: URL, storedURL: URL?
+    ) async throws {
+        let conflict = record.conflict
+        if try await resolveRemoteDeletionIfNeeded(
+            record, localURL: localURL, storedURL: storedURL) { return }
+        guard let storedURL else {
+            throw SyncEngineError.general(
+                "The remote conflict copy is unavailable: \(conflict.relativePath)")
+        }
+        let digest = try Self.computeFileSha256(at: storedURL)
+        guard digest.sha256Hex.caseInsensitiveCompare(conflict.remoteSHA256) == .orderedSame,
+              digest.fileSize == conflict.remoteSize else {
+            throw SyncEngineError.general("The stored remote conflict file changed: \(storedURL.path)")
+        }
+        guard let expected = try LocalFileVersion.read(at: localURL),
+              let storedVersion = try LocalFileVersion.read(at: storedURL) else {
+            throw DriveError.fileModifiedDuringUpload(path: localURL.path)
+        }
+        let publicationURL: URL
+        let replacementDirectory: URL?
+        if storedVersion.device == expected.device {
+            publicationURL = storedURL
+            replacementDirectory = nil
+        } else {
+            let directory = try FileManager.default.url(
+                for: .itemReplacementDirectory, in: .userDomainMask,
+                appropriateFor: localURL, create: true)
+            publicationURL = directory.appendingPathComponent(localURL.lastPathComponent)
+            try FileManager.default.copyItem(at: storedURL, to: publicationURL)
+            replacementDirectory = directory
+        }
+        defer {
+            if let replacementDirectory {
+                try? FileManager.default.removeItem(at: replacementDirectory)
+            }
+        }
+        let exchange = try LocalFilePublication.exchangeOwnedFile(
+            publicationURL, with: localURL, expected: expected)
+        do {
+            try await commitRemoteConflictResolution(
+                record, published: exchange.published,
+                remotePresent: conflict.remoteStatus == .present)
+        } catch {
+            do {
+                try exchange.rollback()
+            } catch let rollbackError {
+                throw SyncEngineError.general(
+                    "Conflict database update failed and publication rollback failed: \(rollbackError)")
+            }
+            throw error
+        }
+        try exchange.deleteDisplacedFile()
+        if publicationURL != storedURL {
+            try FileManager.default.removeItem(at: storedURL)
+        }
+    }
+
+    private func commitRemoteConflictResolution(
+        _ record: SyncConflictStore.Record, published: LocalFileVersion, remotePresent: Bool
+    ) async throws {
+        let conflict = record.conflict
+        try await store.batchWrite { conn in
+            let update = try conn.cachedStatement("""
+            UPDATE items SET local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?,
+                local_sha256 = ?, base_sha256 = ?, base_size = ?, local_status = 'present',
+                phase = ?, dirty_generation = ?, updated_at = ? WHERE item_id = ?;
+            """)
+            update.bindInt64(published.device, at: 1)
+            update.bindInt64(published.inode, at: 2)
+            update.bindInt64(published.mtime, at: 3)
+            update.bindInt64(published.size, at: 4)
+            update.bindText(conflict.remoteSHA256, at: 5)
+            update.bindText(remotePresent ? conflict.remoteSHA256 : nil, at: 6)
+            if remotePresent { update.bindInt64(conflict.remoteSize, at: 7) }
+            update.bindText(remotePresent ? "committed" : "ready", at: 8)
+            update.bindInt64(remotePresent ? 0 : 1, at: 9)
+            update.bindDouble(Date().timeIntervalSince1970, at: 10)
+            update.bindInt64(record.itemID, at: 11)
+            _ = try update.step()
+            update.reset()
+            let remove = try conn.cachedStatement(
+                "DELETE FROM sync_conflicts WHERE conflict_id = ?;")
+            remove.bindText(conflict.id, at: 1)
+            _ = try remove.step()
+            remove.reset()
+        }
+    }
+
     private func resolveInitialConflict(_ record: SyncConflictStore.Record,
                                         resolution: SyncConflictResolution) async throws {
         let conflict = record.conflict
@@ -425,48 +514,8 @@ extension SyncEngine {
         let storedURL = conflict.conflictPath.map(URL.init(fileURLWithPath:))
         switch resolution {
         case .remote:
-            if try await resolveRemoteDeletionIfNeeded(
-                record, localURL: localURL, storedURL: storedURL) { return }
-            guard let storedURL else {
-                throw SyncEngineError.general("The remote conflict copy is unavailable: \(conflict.relativePath)")
-            }
-            let digest = try Self.computeFileSha256(at: storedURL)
-            guard digest.sha256Hex.caseInsensitiveCompare(conflict.remoteSHA256) == .orderedSame,
-                  digest.fileSize == conflict.remoteSize else {
-                throw SyncEngineError.general("The stored remote conflict file changed: \(storedURL.path)")
-            }
-            let publicationCopy = localURL.deletingLastPathComponent()
-                .appendingPathComponent(".gdrive-conflict-\(UUID().uuidString)")
-            try FileManager.default.copyItem(at: storedURL, to: publicationCopy)
-            defer { try? FileManager.default.removeItem(at: publicationCopy) }
-            let published = try LocalFilePublication.publish(
-                publicationCopy, to: localURL, expected: try LocalFileVersion.read(at: localURL))
-            let remotePresent = conflict.remoteStatus == .present
-            try await store.batchWrite { conn in
-                let update = try conn.cachedStatement("""
-                UPDATE items SET local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?,
-                    local_sha256 = ?, base_sha256 = ?, base_size = ?, local_status = 'present',
-                    phase = ?, dirty_generation = ?, updated_at = ? WHERE item_id = ?;
-                """)
-                update.bindInt64(published.device, at: 1)
-                update.bindInt64(published.inode, at: 2)
-                update.bindInt64(published.mtime, at: 3)
-                update.bindInt64(published.size, at: 4)
-                update.bindText(conflict.remoteSHA256, at: 5)
-                update.bindText(remotePresent ? conflict.remoteSHA256 : nil, at: 6)
-                if remotePresent { update.bindInt64(conflict.remoteSize, at: 7) }
-                update.bindText(remotePresent ? "committed" : "ready", at: 8)
-                update.bindInt64(remotePresent ? 0 : 1, at: 9)
-                update.bindDouble(Date().timeIntervalSince1970, at: 10)
-                update.bindInt64(record.itemID, at: 11)
-                _ = try update.step()
-                update.reset()
-                let remove = try conn.cachedStatement("DELETE FROM sync_conflicts WHERE conflict_id = ?;")
-                remove.bindText(conflict.id, at: 1)
-                _ = try remove.step()
-                remove.reset()
-            }
-            try? FileManager.default.removeItem(at: storedURL)
+            try await resolveRemoteConflict(
+                record, localURL: localURL, storedURL: storedURL)
         case .local:
             guard let version = try LocalFileVersion.read(at: localURL) else {
                 try await resolveLocalDeletion(record, storedURL: storedURL)

@@ -206,6 +206,8 @@ struct ConflictRecoveryTests {
         #expect(stats.filesFailed == 0)
         let conflict = try #require(stats.conflicts.first)
         let conflictPath = try #require(conflict.conflictPath)
+        let storedVersion = try #require(
+            try LocalFileVersion.read(at: URL(fileURLWithPath: conflictPath)))
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == Data("remote edited content".utf8))
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == stats.conflicts)
@@ -215,6 +217,11 @@ struct ConflictRecoveryTests {
         #expect(context.value.state.withLock { $0.downloads } == downloads)
         try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
         #expect(try Data(contentsOf: testFixture.original) == Data("remote edited content".utf8))
+        #expect(try LocalFileVersion.read(at: testFixture.original)?.inode == storedVersion.inode)
+        #expect(!FileManager.default.fileExists(atPath: conflictPath))
+        let localEntries = try FileManager.default.contentsOfDirectory(
+            at: testFixture.local, includingPropertiesForKeys: nil)
+        #expect(localEntries.map(\.lastPathComponent) == ["file.txt"])
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
