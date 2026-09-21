@@ -123,6 +123,27 @@ struct RootSyncCoordinatorTests {
         #expect(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: root))
     }
 
+    @Test("Cleanup finds coordinator state through an equivalent root path")
+    func discardsCleanupSubtreeWithNormalizedRoot() async throws {
+        let name = "gdrive-cleanup-normalized-\(UUID().uuidString)"
+        let coordinatorRoot = "/private/tmp/\(name)"
+        let databaseRoot = "/tmp/\(name)"
+        let removed = coordinatorRoot + "/removed"
+        let keep = LocalChange.modified(path: coordinatorRoot + "/keep.txt", isDirectory: false)
+        try await RootSyncCoordinator.shared.acquire(localRootPath: coordinatorRoot)
+        _ = await RootSyncCoordinator.shared.enqueue([
+            .modified(path: removed + "/child.txt", isDirectory: false),
+            keep
+        ], for: coordinatorRoot)
+
+        await RootSyncCoordinator.shared.discardPendingChanges(
+            for: databaseRoot, under: databaseRoot + "/removed")
+
+        let batch = try #require(await RootSyncCoordinator.shared.takePending(for: databaseRoot))
+        #expect(batch.changes == [keep])
+        #expect(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: databaseRoot))
+    }
+
     @Test("Pre-baseline active roots route a multi-root watcher batch by path boundary")
     func routesActiveRootsBeforeDatabaseBinding() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

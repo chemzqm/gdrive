@@ -56,7 +56,7 @@ extension IncrementalSyncRun {
         let baselineCache = try await LocalBaselineCache.load(store: engine.store, rootId: rootID)
         let baselineFilePaths = try await engine.store.read { conn -> Set<String> in
             let stmt = try conn.cachedStatement(
-                "SELECT parent_id, name FROM items WHERE root_id = ? AND entry_kind = 'file' AND is_tombstone = 0 AND parent_id IS NOT NULL;")
+                "SELECT parent_id, name FROM items WHERE root_id = ? AND entry_kind = 'file' AND parent_id IS NOT NULL;")
             stmt.bindInt64(self.rootID, at: 1)
             defer { stmt.reset() }
             var paths = Set<String>()
@@ -144,7 +144,7 @@ extension IncrementalSyncRun {
                             1, 'present', 'ready', 1,
                             ?, ?
                         )
-                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                        ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                         DO UPDATE SET
                             local_device = excluded.local_device,
                             local_inode = excluded.local_inode,
@@ -188,7 +188,7 @@ extension IncrementalSyncRun {
                             phase, dirty_generation, created_at, updated_at
                         ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?,
                             'unknown', 'absent', 1, 'waitingEvidence', 1, ?, ?)
-                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                        ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                         DO UPDATE SET
                             local_device = excluded.local_device,
                             local_inode = excluded.local_inode,
@@ -280,7 +280,7 @@ extension IncrementalSyncRun {
                     """
                     SELECT item_id, parent_id, name, remote_file_id
                     FROM items
-                    WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                    WHERE root_id = ? AND entry_kind = 'file' AND local_device = ? AND local_inode = ?;
                     """)
                 stmt.bindInt64(rootID, at: 1)
                 stmt.bindInt64(device, at: 2)
@@ -322,7 +322,7 @@ extension IncrementalSyncRun {
                             """
                             SELECT item_id, parent_id, name, remote_file_id
                             FROM items
-                            WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ? AND is_tombstone = 0;
+                            WHERE root_id = ? AND entry_kind = 'directory' AND local_device = ? AND local_inode = ?;
                             """)
                         stmt.bindInt64(rootID, at: 1)
                         stmt.bindInt64(dev, at: 2)

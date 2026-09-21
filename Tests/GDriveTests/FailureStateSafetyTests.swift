@@ -235,7 +235,7 @@ struct FailureStateSafetyTests {
             #expect(child.columnInt64(at: 0) == dirAItemId)
 
             let misplaced = try conn.prepare(
-                "SELECT COUNT(*) FROM items WHERE root_id = ? AND parent_id = ? AND name = 'sub' AND is_tombstone = 0;")
+                "SELECT COUNT(*) FROM items WHERE root_id = ? AND parent_id = ? AND name = 'sub';")
             misplaced.bindInt64(rootId, at: 1)
             misplaced.bindInt64(rootDirItemId, at: 2)
             #expect(try misplaced.step())
@@ -447,7 +447,7 @@ struct FailureStateSafetyTests {
         #expect(renames.filePatchCount == (failRename ? 2 : 1))
     }
 
-    @Test("Remote trash remains pending without a verified conditional metadata update")
+    @Test("Remote trash failure preserves the item and a later retry deletes it")
     func testRemoteTrashFailurePreservesItemAndRetries() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_trash_\(UUID().uuidString)")
@@ -565,30 +565,28 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. First sync with trash failing
-        let stats1 = try await engine.syncIncremental(localPath: localRootDir.path)
-        #expect(stats1.filesDeleted == 0, "Failed trash must not be counted in filesDeleted")
-
-        // In SQLite: is_tombstone MUST still be 0!
-        try await store.read { conn in
-            let stmt = try conn.prepare("SELECT is_tombstone FROM items WHERE item_id = ?;")
-            stmt.bindInt64(fileItemId, at: 1)
-            #expect(try stmt.step())
-            #expect(stmt.columnInt64(at: 0) == 0, "Item must NOT be marked tombstone when trash fails")
+        await #expect(throws: (any Error).self) {
+            try await engine.syncIncremental(localPath: localRootDir.path)
         }
 
-        // A retry still must not issue an unconditional PATCH.
+        // The failed remote trash keeps the item row
+        try await store.read { conn in
+            let stmt = try conn.prepare("SELECT 1 FROM items WHERE item_id = ?;")
+            stmt.bindInt64(fileItemId, at: 1)
+            #expect(try stmt.step())
+            #expect(stmt.columnInt64(at: 0) == 1)
+        }
+
+        // A later run retries the Drive trash and physically removes the row.
         control.shouldFail = false
         let stats2 = try await engine.syncIncremental(localPath: localRootDir.path)
-        #expect(stats2.filesDeleted == 0)
+        #expect(stats2.filesDeleted == 1)
 
         try await store.read { conn in
-            let stmt = try conn.prepare(
-                "SELECT is_tombstone, phase, dirty_generation FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
             stmt.bindInt64(fileItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnInt64(at: 0) == 0)
-            #expect(stmt.columnText(at: 1) == "blocked")
-            #expect((stmt.columnInt64(at: 2) ?? 0) > 0)
         }
     }
 
@@ -731,7 +729,7 @@ struct FailureStateSafetyTests {
                 SELECT COUNT(*) FROM items child
                 JOIN items parent ON parent.item_id = child.parent_id
                 WHERE child.root_id = ? AND parent.parent_id IS NULL
-                    AND child.name IN ('sub', 'f.txt') AND child.is_tombstone = 0;
+                    AND child.name IN ('sub', 'f.txt');
                 """)
             misplaced.bindInt64(rootId, at: 1)
             #expect(try misplaced.step())
@@ -761,9 +759,7 @@ struct FailureStateSafetyTests {
                 JOIN items sub ON sub.item_id = file.parent_id
                 JOIN items directory ON directory.item_id = sub.parent_id
                 WHERE file.root_id = ? AND directory.name = 'new_folder'
-                    AND sub.name = 'sub' AND file.name = 'f.txt'
-                    AND file.is_tombstone = 0 AND sub.is_tombstone = 0
-                    AND directory.is_tombstone = 0;
+                    AND sub.name = 'sub' AND file.name = 'f.txt';
                 """)
             hierarchy.bindInt64(rootId, at: 1)
             #expect(try hierarchy.step())

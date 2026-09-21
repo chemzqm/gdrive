@@ -14,54 +14,62 @@ actor RootSyncCoordinator {
     private var states: [String: State] = [:]
 
     func acquire(localRootPath: String) throws {
-        var state = states[localRootPath] ?? State()
-        guard !state.running else { throw SyncEngineError.rootBusy(path: localRootPath) }
+        let key = Self.normalizedPath(localRootPath)
+        var state = states[key] ?? State()
+        guard !state.running else { throw SyncEngineError.rootBusy(path: key) }
         state.running = true
-        states[localRootPath] = state
+        states[key] = state
     }
 
     func enqueue(_ changes: [LocalChange], for localRootPath: String) -> Bool {
-        var state = states[localRootPath] ?? State()
+        let key = Self.normalizedPath(localRootPath)
+        var state = states[key] ?? State()
         state.pending = LocalChange.coalescing(state.pending + changes)
         let shouldStart = !state.running
         state.running = true
-        states[localRootPath] = state
+        states[key] = state
         return shouldStart
     }
 
     func takePending(for localRootPath: String) -> Batch? {
-        guard var state = states[localRootPath], !state.pending.isEmpty else { return nil }
+        let key = Self.normalizedPath(localRootPath)
+        guard var state = states[key], !state.pending.isEmpty else { return nil }
         let batch = Batch(changes: state.pending)
         state.pending.removeAll()
-        states[localRootPath] = state
+        states[key] = state
         return batch
     }
 
     func discardPendingChanges(for localRootPath: String, under path: String) {
-        guard var state = states[localRootPath] else { return }
+        let key = Self.normalizedPath(localRootPath)
+        let normalizedPath = Self.normalizedPath(path)
+        guard var state = states[key] else { return }
         state.pending.removeAll { change in
-            change.paths.allSatisfy { Self.contains($0, in: path) }
+            change.paths.allSatisfy { Self.contains(Self.normalizedPath($0), in: normalizedPath) }
         }
-        states[localRootPath] = state
+        states[key] = state
     }
 
     func finishIfIdle(localRootPath: String) -> Bool {
-        guard let state = states[localRootPath] else { return true }
+        let key = Self.normalizedPath(localRootPath)
+        guard let state = states[key] else { return true }
         guard state.pending.isEmpty else { return false }
-        states.removeValue(forKey: localRootPath)
+        states.removeValue(forKey: key)
         return true
     }
 
     /// Compatibility release for direct coordinator users and focused tests.
     /// Normal engine paths use `finishIfIdle` to preserve the pending handoff.
     func release(localRootPath: String) {
-        guard var state = states[localRootPath] else { return }
+        let key = Self.normalizedPath(localRootPath)
+        guard var state = states[key] else { return }
         state.running = false
-        if state.pending.isEmpty { states.removeValue(forKey: localRootPath) } else { states[localRootPath] = state }
+        if state.pending.isEmpty { states.removeValue(forKey: key) } else { states[key] = state }
     }
 
     func activeRoots(containing paths: [String]) -> [String] {
-        states.keys.filter { root in paths.contains { Self.contains($0, in: root) } }
+        let normalizedPaths = paths.map(Self.normalizedPath)
+        return states.keys.filter { root in normalizedPaths.contains { Self.contains($0, in: root) } }
     }
 
     func statuses() -> [PendingLocalChangeStatus] {
@@ -73,5 +81,20 @@ actor RootSyncCoordinator {
 
     nonisolated static func contains(_ path: String, in root: String) -> Bool {
         path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    nonisolated static func normalizedPath(_ path: String) -> String {
+        var existing = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            .standardizedFileURL
+        var missingComponents: [String] = []
+        while existing.path != "/", !FileManager.default.fileExists(atPath: existing.path) {
+            missingComponents.append(existing.lastPathComponent)
+            existing.deleteLastPathComponent()
+        }
+        var resolved = existing.resolvingSymlinksInPath()
+        for component in missingComponents.reversed() {
+            resolved.appendPathComponent(component)
+        }
+        return resolved.standardizedFileURL.path
     }
 }

@@ -30,7 +30,7 @@ extension SyncEngine {
             SELECT roots.root_id, items.item_id, roots.bootstrap_state, roots.initial_sync_direction
             FROM roots
             JOIN items ON items.root_id = roots.root_id
-                AND items.parent_id IS NULL AND items.is_tombstone = 0
+                AND items.parent_id IS NULL
             WHERE roots.local_root_path = ? AND roots.remote_root_id = ? AND roots.is_active = 1;
             """)
             stmt.bindText(resolvedLocalPath, at: 1)

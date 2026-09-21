@@ -105,7 +105,7 @@ extension IncrementalSyncRun {
                 """
                 SELECT item_id, parent_id, name, remote_file_id, remote_status
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0 AND parent_id IS NOT NULL;
+                WHERE root_id = ? AND entry_kind = 'directory' AND parent_id IS NOT NULL;
                 """)
             stmt.bindInt64(rootID, at: 1)
             var rawDirs: [StoredDirectory] = []
@@ -198,238 +198,43 @@ extension IncrementalSyncRun {
     }
 
     func reconcileDirectories(_ dirItems: [DirtyRecord]) async throws {
-        // 1. For ordinary directories in a non-deleted state, submit and clear them directly. dirty_generation
-        func commitSettledDirectories() async throws {
-            if !dirItems.isEmpty {
-                try await engine.store.write { conn in
-                    for item in dirItems {
-                        let isCandidate =
-                            (item.local?.status == .absent && item.remote?.status == .present)
-                            || (item.remote?.status == .trashed && item.local?.status == .present)
-                            || (item.local?.status == .absent && item.remote?.status == .trashed)
-                        if !isCandidate {
-                            if item.local?.status != .unknown && item.remote?.status != .unknown {
-                                do {
-                                    let stmt = try conn.cachedStatement(
-                                        """
-                                        UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                                        """)
-                                    stmt.bindDouble(self.now, at: 1)
-                                    stmt.bindInt64(item.itemId, at: 2)
-                                    _ = try stmt.step()
-                                    stmt.reset()
-                                }
-                            }
-                        } else if item.local?.status == .absent && item.remote?.status == .trashed {
-                            // Both ends have been deleted
-                            do {
-                                let stmt = try conn.cachedStatement(
-                                    """
-                                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                                    """)
-                                stmt.bindDouble(self.now, at: 1)
-                                stmt.bindInt64(item.itemId, at: 2)
-                                _ = try stmt.step()
-                                stmt.reset()
-                            }
-                            self.actionTracker.counts.withLock { $0.deleted += 1 }
-                        }
-                    }
-
-                }
-            }
-        }
-        try await commitSettledDirectories()
-
-        // 2. For directories with unilateral deletion intentions, perform barrier verification in reverse order of tree depth (bottom-up, leaf directories first)
-        let dirCandidates = dirItems.filter {
+        let deletionCandidates = dirItems.filter {
             ($0.local?.status == .absent && $0.remote?.status == .present)
                 || ($0.remote?.status == .trashed && $0.local?.status == .present)
-        }.sorted { firstDirectory, secondDirectory in
-            let pathA = directoryContext.getRelPath(for: firstDirectory.itemId) ?? ""
-            let pathB = directoryContext.getRelPath(for: secondDirectory.itemId) ?? ""
-            let depthA = pathA.isEmpty ? 0 : pathA.split(separator: "/").count
-            let depthB = pathB.isEmpty ? 0 : pathB.split(separator: "/").count
-            return depthA > depthB
+                || ($0.local?.status == .absent && $0.remote?.status == .trashed)
+        }
+        let deletionIDs = Set(deletionCandidates.map(\.itemId))
+        try await engine.store.write { conn in
+            let stmt = try conn.cachedStatement(
+                "UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;")
+            defer { stmt.reset() }
+            for item in dirItems where !deletionIDs.contains(item.itemId) {
+                guard item.local?.status != .unknown, item.remote?.status != .unknown else { continue }
+                stmt.bindDouble(self.now, at: 1)
+                stmt.bindInt64(item.itemId, at: 2)
+                _ = try stmt.step()
+                stmt.reset()
+            }
         }
 
-        for dirItem in dirCandidates {
-            let parentRel = directoryContext.getRelPath(for: dirItem.parentId) ?? ""
-            let relPath = parentRel.isEmpty ? dirItem.name : "\(parentRel)/\(dirItem.name)"
-            let localDirURL = rootURL.appendingPathComponent(relPath)
-
-            // Recursively query the status of all descendants of the current directory
-            let barrier = try await engine.store.read { conn in
-                let stmt = try conn.cachedStatement(
-                    """
-                    WITH RECURSIVE subtree AS (
-                        SELECT item_id, entry_kind, local_status, remote_status, phase, is_tombstone
-                        FROM items
-                        WHERE parent_id = ? AND root_id = ?
-                        UNION ALL
-                        SELECT i.item_id, i.entry_kind, i.local_status, i.remote_status, i.phase, i.is_tombstone
-                        FROM items i
-                        JOIN subtree s ON i.parent_id = s.item_id
-                        WHERE i.root_id = ?
-                    )
-                    SELECT
-                        COUNT(*) AS total,
-                        SUM(CASE WHEN is_tombstone = 0 AND local_status = 'present' THEN 1 ELSE 0 END) AS local_present,
-                        SUM(CASE WHEN is_tombstone = 0 AND remote_status = 'present' THEN 1 ELSE 0 END) AS remote_present,
-                        SUM(CASE WHEN is_tombstone = 0 AND (phase IN ('waitingEvidence', 'conflict', 'blocked') OR local_status = 'unknown' OR remote_status = 'unknown') THEN 1 ELSE 0 END) AS pending_count
-                    FROM subtree;
-                    """)
-                stmt.bindInt64(dirItem.itemId, at: 1)
-                stmt.bindInt64(self.rootID, at: 2)
-                stmt.bindInt64(self.rootID, at: 3)
-                defer { stmt.reset() }
-                if try stmt.step() {
-                    let total = Int(stmt.columnInt64(at: 0) ?? 0)
-                    let localPresent = Int(stmt.columnInt64(at: 1) ?? 0)
-                    let remotePresent = Int(stmt.columnInt64(at: 2) ?? 0)
-                    let pending = Int(stmt.columnInt64(at: 3) ?? 0)
-                    return (
-                        total: total, localPresent: localPresent, remotePresent: remotePresent,
-                        pending: pending
-                    )
-                }
-                return (total: 0, localPresent: 0, remotePresent: 0, pending: 0)
+        let ordered = deletionCandidates.sorted { first, second in
+            let firstPath = directoryContext.getRelPath(for: first.itemId) ?? ""
+            let secondPath = directoryContext.getRelPath(for: second.itemId) ?? ""
+            return firstPath.split(separator: "/").count
+                > secondPath.split(separator: "/").count
+        }
+        for item in ordered {
+            let expected = ItemCleanupGenerations(
+                local: item.localGeneration, remote: item.remoteGeneration,
+                dirty: item.dirtyGeneration)
+            if item.local?.status == .absent && item.remote?.status == .present {
+                try await engine.cleanupLocalDeletionToRemoteUnlocked(
+                    itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
+            } else {
+                try await engine.cleanupRemoteDeletionToLocalUnlocked(
+                    itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
             }
-
-            func reconcileRemoteDeletion() async throws {
-                // The directory is deleted locally, but the remote directory is still there (original intention: trashRemote)
-                // Barrier check: if there are any remote files in the descendants that need to be preserved/Download files locally/conflict/Pending items, deletion of remote directories is absolutely prohibited
-                if barrier.remotePresent > 0 || barrier.localPresent > 0 || barrier.pending > 0 {
-                    engine.logger.info(
-                        "Descendant barrier blocked deletion of remote directory [\(relPath)]: descendants must be retained or added (remotePresent: \(barrier.remotePresent), localPresent: \(barrier.localPresent)); restoring the local directory"
-                    )
-                    try? FileManager.default.createDirectory(
-                        at: localDirURL, withIntermediateDirectories: true)
-                    try await engine.store.batchWrite { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET local_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                            """)
-                        stmt.bindDouble(self.now, at: 1)
-                        stmt.bindInt64(dirItem.itemId, at: 2)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                } else {
-                    // A GET followed by PATCH cannot exclude a concurrent remote child
-                    // or metadata update. Retain the deletion until Drive conditional
-                    // metadata updates have passed the real-service contract test.
-                    try await engine.store.write { conn in
-                        let stmt = try conn.cachedStatement(
-                            """
-                            UPDATE items SET phase = 'blocked', updated_at = ?
-                            WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                                AND dirty_generation = ? AND is_tombstone = 0;
-                            """)
-                        stmt.bindDouble(self.now, at: 1)
-                        stmt.bindInt64(dirItem.itemId, at: 2)
-                        stmt.bindInt64(dirItem.localGeneration, at: 3)
-                        stmt.bindInt64(dirItem.remoteGeneration, at: 4)
-                        stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
-                        _ = try stmt.step()
-                        stmt.reset()
-                    }
-                    engine.logger.error(
-                        "Remote directory deletion blocked because Drive conditional metadata updates are unverified [\(relPath)]"
-                    )
-                }
-            }
-
-            func reconcileLocalDeletion() async throws {
-                // The remote end deleted the directory, but the local directory is still there (original intention: deleteLocal)
-                // Barrier check: If there are local new, modified or conflicting files in the descendants, deletion of the local directory is absolutely prohibited
-                if barrier.localPresent > 0 || barrier.remotePresent > 0 || barrier.pending > 0 {
-                    engine.logger.info(
-                        "Descendant barrier blocked deletion of local directory [\(relPath)]: it contains locally added or modified descendants (localPresent: \(barrier.localPresent))"
-                    )
-                    do {
-                        if let rId = dirItem.remoteFileId {
-                            try await engine.client.untrash(remoteId: rId)
-                        }
-                        try await engine.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement(
-                                """
-                                UPDATE items SET remote_status = 'present', phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-                                """)
-                            stmt.bindDouble(self.now, at: 1)
-                            stmt.bindInt64(dirItem.itemId, at: 2)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                    } catch {
-                        if DatabaseFailure.isSQLite(error) { throw error }
-                        engine.logger.error(
-                            "Descendant barrier failed to restore remote directory [\(relPath)]: \(error)"
-                        )
-                    }
-                } else {
-                    // All descendants have been cleaned up. Verify that the local directory is empty and safely move it to the trash.
-                    let trashSucceeded: Bool
-                    do {
-                        trashSucceeded = try LocalDeletionSafety.trashDirectoryIfEmpty(
-                            at: localDirURL)
-                        if !trashSucceeded {
-                            engine.logger.warning(
-                                "Local directory [\(relPath)] is not empty; blocking deletion")
-                        }
-                    } catch {
-                        trashSucceeded = false
-                        engine.logger.warning(
-                            "Unable to inspect or move local directory to Trash [\(relPath)]: \(error). Keeping the deletion pending."
-                        )
-                    }
-
-                    if trashSucceeded {
-                        try await engine.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement(
-                                """
-                                UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ?
-                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                                    AND dirty_generation = ? AND is_tombstone = 0;
-                                """)
-                            stmt.bindDouble(self.now, at: 1)
-                            stmt.bindInt64(dirItem.itemId, at: 2)
-                            stmt.bindInt64(dirItem.localGeneration, at: 3)
-                            stmt.bindInt64(dirItem.remoteGeneration, at: 4)
-                            stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
-                            _ = try stmt.step()
-                            stmt.reset()
-                            guard conn.changes == 1 else {
-                                throw SyncEngineError.general(
-                                    "Local directory deletion receipt is stale: \(relPath)")
-                            }
-                        }
-                        self.actionTracker.counts.withLock { $0.deleted += 1 }
-                    } else {
-                        try await engine.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement(
-                                """
-                                UPDATE items SET phase = 'blocked', updated_at = ?
-                                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                                    AND dirty_generation = ? AND is_tombstone = 0;
-                                """)
-                            stmt.bindDouble(self.now, at: 1)
-                            stmt.bindInt64(dirItem.itemId, at: 2)
-                            stmt.bindInt64(dirItem.localGeneration, at: 3)
-                            stmt.bindInt64(dirItem.remoteGeneration, at: 4)
-                            stmt.bindInt64(dirItem.dirtyGeneration, at: 5)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                    }
-                }
-            }
-
-            if dirItem.local?.status == .absent && dirItem.remote?.status == .present {
-                try await reconcileRemoteDeletion()
-            } else if dirItem.remote?.status == .trashed && dirItem.local?.status == .present {
-                try await reconcileLocalDeletion()
-            }
+            actionTracker.counts.withLock { $0.deleted += 1 }
         }
     }
 }

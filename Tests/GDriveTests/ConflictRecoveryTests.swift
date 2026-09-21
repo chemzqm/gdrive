@@ -293,6 +293,20 @@ struct ConflictRecoveryTests {
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
+    @Test("Local deletion against a remote modification creates a conflict")
+    func localDeletionAgainstRemoteModification() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        try FileManager.default.removeItem(at: testFixture.original)
+
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        let conflict = try #require(stats.conflicts.first)
+        #expect(conflict.remoteStatus == .present)
+        #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == false)
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+    }
+
     @Test("Selecting a remote deletion trashes the local conflict file")
     func chooseRemoteDeletion() async throws {
         let testFixture = try await fixture()

@@ -359,7 +359,7 @@ struct BootstrapResumeSafetyTests {
 
         // record Round 1 all produced remote_file_id
         let itemRemoteIdsRound1: [String] = try await store.read { conn in
-            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
+            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE parent_id IS NOT NULL ORDER BY item_id;")
             defer { statement.reset() }
             var res: [String] = []
             while try statement.step() {
@@ -389,7 +389,7 @@ struct BootstrapResumeSafetyTests {
 
         // Assert:SQLite in remote_file_id The sequence is completely unchanged and never regenerated ID!
         let itemRemoteIdsRound3: [String] = try await store.read { conn in
-            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE is_tombstone = 0 AND parent_id IS NOT NULL ORDER BY item_id;")
+            let statement = try conn.cachedStatement("SELECT remote_file_id FROM items WHERE parent_id IS NOT NULL ORDER BY item_id;")
             defer { statement.reset() }
             var res: [String] = []
             while try statement.step() {
@@ -504,7 +504,7 @@ struct BootstrapResumeSafetyTests {
             let currentBaseSha: String?
         }
         let storedFile: FileBaseline = try await store.read { conn in
-            let statement = try conn.cachedStatement("SELECT COUNT(*), remote_file_id, base_sha256 FROM items WHERE entry_kind = 'file' AND is_tombstone = 0;")
+            let statement = try conn.cachedStatement("SELECT COUNT(*), remote_file_id, base_sha256 FROM items WHERE entry_kind = 'file';")
             defer { statement.reset() }
             if try statement.step() {
                 return FileBaseline(itemCount: Int(statement.columnInt64(at: 0) ?? 0), currentRemoteId: statement.columnText(at: 1), currentBaseSha: statement.columnText(at: 2))

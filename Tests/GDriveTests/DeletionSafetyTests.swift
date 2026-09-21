@@ -168,18 +168,15 @@ struct DeletionSafetyTests {
             }
         }
 
-        // Verify SQLite state: remote_status must NOT be 'trashed', phase must be 'blocked', is_tombstone must be 0
+        // Permission loss retains the item in blocked state
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT remote_status, phase FROM items WHERE item_id = ?;")
             stmt.bindInt64(itemId, at: 1)
             #expect(try stmt.step())
             let remoteStatus = stmt.columnText(at: 0)
             let phase = stmt.columnText(at: 1)
-            let isTombstone = stmt.columnInt64(at: 2)
-
             #expect(remoteStatus == "unknown", "Permission lost must NOT be categorized as trashed")
             #expect(phase == "blocked", "Phase should be blocked from deletion")
-            #expect(isTombstone == 0, "Item must not be marked as tombstone")
         }
 
         // Verify Reconciler decision with remoteStatus == unknown: must be waitingEvidence, NEVER deleteLocal
@@ -196,7 +193,7 @@ struct DeletionSafetyTests {
         }
     }
 
-    @Test("trashItem failure does not call removeItem or write tombstone")
+    @Test("trashItem failure does not call removeItem or delete the database row")
     func testTrashFailurePreservesFileAndMarksBlocked() async throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("trash_fail_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -241,12 +238,10 @@ struct DeletionSafetyTests {
             let stmt = try conn.prepare("""
                 INSERT INTO items (
                     root_id, parent_id, name, entry_kind, remote_file_id,
-                    local_status, phase, dirty_generation, is_tombstone,
-                    created_at, updated_at
+                    local_status, phase, dirty_generation, created_at, updated_at
                 ) VALUES (
                     ?, ?, 'important.txt', 'file', 'remote_imp_1',
-                    'present', 'ready', 1, 0,
-                    100, 100
+                    'present', 'ready', 1, 100, 100
                 );
             """)
             stmt.bindInt64(rootId, at: 1)
@@ -259,7 +254,7 @@ struct DeletionSafetyTests {
         func performLocalDelete(simulatedTrashSucceeds: Bool) async throws {
             if simulatedTrashSucceeds {
                 try await store.batchWrite { conn in
-                    let stmt = try conn.prepare("UPDATE items SET is_tombstone = 1, phase = 'committed' WHERE item_id = ?;")
+                    let stmt = try conn.prepare("DELETE FROM items WHERE item_id = ?;")
                     stmt.bindInt64(itemId, at: 1)
                     _ = try stmt.step()
                 }
@@ -281,16 +276,13 @@ struct DeletionSafetyTests {
         let currentContent = try String(contentsOf: testFile, encoding: .utf8)
         #expect(currentContent == originalContent)
 
-        // 2. Database record is NOT a tombstone and is marked 'blocked'
+        // 2. Database record remains and is marked blocked
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT phase, is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT phase FROM items WHERE item_id = ?;")
             stmt.bindInt64(itemId, at: 1)
             #expect(try stmt.step())
             let phase = stmt.columnText(at: 0)
-            let isTombstone = stmt.columnInt64(at: 1)
-
             #expect(phase == "blocked")
-            #expect(isTombstone == 0, "Item must NOT be marked tombstone when trash fails")
         }
     }
 }

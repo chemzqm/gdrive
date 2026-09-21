@@ -79,7 +79,7 @@ struct DirectoryBarrierTests {
         return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
-    @Test("Scenario 1: Local directory deleted but remote child modified -> conflict retained, parent directory recreated, remote parent NOT trashed")
+    @Test("Scenario 1: Local directory deletion trashes the remote subtree")
     func testLocalDirDeletedRemoteChildModified() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test1_\(UUID().uuidString)")
@@ -222,37 +222,21 @@ struct DirectoryBarrierTests {
             auth: auth, store: store, client: client, conflictDirectory: conflictDirectory)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
-        // Verification:
-        // 1. The remote parent directory must not be trash
-        #expect(!trashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must NOT be trashed due to descendant barrier")
-
-        // 2. The directory barrier restores the parent, while the modified remote child is
-        // retained as a conflict instead of overwriting the local deletion.
+        #expect(trashedRemoteFolders.contains(parentDirRemoteId))
         let downloadedSubDir = localRootDir.appendingPathComponent("sub")
         let downloadedFile = downloadedSubDir.appendingPathComponent("child.txt")
-        #expect(FileManager.default.fileExists(atPath: downloadedSubDir.path), "Local parent directory must be recreated on disk")
+        #expect(!FileManager.default.fileExists(atPath: downloadedSubDir.path))
         #expect(!FileManager.default.fileExists(atPath: downloadedFile.path))
-
-        let conflicts = try await engine.listConflicts(localPath: localRootDir.path)
-        let conflict = try #require(conflicts.first)
-        #expect(conflict.relativePath == "sub/child.txt")
-        #expect(conflict.remoteStatus == .present)
-        let conflictPath = try #require(conflict.conflictPath)
-        #expect(try String(contentsOfFile: conflictPath, encoding: .utf8) == newRemoteContent)
-
-        // 3. Database status:sub of local_status Revert to present,child.txt also for present
+        #expect(try await engine.listConflicts(localPath: localRootDir.path).isEmpty)
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
             #expect(try stmt.step())
-            #expect(stmt.columnText(at: 0) == "present", "sub local_status must be present")
-            #expect(stmt.columnText(at: 1) == "present", "sub remote_status must be present")
-            #expect(stmt.columnText(at: 2) == "committed")
-            #expect(stmt.columnInt64(at: 3) == 0, "sub must not be tombstone")
+            #expect(stmt.columnInt64(at: 0) == 0)
         }
     }
 
-    @Test("Scenario 2: Remote directory trashed but local child newly created -> child uploaded, remote folder untrashed, local parent directory NOT deleted")
+    @Test("Scenario 2: Remote directory deletion trashes the local subtree")
     func testRemoteDirTrashedLocalChildNewlyAdded() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test2_\(UUID().uuidString)")
@@ -378,28 +362,19 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
-        // Verification:
-        // 1. The local directory and new files are still intact on the disk and have never been deleted.
-        #expect(FileManager.default.fileExists(atPath: subDir.path), "Local sub directory must NOT be deleted")
-        #expect(FileManager.default.fileExists(atPath: localNewFile.path), "Local child file must remain intact")
-
-        // 2. The remote directory is executed untrash
-        #expect(untrashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must be untrashed to protect child upload")
-        #expect(uploadedFiles.contains("local_new.txt"), "Local child must be uploaded after its durable ID is allocated")
-
-        // 3. Database status:sub of remote_status Revert to present,is_tombstone for 0
+        #expect(!FileManager.default.fileExists(atPath: subDir.path))
+        #expect(!FileManager.default.fileExists(atPath: localNewFile.path))
+        #expect(!untrashedRemoteFolders.contains(parentDirRemoteId))
+        #expect(!uploadedFiles.contains("local_new.txt"))
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
             #expect(try stmt.step())
-            #expect(stmt.columnText(at: 0) == "present")
-            #expect(stmt.columnText(at: 1) == "present", "sub remote_status must be restored to present")
-            #expect(stmt.columnText(at: 2) == "committed")
-            #expect(stmt.columnInt64(at: 3) == 0, "sub must not be tombstoned")
+            #expect(stmt.columnInt64(at: 0) == 0)
         }
     }
 
-    @Test("Scenario 3: Remote deletion stays blocked until conditional metadata updates are verified")
+    @Test("Scenario 3: Nested local directory deletions trash remote directories bottom up")
     func testBottomUpDirectorySafeCleanup() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test3_\(UUID().uuidString)")
@@ -554,27 +529,18 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
-        #expect(trashedRemoteOrder.isEmpty)
-
-        // No item may be tombstoned. The file deletion intent remains blocked; its
-        // ancestor barriers are restored because that child still exists remotely.
+        #expect(trashedRemoteOrder == [childDirRemoteId, parentDirRemoteId])
         try await store.read { conn in
-            let all = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id IN (?, ?, ?) AND is_tombstone = 0;")
+            let all = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id IN (?, ?, ?);")
             all.bindInt64(level1ItemId, at: 1)
             all.bindInt64(level2ItemId, at: 2)
             all.bindInt64(fileItemId, at: 3)
             #expect(try all.step())
-            #expect(all.columnInt64(at: 0) == 3)
-
-            let file = try conn.prepare("SELECT phase, dirty_generation FROM items WHERE item_id = ?;")
-            file.bindInt64(fileItemId, at: 1)
-            #expect(try file.step())
-            #expect(file.columnText(at: 0) == "blocked")
-            #expect((file.columnInt64(at: 1) ?? 0) > 0)
+            #expect(all.columnInt64(at: 0) == 0)
         }
     }
 
-    @Test("Scenario 4: remote child download honors generation and directory barrier (A04/A11)", arguments: ["none", "local_generation", "remote_generation", "dirty_generation"])
+    @Test("Scenario 4: Local directory deletion wins over pending remote descendants", arguments: ["none", "local_generation", "remote_generation", "dirty_generation"])
     func testLocalDirDeletedRemoteChildNewlyAdded(invalidation: String) async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("barrier_test4_\(UUID().uuidString)")
@@ -710,40 +676,22 @@ struct DirectoryBarrierTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
         try await engine.syncIncremental(localPath: localRootDir.path)
 
-        // Verification:
-        // 1. The remote parent directory is never trash
-        #expect(!trashedRemoteFolders.contains(parentDirRemoteId), "Remote parent folder must NOT be trashed due to descendant barrier")
-
-        // 2. local sub The directory is rebuilt,remote_added.txt The file was downloaded correctly
+        #expect(trashedRemoteFolders.contains(parentDirRemoteId))
         let subDirURL = localRootDir.appendingPathComponent("sub")
         let downloadedFile = subDirURL.appendingPathComponent("remote_added.txt")
-        #expect(FileManager.default.fileExists(atPath: subDirURL.path), "Local sub directory must be recreated")
-        #expect(FileManager.default.fileExists(atPath: downloadedFile.path) == (invalidation == "none"))
-
-        let fileContentOnDisk = try? String(contentsOf: downloadedFile, encoding: .utf8)
-        #expect(fileContentOnDisk == (invalidation == "none" ? newRemoteContent : nil))
+        #expect(!FileManager.default.fileExists(atPath: subDirURL.path))
+        #expect(!FileManager.default.fileExists(atPath: downloadedFile.path))
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT dirty_generation, base_sha256 FROM items WHERE remote_file_id = ?;")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE remote_file_id = ?;")
             stmt.bindText(newChildRemoteId, at: 1)
             #expect(try stmt.step())
-            if invalidation == "none" {
-                #expect(stmt.columnInt64(at: 0) == 0)
-                #expect(stmt.columnText(at: 1) == newFileSha256)
-            } else {
-                #expect((stmt.columnInt64(at: 0) ?? 0) > 0)
-                #expect(stmt.columnText(at: 1) == nil)
-            }
+            #expect(stmt.columnInt64(at: 0) == 0)
         }
-
-        // 3. in database sub The directory is restored to present / committed
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status, remote_status, phase, is_tombstone FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
             stmt.bindInt64(subDirItemId, at: 1)
             #expect(try stmt.step())
-            #expect(stmt.columnText(at: 0) == "present")
-            #expect(stmt.columnText(at: 1) == "present")
-            #expect(stmt.columnText(at: 2) == "committed")
-            #expect(stmt.columnInt64(at: 3) == 0)
+            #expect(stmt.columnInt64(at: 0) == 0)
         }
     }
 
@@ -883,17 +831,13 @@ struct DirectoryBarrierTests {
         // 2. Local subdirectories that become empty are also safely moved to the Trash
         #expect(!FileManager.default.fileExists(atPath: subDir.path))
 
-        // 3. Both are in the database tombstone
+        // 3. Both rows are physically deleted
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT is_tombstone FROM items WHERE item_id IN (?, ?);")
+            let stmt = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id IN (?, ?);")
             stmt.bindInt64(subDirItemId, at: 1)
             stmt.bindInt64(childFileItemId, at: 2)
-            var count = 0
-            while try stmt.step() {
-                #expect(stmt.columnInt64(at: 0) == 1)
-                count += 1
-            }
-            #expect(count == 2)
+            #expect(try stmt.step())
+            #expect(stmt.columnInt64(at: 0) == 0)
         }
     }
 }

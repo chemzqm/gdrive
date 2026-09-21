@@ -354,16 +354,13 @@ struct ChangesRecoveryTests {
 
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
 
-        #expect(stats.filesDeleted == 0)
+        #expect(stats.filesDeleted == 1)
         #expect(!FileManager.default.fileExists(atPath: localDirectory.path))
         let retained = try await testFixture.store.read { conn in
             let queryStatement = try conn.prepare(
-                "SELECT is_tombstone, local_status, phase, dirty_generation FROM items WHERE remote_file_id = 'known-directory';")
+                "SELECT COUNT(*) FROM items WHERE remote_file_id = 'known-directory';")
             guard try queryStatement.step() else { return false }
             return queryStatement.columnInt64(at: 0) == 0
-                && queryStatement.columnText(at: 1) == "absent"
-                && queryStatement.columnText(at: 2) == "blocked"
-                && (queryStatement.columnInt64(at: 3) ?? 0) > 0
         }
         #expect(retained)
     }
@@ -781,7 +778,7 @@ struct ChangesRecoveryTests {
                 queryStatement.bindText(name, at: 3); queryStatement.bindText(name, at: 4)
                 _ = try queryStatement.step()
             }
-            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT item_id FROM items INDEXED BY idx_items_local_name_key WHERE root_id = 1 AND parent_id = 1 AND gdrive_name_key(name) = gdrive_name_key('a') AND is_tombstone = 0;")
+            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT item_id FROM items INDEXED BY idx_items_local_name_key WHERE root_id = 1 AND parent_id = 1 AND gdrive_name_key(name) = gdrive_name_key('a');")
             #expect(try plan.step())
             #expect(plan.columnText(at: 3)?.contains("idx_items_local_name_key") == true)
             let queryStatement = try conn.prepare("SELECT COUNT(*) FROM items WHERE gdrive_name_key(name) = gdrive_name_key('A');")
@@ -987,7 +984,7 @@ struct ChangesRecoveryTests {
 
         let baseline = try await testFixture.store.read { conn -> StoredBaseline in
             let stmt = try conn.prepare(
-                "SELECT entry_kind, remote_file_id, dirty_generation FROM items WHERE root_id = \(testFixture.rootID) AND parent_id = \(testFixture.rootItemID) AND name = '\(name)' AND is_tombstone = 0;")
+                "SELECT entry_kind, remote_file_id, dirty_generation FROM items WHERE root_id = \(testFixture.rootID) AND parent_id = \(testFixture.rootItemID) AND name = '\(name)';")
             defer { stmt.reset() }
             #expect(try stmt.step())
             return StoredBaseline(
@@ -1052,7 +1049,7 @@ struct ChangesRecoveryTests {
         #expect(names.contains("b.txt"))
         let storedNames = try await testFixture.store.read { conn -> Set<String> in
             let query = try conn.prepare(
-                "SELECT name FROM items WHERE root_id = \(testFixture.rootID) AND entry_kind = 'file' AND is_tombstone = 0;")
+                "SELECT name FROM items WHERE root_id = \(testFixture.rootID) AND entry_kind = 'file';")
             defer { query.reset() }
             var result = Set<String>()
             while try query.step(), let name = query.columnText(at: 0) { result.insert(name) }
@@ -1098,14 +1095,13 @@ struct ChangesRecoveryTests {
 
         #expect(stats.filesUploaded == 1)
         #expect(scanCount.withLock { $0 } == 0)
-        let siblingState = try await testFixture.store.read { conn -> (String?, Int64?) in
-            let stmt = try conn.prepare("SELECT local_status, is_tombstone FROM items WHERE name = 'sibling.txt';")
+        let siblingState = try await testFixture.store.read { conn -> String? in
+            let stmt = try conn.prepare("SELECT local_status FROM items WHERE name = 'sibling.txt';")
             defer { stmt.reset() }
             #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnInt64(at: 1))
+            return stmt.columnText(at: 0)
         }
-        #expect(siblingState.0 == "present")
-        #expect(siblingState.1 == 0)
+        #expect(siblingState == "present")
     }
 
     @Test("A directory watcher event creates its parent then scans exactly that subtree")
@@ -1163,16 +1159,15 @@ struct ChangesRecoveryTests {
             onProgress: nil, localChanges: [.deleted(path: local.path, isDirectory: false)])
         #expect(context.value.state.withLock { $0.files[remote.id]?.trashed != true })
         let observed = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_sha256, local_status, is_tombstone, dirty_generation, phase FROM items WHERE remote_file_id = 'remote-recreated';")
+            let stmt = try conn.prepare("SELECT local_sha256, local_status, dirty_generation, phase FROM items WHERE remote_file_id = 'remote-recreated';")
             defer { stmt.reset() }
             #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnText(at: 1), stmt.columnInt64(at: 2), stmt.columnInt64(at: 3), stmt.columnText(at: 4))
+            return (stmt.columnText(at: 0), stmt.columnText(at: 1), stmt.columnInt64(at: 2), stmt.columnText(at: 3))
         }
         #expect(observed.0 == SyncEngine.computeSha256(of: current))
         #expect(observed.1 == "present")
-        #expect(observed.2 == 0)
-        #expect((observed.3 ?? 0) > 0)
-        #expect(observed.4 == "blocked")
+        #expect((observed.2 ?? 0) > 0)
+        #expect(observed.3 == "blocked")
     }
 
     @Test("A root modification persists a descendant hash failure while completing a healthy upload")
@@ -1294,13 +1289,12 @@ struct ChangesRecoveryTests {
         }
         #expect(context.value.state.withLock { $0.files[remote.id]?.trashed != true })
         let state = try await testFixture.store.read { conn in
-            let stmt = try conn.prepare("SELECT local_status, is_tombstone FROM items WHERE remote_file_id = 'remote-tracked-file';")
+            let stmt = try conn.prepare("SELECT local_status FROM items WHERE remote_file_id = 'remote-tracked-file';")
             defer { stmt.reset() }
             #expect(try stmt.step())
-            return (stmt.columnText(at: 0), stmt.columnInt64(at: 1))
+            return stmt.columnText(at: 0)
         }
-        #expect(state.0 == "present")
-        #expect(state.1 == 0)
+        #expect(state == "present")
     }
 
     @Test("A vanished observation does not abort later files or become a deletion")
@@ -1353,11 +1347,11 @@ struct ChangesRecoveryTests {
         #expect(stats.filesUploaded == 1)
         #expect(context.value.state.withLock { $0.files.values.contains { $0.name == "healthy" } })
         let preserved = try await testFixture.store.read { conn in
-            let query = try conn.prepare("SELECT local_status, is_tombstone, base_sha256, dirty_generation, phase, local_sha256 FROM items WHERE name = 'vanished';")
+            let query = try conn.prepare("SELECT local_status, base_sha256, dirty_generation, phase, local_sha256 FROM items WHERE name = 'vanished';")
             guard try query.step() else { return false }
-            return query.columnText(at: 0) == "unknown" && query.columnInt64(at: 1) == 0
-                && query.columnText(at: 2) == oldSHA && (query.columnInt64(at: 3) ?? 0) > 0
-                && query.columnText(at: 4) == "waitingEvidence" && query.columnText(at: 5) == oldSHA
+            return query.columnText(at: 0) == "unknown"
+                && query.columnText(at: 1) == oldSHA && (query.columnInt64(at: 2) ?? 0) > 0
+                && query.columnText(at: 3) == "waitingEvidence" && query.columnText(at: 4) == oldSHA
         }
         #expect(preserved)
         #expect(!context.value.state.withLock { $0.requests.contains { $0.contains("remote-vanished") } })
@@ -1471,10 +1465,9 @@ struct ChangesRecoveryTests {
             #expect(try queryStatement.step())
             #expect(queryStatement.columnText(at: 0) == "committed")
             #expect(queryStatement.columnInt64(at: 1) == 0)
-            let tail = try conn.prepare("SELECT local_status, is_tombstone FROM items WHERE name = 'slow-tail';")
+            let tail = try conn.prepare("SELECT local_status FROM items WHERE name = 'slow-tail';")
             #expect(try tail.step())
             #expect(tail.columnText(at: 0) == "present")
-            #expect(tail.columnInt64(at: 1) == 0)
         }
         #expect(context.value.state.withLock { $0.requests.filter { $0.contains("/upload/") }.count } == 1)
     }
@@ -1516,7 +1509,7 @@ struct ChangesRecoveryTests {
             let queryStatement = try conn.prepare("SELECT COUNT(*) FROM items WHERE entry_kind = 'file' AND local_sha256 = base_sha256 AND dirty_generation = 0 AND local_generation = 1;")
             #expect(try queryStatement.step())
             #expect(queryStatement.columnInt64(at: 0) == 1000)
-            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT items.item_id FROM json_each('[1,2,3]') selected CROSS JOIN items ON items.item_id = selected.value WHERE items.root_id = 1 AND items.dirty_generation > 0 AND items.is_tombstone = 0;")
+            let plan = try conn.prepare("EXPLAIN QUERY PLAN SELECT items.item_id FROM json_each('[1,2,3]') selected CROSS JOIN items ON items.item_id = selected.value WHERE items.root_id = 1 AND items.dirty_generation > 0;")
             var details: [String] = []
             while try plan.step() { details.append(plan.columnText(at: 3) ?? "") }
             #expect(details.contains { $0.contains("SEARCH items USING INTEGER PRIMARY KEY") })

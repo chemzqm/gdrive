@@ -19,6 +19,7 @@ final class IncrementalSyncRun: Sendable {
     let directoryContext: DirectoryContext
     let syncSemaphore: AsyncSemaphore
     let syncGroup: DispatchGroup
+    let itemTaskRegistry: ItemTaskRegistry
     let actionTracker: ActionTracker
     let scheduled: OSAllocatedUnfairLock<Set<Int64>>
     let startedTransfers: OSAllocatedUnfairLock<Bool>
@@ -46,6 +47,7 @@ final class IncrementalSyncRun: Sendable {
         directoryContext: DirectoryContext,
         syncSemaphore: AsyncSemaphore,
         syncGroup: DispatchGroup,
+        itemTaskRegistry: ItemTaskRegistry,
         actionTracker: ActionTracker,
         scheduled: OSAllocatedUnfairLock<Set<Int64>>,
         startedTransfers: OSAllocatedUnfairLock<Bool>,
@@ -72,6 +74,7 @@ final class IncrementalSyncRun: Sendable {
         self.directoryContext = directoryContext
         self.syncSemaphore = syncSemaphore
         self.syncGroup = syncGroup
+        self.itemTaskRegistry = itemTaskRegistry
         self.actionTracker = actionTracker
         self.scheduled = scheduled
         self.startedTransfers = startedTransfers
@@ -195,7 +198,8 @@ extension IncrementalSyncRun {
             remoteChanges: remoteChanges, remoteGate: remoteGate,
             directoryContext: directoryContext,
             syncSemaphore: AsyncSemaphore(count: effectiveSyncConcurrency),
-            syncGroup: DispatchGroup(), actionTracker: ActionTracker(),
+            syncGroup: DispatchGroup(), itemTaskRegistry: ItemTaskRegistry(),
+            actionTracker: ActionTracker(),
             scheduled: OSAllocatedUnfairLock(initialState: Set<Int64>()),
             startedTransfers: OSAllocatedUnfairLock(initialState: false),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
@@ -225,8 +229,20 @@ extension IncrementalSyncRun {
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
             return !remoteGate.blocks(path) && isInLocalScope(path)
         }
-        let fileItems = eligibleItems.filter { $0.entryKind == "file" }
         let dirItems = eligibleItems.filter { $0.entryKind == "directory" }
+        let deletionRoots = dirItems.compactMap { item -> String? in
+            let unilateralDeletion =
+                (item.local?.status == .absent && item.remote?.status == .present)
+                || (item.remote?.status == .trashed && item.local?.status == .present)
+            guard unilateralDeletion else { return nil }
+            return directoryContext.getRelPath(for: item.itemId)
+        }
+        let fileItems = eligibleItems.filter { item in
+            guard item.entryKind == "file" else { return false }
+            let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
+            let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
+            return !deletionRoots.contains { root in path == root || path.hasPrefix(root + "/") }
+        }
         do {
             try await scheduleFiles(fileItems, duringScan: false)
         } catch {

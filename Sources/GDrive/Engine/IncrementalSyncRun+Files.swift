@@ -156,7 +156,8 @@ extension IncrementalSyncRun {
         try await acquireTransfer()
         engine.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
         syncGroup.enter()
-        Task {
+        do {
+            _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             var createIntent = item.pendingCreate
             defer {
                 engine.monitor.finishUpload(id: item.name)
@@ -333,7 +334,7 @@ extension IncrementalSyncRun {
                             dirty_generation = 0,
                             updated_at = ?
                         WHERE item_id = ? AND local_generation = ?
-                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                            AND remote_generation = ? AND dirty_generation = ?;
                         """)
                     stmt.bindText(uploadedFile.id, at: 1)
                     stmt.bindInt64(dev, at: 2)
@@ -376,6 +377,13 @@ extension IncrementalSyncRun {
             } catch {
                 await handleUploadFailure(error, item: item, createIntent: createIntent)
             }
+            }
+        } catch {
+            engine.monitor.finishUpload(id: item.name)
+            syncSemaphore.signal()
+            syncGroup.leave()
+            notifier.addCompleted(files: 1, bytes: upBytes)
+            throw error
         }
     }
 
@@ -386,7 +394,8 @@ extension IncrementalSyncRun {
         try await acquireTransfer()
         engine.monitor.enqueueDownload(id: downId, name: item.name, totalBytes: downSize)
         syncGroup.enter()
-        Task {
+        do {
+            _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             defer {
                 engine.monitor.finishDownload(id: downId)
                 syncSemaphore.signal()
@@ -431,7 +440,7 @@ extension IncrementalSyncRun {
                             let stmt = try conn.cachedStatement(
                                 """
                                 SELECT 1 FROM items WHERE item_id = ? AND local_generation = ?
-                                    AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                                    AND remote_generation = ? AND dirty_generation = ?;
                                 """)
                             defer { stmt.reset() }
                             stmt.bindInt64(item.itemId, at: 1)
@@ -475,7 +484,7 @@ extension IncrementalSyncRun {
                             dirty_generation = 0,
                             updated_at = ?
                         WHERE item_id = ? AND local_generation = ?
-                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                            AND remote_generation = ? AND dirty_generation = ?;
                         """)
                     stmt.bindInt64(Int64(mtime), at: 1)
                     stmt.bindInt64(published.device, at: 2)
@@ -506,97 +515,41 @@ extension IncrementalSyncRun {
                 actionTracker.recordDatabaseFailure(error)
                 engine.logger.error("Incremental download failed [\(item.name)]: \(error)")
             }
+            }
+        } catch {
+            engine.monitor.finishDownload(id: downId)
+            syncSemaphore.signal()
+            syncGroup.leave()
+            notifier.addCompleted(files: 1, bytes: downSize)
+            throw error
         }
     }
 
     private func scheduleRemoteDeletion(_ item: DirtyRecord) async throws {
-        // Drive's metadata PATCH precondition contract has not been demonstrated by the
-        // real-service contract test. A GET followed by PATCH still permits a newer
-        // remote revision to arrive between the requests, so retain the deletion intent.
-        try await engine.store.write { conn in
-            let stmt = try conn.cachedStatement(
-                """
-                UPDATE items SET phase = 'blocked', updated_at = ?
-                WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                    AND dirty_generation = ? AND is_tombstone = 0;
-                """)
-            stmt.bindDouble(Date().timeIntervalSince1970, at: 1)
-            stmt.bindInt64(item.itemId, at: 2)
-            stmt.bindInt64(item.localGeneration, at: 3)
-            stmt.bindInt64(item.remoteGeneration, at: 4)
-            stmt.bindInt64(item.dirtyGeneration, at: 5)
-            _ = try stmt.step()
-            stmt.reset()
-        }
-        engine.logger.error(
-            "Remote file deletion blocked because Drive conditional metadata updates are unverified [\(item.name)]"
-        )
+        try await engine.cleanupLocalDeletionToRemoteUnlocked(
+            itemID: item.itemId,
+            expected: ItemCleanupGenerations(
+                local: item.localGeneration, remote: item.remoteGeneration,
+                dirty: item.dirtyGeneration),
+            taskRegistry: itemTaskRegistry)
+        actionTracker.counts.withLock { $0.deleted += 1 }
     }
 
     private func deleteLocalFile(_ item: DirtyRecord) async throws {
-        let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
-        let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-        let localFileURL = rootURL.appendingPathComponent(relPath)
-        let trashSucceeded: Bool
-        do {
-            trashSucceeded = try LocalDeletionSafety.trashFileIfUnchanged(
-                at: localFileURL,
-                expectedDevice: item.localDevice,
-                expectedInode: item.localInode,
-                expectedMtime: item.localMtime,
-                expectedSize: item.local?.size,
-                expectedSHA256: item.local?.sha256)
-        } catch {
-            engine.logger.warning(
-                "Unable to safely move local file to Trash [\(relPath)]: \(error). Keeping the deletion pending."
-            )
-            trashSucceeded = false
-        }
-
-        if trashSucceeded {
-            try await engine.store.batchWrite { conn in
-                let stmt = try conn.cachedStatement(
-                    """
-                    UPDATE items SET is_tombstone = 1, phase = 'committed', dirty_generation = 0, updated_at = ?
-                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                        AND dirty_generation = ? AND is_tombstone = 0;
-                    """)
-                stmt.bindDouble(self.now, at: 1)
-                stmt.bindInt64(item.itemId, at: 2)
-                stmt.bindInt64(item.localGeneration, at: 3)
-                stmt.bindInt64(item.remoteGeneration, at: 4)
-                stmt.bindInt64(item.dirtyGeneration, at: 5)
-                _ = try stmt.step()
-                stmt.reset()
-                guard conn.changes == 1 else {
-                    throw SyncEngineError.general(
-                        "Local deletion receipt is stale; the newer generation remains pending: \(relPath)")
-                }
-            }
-            actionTracker.counts.withLock { $0.deleted += 1 }
-        } else {
-            try await engine.store.batchWrite { conn in
-                let stmt = try conn.cachedStatement(
-                    """
-                    UPDATE items SET phase = 'blocked', updated_at = ?
-                    WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                        AND dirty_generation = ? AND is_tombstone = 0;
-                    """)
-                stmt.bindDouble(self.now, at: 1)
-                stmt.bindInt64(item.itemId, at: 2)
-                stmt.bindInt64(item.localGeneration, at: 3)
-                stmt.bindInt64(item.remoteGeneration, at: 4)
-                stmt.bindInt64(item.dirtyGeneration, at: 5)
-                _ = try stmt.step()
-                stmt.reset()
-            }
-        }
+        try await engine.cleanupRemoteDeletionToLocalUnlocked(
+            itemID: item.itemId,
+            expected: ItemCleanupGenerations(
+                local: item.localGeneration, remote: item.remoteGeneration,
+                dirty: item.dirtyGeneration),
+            taskRegistry: itemTaskRegistry)
+        actionTracker.counts.withLock { $0.deleted += 1 }
     }
 
     private func scheduleConflict(_ item: DirtyRecord, winner: ConflictWinner, conflictId: String) async throws {
         try await acquireTransfer()
         syncGroup.enter()
-        Task {
+        do {
+            _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             defer {
                 syncSemaphore.signal()
                 syncGroup.leave()
@@ -643,6 +596,11 @@ extension IncrementalSyncRun {
                 engine.logger.error(
                     "Failed to handle file conflicts [\(item.name)]: \(error)")
             }
+            }
+        } catch {
+            syncSemaphore.signal()
+            syncGroup.leave()
+            throw error
         }
     }
 
@@ -690,6 +648,16 @@ extension IncrementalSyncRun {
             try await scheduleConflict(item, winner: winner, conflictId: conflictId)
 
         case .unchanged:
+            if item.local?.status == .absent && item.remote?.status == .trashed {
+                try await engine.cleanupRemoteDeletionToLocalUnlocked(
+                    itemID: item.itemId,
+                    expected: ItemCleanupGenerations(
+                        local: item.localGeneration, remote: item.remoteGeneration,
+                        dirty: item.dirtyGeneration),
+                    taskRegistry: itemTaskRegistry)
+                actionTracker.counts.withLock { $0.deleted += 1 }
+                break
+            }
             receipts.append { conn in
                 let stmt = try conn.cachedStatement(
                     "UPDATE items SET dirty_generation = 0 WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;"

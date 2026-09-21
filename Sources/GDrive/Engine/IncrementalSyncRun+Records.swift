@@ -47,7 +47,7 @@ extension IncrementalSyncRun {
                     ORDER BY candidate.created_at DESC
                     LIMIT 1
                 )
-                WHERE items.root_id = ?1 AND items.dirty_generation > 0 AND items.is_tombstone = 0;
+                WHERE items.root_id = ?1 AND items.dirty_generation > 0;
                 """)
             stmt.bindInt64(self.rootID, at: 1)
             if let encodedIDs { stmt.bindText(encodedIDs, at: 2) }
@@ -134,7 +134,7 @@ extension IncrementalSyncRun {
                 """
                 SELECT item_id, parent_id, name
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'file' AND local_status IN (\(localStatuses)) AND is_tombstone = 0;
+                WHERE root_id = ? AND entry_kind = 'file' AND local_status IN (\(localStatuses));
                 """)
             stmt.bindInt64(rootID, at: 1)
             var deletedIds: [Int64] = []
@@ -157,7 +157,7 @@ extension IncrementalSyncRun {
                 """
                 SELECT item_id, parent_id, name
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'directory' AND parent_id IS NOT NULL AND local_status = 'present' AND is_tombstone = 0;
+                WHERE root_id = ? AND entry_kind = 'directory' AND parent_id IS NOT NULL AND local_status = 'present';
                 """)
             dirStmt.bindInt64(rootID, at: 1)
             while try dirStmt.step() {

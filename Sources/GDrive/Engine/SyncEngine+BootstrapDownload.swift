@@ -106,7 +106,7 @@ extension SyncEngine {
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
             ) VALUES (?, NULL, ?, 'directory', ?, ?, ?)
-            ON CONFLICT (root_id) WHERE parent_id IS NULL AND is_tombstone = 0 DO UPDATE SET updated_at = excluded.updated_at;
+            ON CONFLICT (root_id) WHERE parent_id IS NULL DO UPDATE SET updated_at = excluded.updated_at;
             """)
             itemStmt.bindInt64(rId, at: 1)
             itemStmt.bindText(rootURL.lastPathComponent, at: 2)
@@ -116,7 +116,7 @@ extension SyncEngine {
             _ = try itemStmt.step()
             itemStmt.reset()
 
-            let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
+            let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
             itemQuery.bindInt64(rId, at: 1)
             guard try itemQuery.step(), let rItemId = itemQuery.columnInt64(at: 0) else {
                 throw NSError(domain: "SyncEngine", code: 14, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root item_id"])
@@ -167,7 +167,7 @@ extension SyncEngine {
                         ?, ?,
                         ?, ?
                     )
-                    ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                    ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                     DO UPDATE SET
                         remote_file_id = excluded.remote_file_id,
                         local_mtime = excluded.local_mtime, local_size = excluded.local_size,
@@ -262,7 +262,7 @@ extension SyncEngine {
                             root_id, parent_id, name, entry_kind, remote_file_id,
                             phase, created_at, updated_at
                         ) VALUES (?, ?, ?, 'directory', ?, 'committed', ?, ?)
-                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                        ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                         DO UPDATE SET updated_at = excluded.updated_at WHERE items.remote_file_id = excluded.remote_file_id;
                         """)
                         stmt.bindInt64(rootId, at: 1)
@@ -279,7 +279,7 @@ extension SyncEngine {
                         }
 
                         let qStmt = try conn.cachedStatement("""
-                        SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                        SELECT item_id FROM items WHERE root_id = ? AND parent_id = ? AND name = ?;
                         """)
                         qStmt.bindInt64(rootId, at: 1)
                         qStmt.bindInt64(parentItemId, at: 2)

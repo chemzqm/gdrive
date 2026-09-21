@@ -77,7 +77,7 @@ extension SyncEngine {
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
             ) VALUES (?, NULL, ?, 'directory', ?, ?, ?)
-            ON CONFLICT (root_id) WHERE parent_id IS NULL AND is_tombstone = 0 DO UPDATE SET updated_at = excluded.updated_at;
+            ON CONFLICT (root_id) WHERE parent_id IS NULL DO UPDATE SET updated_at = excluded.updated_at;
             """)
             itemStmt.bindInt64(rId, at: 1)
             itemStmt.bindText(rootURL.lastPathComponent, at: 2)
@@ -87,7 +87,7 @@ extension SyncEngine {
             _ = try itemStmt.step()
             itemStmt.reset()
 
-            let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
+            let itemQuery = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
             itemQuery.bindInt64(rId, at: 1)
             guard try itemQuery.step(), let rItemId = itemQuery.columnInt64(at: 0) else {
                 throw NSError(domain: "SyncEngine", code: 4, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root item_id"])
@@ -136,7 +136,7 @@ extension SyncEngine {
                 let stmt = try conn.cachedStatement("""
                 SELECT item_id, parent_id, name, remote_file_id
                 FROM items
-                WHERE root_id = ? AND entry_kind = 'directory' AND is_tombstone = 0
+                WHERE root_id = ? AND entry_kind = 'directory'
                     AND parent_id IS NOT NULL AND phase = 'committed' AND remote_status = 'present';
                 """)
                 stmt.bindInt64(rootId, at: 1)
@@ -339,7 +339,7 @@ extension SyncEngine {
                     SELECT item_id, remote_file_id, phase, remote_status, base_sha256,
                            local_generation, remote_generation, dirty_generation
                     FROM items
-                    WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                    WHERE root_id = ? AND parent_id = ? AND name = ?;
                     """)
                     stmt.bindInt64(rootId, at: 1)
                     stmt.bindInt64(parentDirItemId, at: 2)
@@ -451,7 +451,7 @@ extension SyncEngine {
                             local_status = 'present', phase = 'committed', dirty_generation = 0,
                             updated_at = ?
                         WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                            AND dirty_generation = ? AND is_tombstone = 0;
+                            AND dirty_generation = ?;
                         """)
                         itemStmt.bindText(uploadedFile.id, at: 1)
                         itemStmt.bindInt64(dev, at: 2)
@@ -507,7 +507,7 @@ extension SyncEngine {
                             1, 'present', 'inFlight', 1,
                             ?, ?
                         )
-                        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+                        ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                         DO UPDATE SET
                             remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
                             local_device = excluded.local_device,
@@ -536,7 +536,7 @@ extension SyncEngine {
 
                         let qStmt = try conn.cachedStatement("""
                         SELECT item_id FROM items
-                        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                        WHERE root_id = ? AND parent_id = ? AND name = ?;
                         """)
                         qStmt.bindInt64(rootId, at: 1)
                         qStmt.bindInt64(parentDirItemId, at: 2)
@@ -577,7 +577,7 @@ extension SyncEngine {
                             dirty_generation = 0,
                             updated_at = ?
                         WHERE root_id = ? AND remote_file_id = ? AND local_generation = ?
-                            AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                            AND remote_generation = ? AND dirty_generation = ?;
                         """)
                         updateStmt.bindText(sha256Hex, at: 1)
                         updateStmt.bindInt64(fileSize, at: 2)
@@ -613,7 +613,7 @@ extension SyncEngine {
                         try await self.store.batchWrite { conn in
                             let stmt = try conn.cachedStatement("""
                             UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
-                            WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+                            WHERE root_id = ? AND parent_id = ? AND name = ?;
                             """)
                             stmt.bindInt64(rootId, at: 1)
                             stmt.bindInt64(parentItemID, at: 2)

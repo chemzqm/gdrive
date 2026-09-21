@@ -284,7 +284,7 @@ struct SyncEngineTests {
 
         #expect(incStats.filesUploaded == 1) // new_local.txt;modify.txt insecure coverage is blocked
         #expect(incStats.filesFailed == 1)
-        #expect(incStats.filesDeleted == 0)  // remote conditional Trash is not verified
+        #expect(incStats.filesDeleted == 1)
         #expect(incStats.filesSkipped >= 1)  // keep.txt
 
         // 4. Add files directly on the remote end and test that remote changes are incrementally pulled locally.
@@ -407,12 +407,12 @@ struct SyncEngineTests {
         let deleteStats = try await engine.syncIncremental(localPath: tempDir.path)
         print("✅ [Lifecycle] Local deletion incremental synchronization completed:")
         print("   Delete items: \(deleteStats.filesDeleted)")
-        #expect(deleteStats.filesDeleted == 0)
+        #expect(deleteStats.filesDeleted == 1)
 
         // Verify that the remote directory has been moved to the recycle bin
         let updatedRemoteChildren = try await client.listChildren(parentId: remoteRoot.id)
         let updatedNames = updatedRemoteChildren.map(\.name)
-        #expect(updatedNames.contains("folder_renamed"))
+        #expect(!updatedNames.contains("folder_renamed"))
 
         // 6. Remote rename: rename in the cloud greeting.txt Rename to remote_renamed.txt
         print("🚀 [Lifecycle] Remote rename: greeting.txt -> remote_renamed.txt...")

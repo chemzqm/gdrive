@@ -308,7 +308,7 @@ public final class SyncEngine: Sendable {
     }
 
     static func normalizedPath(_ path: String) -> String {
-        URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.path
+        RootSyncCoordinator.normalizedPath(path)
     }
 
     private static func normalizedLocalChange(_ change: LocalChange) -> LocalChange {
@@ -384,7 +384,7 @@ public final class SyncEngine: Sendable {
             defer { stmt.reset() }
             guard try stmt.step(), let rootID = stmt.columnInt64(at: 0),
                   let remoteRootID = stmt.columnText(at: 1) else { return nil }
-            let item = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL AND is_tombstone = 0;")
+            let item = try conn.cachedStatement("SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
             item.bindInt64(rootID, at: 1)
             defer { item.reset() }
             guard try item.step(), let rootItem = item.columnInt64(at: 0) else { return nil }

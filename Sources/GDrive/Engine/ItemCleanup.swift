@@ -116,17 +116,36 @@ extension SyncEngine {
     ) async throws {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
         try await withRootSyncLock(localPath: initial.localRootPath) {
-            try await self.executeCleanup(
-                initial: initial, expected: expected, taskRegistry: taskRegistry,
-                removePrimary: { plan in
-                    if let remoteID = plan.remoteID {
-                        try await self.client.trash(remoteId: remoteID)
-                    }
-                    for remoteID in plan.extraRemoteIDs where remoteID != plan.remoteID {
-                        try await self.client.trash(remoteId: remoteID)
-                    }
-                })
+            try await self.cleanupLocalDeletionToRemoteUnlocked(
+                initial: initial, expected: expected, taskRegistry: taskRegistry)
         }
+    }
+
+    func cleanupLocalDeletionToRemoteUnlocked(
+        itemID: Int64,
+        expected: ItemCleanupGenerations,
+        taskRegistry: ItemTaskRegistry
+    ) async throws {
+        let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
+        try await cleanupLocalDeletionToRemoteUnlocked(
+            initial: initial, expected: expected, taskRegistry: taskRegistry)
+    }
+
+    private func cleanupLocalDeletionToRemoteUnlocked(
+        initial: ItemCleanupPlan,
+        expected: ItemCleanupGenerations,
+        taskRegistry: ItemTaskRegistry
+    ) async throws {
+        try await executeCleanup(
+            initial: initial, expected: expected, taskRegistry: taskRegistry,
+            removePrimary: { plan in
+                if let remoteID = plan.remoteID {
+                    try await self.client.trash(remoteId: remoteID)
+                }
+                for remoteID in plan.extraRemoteIDs where remoteID != plan.remoteID {
+                    try await self.client.trash(remoteId: remoteID)
+                }
+            })
     }
 
     func cleanupRemoteDeletionToLocal(
@@ -136,9 +155,29 @@ extension SyncEngine {
     ) async throws {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
         try await withRootSyncLock(localPath: initial.localRootPath) {
-            try await self.executeCleanup(
-                initial: initial, expected: expected, taskRegistry: taskRegistry,
-                removePrimary: { plan in
+            try await self.cleanupRemoteDeletionToLocalUnlocked(
+                initial: initial, expected: expected, taskRegistry: taskRegistry)
+        }
+    }
+
+    func cleanupRemoteDeletionToLocalUnlocked(
+        itemID: Int64,
+        expected: ItemCleanupGenerations,
+        taskRegistry: ItemTaskRegistry
+    ) async throws {
+        let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
+        try await cleanupRemoteDeletionToLocalUnlocked(
+            initial: initial, expected: expected, taskRegistry: taskRegistry)
+    }
+
+    private func cleanupRemoteDeletionToLocalUnlocked(
+        initial: ItemCleanupPlan,
+        expected: ItemCleanupGenerations,
+        taskRegistry: ItemTaskRegistry
+    ) async throws {
+        try await executeCleanup(
+            initial: initial, expected: expected, taskRegistry: taskRegistry,
+            removePrimary: { plan in
                     if plan.entryKind == "directory" {
                         if FileManager.default.fileExists(atPath: plan.localURL.path) {
                             let changes = try self.modifiedFilesBeforeDirectoryTrash(plan)
@@ -171,7 +210,6 @@ extension SyncEngine {
                         }
                     }
                 })
-        }
     }
 
     private func executeCleanup(

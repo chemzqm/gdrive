@@ -96,7 +96,7 @@ enum SyncConflictStore {
                 local_status, remote_status, phase, dirty_generation, created_at, updated_at)
             VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1,
                 'present', 'present', 'blocked', 0, ?, ?)
-            ON CONFLICT(root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+            ON CONFLICT(root_id, parent_id, name) WHERE parent_id IS NOT NULL
             DO UPDATE SET remote_file_id = excluded.remote_file_id,
                 local_device = excluded.local_device, local_inode = excluded.local_inode,
                 local_mtime = excluded.local_mtime, local_size = excluded.local_size,
@@ -389,19 +389,10 @@ extension SyncEngine {
         _ record: SyncConflictStore.Record, storedURL: URL?
     ) async throws {
         try await store.batchWrite { conn in
-            let item = try conn.cachedStatement("""
-            UPDATE items SET is_tombstone = 1, local_status = 'absent',
-                phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;
-            """)
-            item.bindDouble(Date().timeIntervalSince1970, at: 1)
-            item.bindInt64(record.itemID, at: 2)
+            let item = try conn.cachedStatement("DELETE FROM items WHERE item_id = ?;")
+            item.bindInt64(record.itemID, at: 1)
             _ = try item.step()
             item.reset()
-            let remove = try conn.cachedStatement(
-                "DELETE FROM sync_conflicts WHERE conflict_id = ?;")
-            remove.bindText(record.conflict.id, at: 1)
-            _ = try remove.step()
-            remove.reset()
         }
         if let storedURL { try? FileManager.default.removeItem(at: storedURL) }
     }

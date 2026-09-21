@@ -59,7 +59,6 @@ public final class LocalBaselineCache: @unchecked Sendable {
             FROM items
             WHERE root_id = ?
               AND entry_kind = 'file'
-              AND is_tombstone = 0
               AND local_inode IS NOT NULL
               AND phase = 'committed'
               AND base_sha256 IS NOT NULL

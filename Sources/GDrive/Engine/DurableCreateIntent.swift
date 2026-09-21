@@ -238,7 +238,7 @@ enum DurableCreateIntentStore {
             local_device, local_inode, local_status, remote_status,
             local_generation, phase, dirty_generation, created_at, updated_at
         ) VALUES (?, ?, ?, 'directory', ?, ?, ?, 'present', 'unknown', 1, 'inFlight', 1, ?, ?)
-        ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+        ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
         DO UPDATE SET
             remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
             local_device = excluded.local_device,
@@ -288,7 +288,7 @@ enum DurableCreateIntentStore {
                 remote_file_id = COALESCE(remote_file_id, ?),
                 local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?, local_sha256 = ?,
                 local_status = 'present', phase = 'inFlight', dirty_generation = MAX(dirty_generation, 1), updated_at = ?
-            WHERE item_id = ? AND root_id = ? AND entry_kind = 'file' AND is_tombstone = 0;
+            WHERE item_id = ? AND root_id = ? AND entry_kind = 'file';
             """)
             update.bindText(candidateRemoteID, at: 1)
             update.bindInt64(device, at: 2)
@@ -312,7 +312,7 @@ enum DurableCreateIntentStore {
                 local_generation, local_status, remote_status, phase, dirty_generation,
                 created_at, updated_at
             ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, 1, 'present', 'unknown', 'inFlight', 1, ?, ?)
-            ON CONFLICT (root_id, parent_id, name) WHERE is_tombstone = 0 AND parent_id IS NOT NULL
+            ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
             DO UPDATE SET
                 remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
                 local_device = excluded.local_device,
@@ -365,7 +365,7 @@ enum DurableCreateIntentStore {
         let query = try conn.cachedStatement("""
         SELECT item_id, remote_file_id, local_generation, entry_kind
         FROM items
-        WHERE root_id = ? AND parent_id = ? AND name = ? AND is_tombstone = 0;
+        WHERE root_id = ? AND parent_id = ? AND name = ?;
         """)
         query.bindInt64(rootID, at: 1)
         query.bindInt64(parentItemID, at: 2)

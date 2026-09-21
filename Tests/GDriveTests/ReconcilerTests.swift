@@ -83,8 +83,8 @@ struct ReconcilerTests {
         #expect(decision == .deleteLocal)
     }
 
-    @Test("One side deleted and other side modified creates a conflict")
-    func testDeleteAndModifyConflict() {
+    @Test("Local deleted while remote modified creates a conflict")
+    func testLocalDeletedRemoteModifiedConflict() {
         let baseline = ItemBaseline(sha256: baseSha, size: 100)
         let local = LocalObservation(status: .absent)
         let remote = RemoteObservation(status: .present, sha256: modSha1, size: 200)
@@ -92,6 +92,19 @@ struct ReconcilerTests {
         let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
         guard case .conflict = decision else {
             Issue.record("Expected deletion versus modification conflict")
+            return
+        }
+    }
+
+    @Test("Remote deleted while local modified creates a conflict")
+    func testRemoteDeletedLocalModifiedConflict() {
+        let baseline = ItemBaseline(sha256: baseSha, size: 100)
+        let local = LocalObservation(status: .present, sha256: modSha1, size: 200)
+        let remote = RemoteObservation(status: .trashed, sha256: baseSha, size: 100)
+
+        let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
+        guard case .conflict = decision else {
+            Issue.record("Expected modification versus deletion conflict")
             return
         }
     }

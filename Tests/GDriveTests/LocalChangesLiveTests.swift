@@ -289,7 +289,7 @@ struct LocalChangesLiveTests {
                 let statement = try conn.cachedStatement("""
                 SELECT name, remote_file_id, base_sha256, phase
                 FROM items
-                WHERE entry_kind = 'file' AND is_tombstone = 0
+                WHERE entry_kind = 'file'
                 ORDER BY name;
                 """)
                 defer { statement.reset() }
@@ -410,7 +410,6 @@ struct LocalChangesLiveTests {
                 let localGeneration: Int64
                 let dirtyGeneration: Int64
                 let phase: String?
-                let isTombstone: Bool
             }
             // A fresh StateStore must see the failed local observation; watcher
             // queue state is intentionally gone once the round has finished.
@@ -418,9 +417,9 @@ struct LocalChangesLiveTests {
             let blockedRecord: GuardedRecord = try await durableStore.read { conn in
                 let statement = try conn.cachedStatement("""
                 SELECT remote_file_id, local_sha256, base_sha256, local_generation,
-                       dirty_generation, phase, is_tombstone
+                       dirty_generation, phase
                 FROM items
-                WHERE entry_kind = 'file' AND name = ? AND is_tombstone = 0;
+                WHERE entry_kind = 'file' AND name = ?;
                 """)
                 statement.bindText(guardedFile.lastPathComponent, at: 1)
                 defer { statement.reset() }
@@ -433,8 +432,7 @@ struct LocalChangesLiveTests {
                     baseSHA: statement.columnText(at: 2),
                     localGeneration: statement.columnInt64(at: 3) ?? 0,
                     dirtyGeneration: statement.columnInt64(at: 4) ?? 0,
-                    phase: statement.columnText(at: 5),
-                    isTombstone: (statement.columnInt64(at: 6) ?? 0) != 0
+                    phase: statement.columnText(at: 5)
                 )
             }
             // updateMultipart is deliberately blocked by A11; the old remote
@@ -446,7 +444,6 @@ struct LocalChangesLiveTests {
             #expect(blockedRecord.baseSHA?.lowercased() == originalSHA.lowercased())
             #expect(blockedRecord.phase == "blocked")
             #expect(blockedRecord.dirtyGeneration > 0)
-            #expect(!blockedRecord.isTombstone)
             let unchangedRemote = try await client.getFile(remoteId: guardedRemote.id)
             #expect(unchangedRemote.trashed != true)
             #expect(unchangedRemote.sha256Checksum?.lowercased() == originalSHA.lowercased())
@@ -480,9 +477,9 @@ struct LocalChangesLiveTests {
             let afterLaterHealthyRecord: GuardedRecord = try await durableStore.read { conn in
                 let statement = try conn.cachedStatement("""
                 SELECT remote_file_id, local_sha256, base_sha256, local_generation,
-                       dirty_generation, phase, is_tombstone
+                       dirty_generation, phase
                 FROM items
-                WHERE entry_kind = 'file' AND name = ? AND is_tombstone = 0;
+                WHERE entry_kind = 'file' AND name = ?;
                 """)
                 statement.bindText(guardedFile.lastPathComponent, at: 1)
                 defer { statement.reset() }
@@ -495,8 +492,7 @@ struct LocalChangesLiveTests {
                     baseSHA: statement.columnText(at: 2),
                     localGeneration: statement.columnInt64(at: 3) ?? 0,
                     dirtyGeneration: statement.columnInt64(at: 4) ?? 0,
-                    phase: statement.columnText(at: 5),
-                    isTombstone: (statement.columnInt64(at: 6) ?? 0) != 0
+                    phase: statement.columnText(at: 5)
                 )
             }
             #expect(afterLaterHealthyRecord.localGeneration == blockedRecord.localGeneration)
@@ -514,40 +510,24 @@ struct LocalChangesLiveTests {
             }
 
             let remainingChildren = try await client.listChildren(parentId: remoteRoot.id)
-            #expect(remainingChildren.contains(where: { $0.id == guardedRemote.id }))
+            #expect(!remainingChildren.contains(where: { $0.id == guardedRemote.id }))
             let trashedGuardedRemote = try await client.getFile(remoteId: guardedRemote.id)
-            #expect(trashedGuardedRemote.trashed == false)
+            #expect(trashedGuardedRemote.trashed == true)
             let healthyAfterDrain = try #require(remainingChildren.first(where: { $0.id == healthyRemote.id }))
             #expect(healthyAfterDrain.sha256Checksum?.lowercased() == SyncEngine.computeSha256(of: healthyData).lowercased())
 
-            let deletedRecord: GuardedRecord = try await durableStore.read { conn in
+            let deletedRecordExists = try await durableStore.read { conn in
                 let statement = try conn.cachedStatement("""
-                SELECT remote_file_id, local_sha256, base_sha256, local_generation,
-                       dirty_generation, phase, is_tombstone
+                SELECT 1
                 FROM items
                 WHERE entry_kind = 'file' AND name = ?
                 ORDER BY item_id DESC LIMIT 1;
                 """)
                 statement.bindText(guardedFile.lastPathComponent, at: 1)
                 defer { statement.reset() }
-                guard try statement.step() else {
-                    throw SyncEngineError.general("Missing deleted A11 file row")
-                }
-                return GuardedRecord(
-                    remoteID: statement.columnText(at: 0),
-                    localSHA: statement.columnText(at: 1),
-                    baseSHA: statement.columnText(at: 2),
-                    localGeneration: statement.columnInt64(at: 3) ?? 0,
-                    dirtyGeneration: statement.columnInt64(at: 4) ?? 0,
-                    phase: statement.columnText(at: 5),
-                    isTombstone: (statement.columnInt64(at: 6) ?? 0) != 0
-                )
+                return try statement.step()
             }
-            #expect(deletedRecord.remoteID == guardedRemote.id)
-            #expect(deletedRecord.baseSHA?.lowercased() == originalSHA.lowercased())
-            #expect(deletedRecord.phase == "blocked")
-            #expect(deletedRecord.dirtyGeneration > 0)
-            #expect(!deletedRecord.isTombstone)
+            #expect(!deletedRecordExists)
 
             try await client.trash(remoteId: remoteRoot.id)
         } catch {

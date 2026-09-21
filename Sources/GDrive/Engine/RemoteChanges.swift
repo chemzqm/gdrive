@@ -150,7 +150,7 @@ struct RemoteChanges: Sendable {
                     try Self.execute(conn, """
                         UPDATE items SET remote_status = 'unknown', phase = 'waitingEvidence',
                             remote_generation = remote_generation + 1, dirty_generation = dirty_generation + 1
-                        WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
+                        WHERE root_id = ? AND remote_file_id = ?;
                         """, [.int(rootID), .text(change.fileId)])
                 }
                 try Self.execute(conn, """
@@ -225,7 +225,7 @@ struct RemoteChanges: Sendable {
             let known: Set<String> = try await store.read { conn in
                 let queryStatement = try Self.statement(conn, """
                     SELECT remote_file_id FROM items WHERE root_id = ? AND entry_kind = 'directory'
-                        AND remote_status = 'present' AND is_tombstone = 0
+                        AND remote_status = 'present'
                         AND remote_scope_excluded = 0;
                     """, [.int(rootID)])
                 defer { queryStatement.reset() }
@@ -336,7 +336,7 @@ struct RemoteChanges: Sendable {
     private func item(_ conn: SQLiteConnection, remoteID: String) throws -> Item? {
         let queryStatement = try Self.statement(conn, """
             SELECT item_id, parent_id, name, entry_kind, local_device, local_inode, remote_version
-            FROM items WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
+            FROM items WHERE root_id = ? AND remote_file_id = ?;
             """, [.int(rootID), .text(remoteID)])
         defer { queryStatement.reset() }
         guard try queryStatement.step(), let id = queryStatement.columnInt64(at: 0), let name = queryStatement.columnText(at: 2) else { return nil }
@@ -360,7 +360,7 @@ struct RemoteChanges: Sendable {
         try Self.execute(conn, "UPDATE items SET remote_scope_excluded = 1 WHERE root_id = ? AND item_id = ? AND remote_scope_excluded = 0;", [.int(rootID), .int(itemID)])
         try Self.execute(conn, """
             WITH RECURSIVE tree(item_id) AS (
-                SELECT ? UNION ALL SELECT i.item_id FROM items i JOIN tree t ON i.parent_id = t.item_id WHERE i.is_tombstone = 0
+                SELECT ? UNION ALL SELECT i.item_id FROM items i JOIN tree t ON i.parent_id = t.item_id
             ) UPDATE items SET remote_status = 'unknown', phase = 'waitingEvidence', dirty_generation = dirty_generation + 1
             WHERE item_id IN tree;
             """, [.int(itemID)])
@@ -384,7 +384,7 @@ struct RemoteChanges: Sendable {
             if change.file?.trashed == true {
                 try Self.execute(conn, """
                     UPDATE items SET remote_status = 'trashed', phase = 'ready', dirty_generation = dirty_generation + 1
-                    WHERE root_id = ? AND remote_file_id = ? AND is_tombstone = 0;
+                    WHERE root_id = ? AND remote_file_id = ?;
                     """, [.int(rootID), .text(change.fileId)])
                 return true
             }
@@ -404,7 +404,7 @@ struct RemoteChanges: Sendable {
         try RemoteNameMapping.validateDestination(destination, root: rootURL)
         func findLocalCollision() throws -> (Bool, Int64?) {
             let collision = try Self.statement(conn, """
-                SELECT item_id, remote_file_id, name FROM items INDEXED BY idx_items_local_name_key WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?) AND is_tombstone = 0;
+                SELECT item_id, remote_file_id, name FROM items INDEXED BY idx_items_local_name_key WHERE root_id = ? AND parent_id = ? AND gdrive_name_key(name) = gdrive_name_key(?);
                 """, [.int(rootID), .int(parent.id), .text(file.name)])
             var localOnlyID: Int64?
             while try collision.step() {
@@ -525,9 +525,9 @@ struct RemoteChanges: Sendable {
             let queryStatement = try Self.statement(conn, """
                 SELECT COUNT(DISTINCT c.remote_id) FROM remote_change_inbox c
                 CROSS JOIN items p ON p.root_id = c.root_id
-                    AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]') AND p.is_tombstone = 0
+                    AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]')
                 CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
-                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name')) AND i.is_tombstone = 0
+                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name'))
                 WHERE c.root_id = ? AND (i.remote_file_id != c.remote_id
                     OR (i.remote_file_id IS NULL AND i.name != json_extract(c.payload, '$.file.name')));
                 """, [.int(rootID)])
@@ -540,20 +540,18 @@ struct RemoteChanges: Sendable {
     func gate() async throws -> Gate {
         try await store.read { conn in
             let queryStatement = try Self.statement(conn, """
-                SELECT item_id FROM items WHERE root_id = ? AND phase = 'waitingEvidence' AND remote_status = 'unknown' AND is_tombstone = 0
+                SELECT item_id FROM items WHERE root_id = ? AND phase = 'waitingEvidence' AND remote_status = 'unknown'
                 UNION SELECT item_id FROM items WHERE root_id = ? AND remote_scope_excluded = 1
                 UNION SELECT i.item_id FROM remote_change_inbox c JOIN items i
-                    ON i.root_id = c.root_id AND i.remote_file_id = c.remote_id AND i.is_tombstone = 0 WHERE c.root_id = ?
+                    ON i.root_id = c.root_id AND i.remote_file_id = c.remote_id WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_change_inbox c CROSS JOIN items p
-                    ON p.root_id = c.root_id AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]')
-                    AND p.is_tombstone = 0 CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
-                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name'))
-                    AND i.is_tombstone = 0 WHERE c.root_id = ?
+                    ON p.root_id = c.root_id AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]') CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
+                    AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name')) WHERE c.root_id = ?
                 UNION SELECT i.item_id FROM remote_directory_scans d JOIN items i
-                    ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id AND i.is_tombstone = 0 WHERE d.root_id = ? AND d.state = 'pending'
+                    ON i.root_id = d.root_id AND i.remote_file_id = d.remote_id WHERE d.root_id = ? AND d.state = 'pending'
                 UNION SELECT item_id FROM sync_conflicts WHERE root_id = ?
                 UNION SELECT item_id FROM items
-                    WHERE root_id = ? AND phase = 'conflict' AND is_tombstone = 0;
+                    WHERE root_id = ? AND phase = 'conflict';
                 """, Array(repeating: .int(rootID), count: 7))
             var ids: Set<Int64> = []
             while try queryStatement.step() { if let id = queryStatement.columnInt64(at: 0) { ids.insert(id) } }

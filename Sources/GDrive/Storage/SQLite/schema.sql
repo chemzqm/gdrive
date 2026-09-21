@@ -83,9 +83,6 @@ CREATE TABLE IF NOT EXISTS items (
         'committed', 'conflict', 'blocked'
     )),
     dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK (dirty_generation >= 0),
-    is_tombstone INTEGER NOT NULL DEFAULT 0 CHECK (is_tombstone IN (0, 1)),
-    tombstone_generation INTEGER CHECK (tombstone_generation IS NULL OR tombstone_generation >= 0),
-
     -- Conflict resolution tracking (§11.3)
     conflict_id TEXT,
     conflict_winner TEXT CHECK (conflict_winner IS NULL OR conflict_winner IN ('local', 'remote')),
@@ -96,25 +93,25 @@ CREATE TABLE IF NOT EXISTS items (
     CHECK (parent_id IS NOT NULL OR entry_kind = 'directory')
 );
 
--- Unique non-tombstone name under the same parent
+-- Unique name under the same parent
 CREATE UNIQUE INDEX IF NOT EXISTS idx_items_parent_name
     ON items(root_id, parent_id, name)
-    WHERE is_tombstone = 0 AND parent_id IS NOT NULL;
+    WHERE parent_id IS NOT NULL;
 
 -- Single root entry per synchronized pair
 CREATE UNIQUE INDEX IF NOT EXISTS idx_items_root_entry
     ON items(root_id)
-    WHERE parent_id IS NULL AND is_tombstone = 0;
+    WHERE parent_id IS NULL;
 
 -- Fast lookup by remote Drive fileId
 CREATE INDEX IF NOT EXISTS idx_items_remote_file_id
     ON items(root_id, remote_file_id)
-    WHERE remote_file_id IS NOT NULL AND is_tombstone = 0;
+    WHERE remote_file_id IS NOT NULL;
 
 -- Fast lookup by local inode identity during scanner walk (§6.2)
 CREATE INDEX IF NOT EXISTS idx_items_local_identity
     ON items(root_id, local_device, local_inode)
-    WHERE local_inode IS NOT NULL AND is_tombstone = 0;
+    WHERE local_inode IS NOT NULL;
 
 -- Dirty items query for scheduler/reconciler
 CREATE INDEX IF NOT EXISTS idx_items_dirty
@@ -251,7 +248,7 @@ CREATE INDEX IF NOT EXISTS idx_trashed_local_changes_root
 
 -- Nonunique to retain distinct item identities when local names are equivalent.
 CREATE INDEX IF NOT EXISTS idx_items_local_name_key
-ON items(root_id, parent_id, gdrive_name_key(name)) WHERE is_tombstone = 0;
+ON items(root_id, parent_id, gdrive_name_key(name));
 
 -- Scope protection belongs to the item; exclude roots and their descendants at query time.
 CREATE INDEX IF NOT EXISTS idx_items_scope_excluded

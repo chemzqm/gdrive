@@ -61,7 +61,7 @@ struct ConflictOperation: Codable, Sendable {
             }
             let reserve = try conn.cachedStatement("""
                 UPDATE items SET phase = 'conflict', conflict_id = ?, conflict_winner = 'remote'
-                WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ? AND is_tombstone = 0;
+                WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
                 """)
             reserve.bindText(id, at: 1)
             reserve.bindInt64(itemID, at: 2)
@@ -117,7 +117,7 @@ struct ConflictOperation: Codable, Sendable {
     func isPlanCurrent(_ conn: SQLiteConnection) throws -> Bool {
         let queryStatement = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND local_generation = ? AND remote_generation = ?
-                AND dirty_generation = ? AND is_tombstone = 0 AND conflict_id = ?;
+                AND dirty_generation = ? AND conflict_id = ?;
             """)
         defer { queryStatement.reset() }
         queryStatement.bindInt64(itemID, at: 1)
@@ -129,7 +129,7 @@ struct ConflictOperation: Codable, Sendable {
         let copy = try conn.cachedStatement("""
             SELECT 1 FROM items WHERE item_id = ? AND remote_file_id = ? AND root_id = ?
                 AND local_generation = 0 AND remote_generation = 0 AND dirty_generation = 1
-                AND phase = 'conflict' AND is_tombstone = 0;
+                AND phase = 'conflict';
             """)
         defer { copy.reset() }
         copy.bindInt64(copyItemID, at: 1)
