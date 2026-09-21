@@ -118,12 +118,20 @@ struct LocalChangesLiveTests {
             }
         }
 
+        // Allocate the root plus all five objects created by this fixture in
+        // one real Drive request, while keeping the pool private to the test.
+        let fixtureIDs = try await client.generateIds(count: 6)
+        try #require(fixtureIDs.count == 6)
+        let remoteID = fixtureIDs[0]
+        let fixtureIDPool = IDPool(api: nil, initialIds: Array(fixtureIDs.dropFirst()))
+
         let gate = PendingLocalChangesScanGate()
         let store = try await StateStore(path: databasePath)
         let engine = try await SyncEngine(
             auth: auth,
             store: store,
             client: client,
+            idPool: fixtureIDPool,
             incrementalScan: { request, consume in
                 // The scanner has completed its real traversal before the gate
                 // closes, so later writes cannot leak into this scan's input.
@@ -132,7 +140,6 @@ struct LocalChangesLiveTests {
             }
         )
 
-        let remoteID = try #require(try await client.generateIds(count: 1).first)
         let remoteRoot: DriveFile
         do {
             remoteRoot = try await client.createDirectory(
@@ -374,9 +381,21 @@ struct LocalChangesLiveTests {
             }
         }
 
+        // Allocate the root and the three files created by this fixture in one
+        // real Drive request. With no refill API, an ID count regression fails
+        // this test instead of silently making another request.
+        let fixtureIDs = try await client.generateIds(count: 4)
+        try #require(fixtureIDs.count == 4)
+        let remoteID = fixtureIDs[0]
+        let fixtureIDPool = IDPool(api: nil, initialIds: Array(fixtureIDs.dropFirst()))
+
         let store = try await StateStore(path: databasePath)
-        let engine = try await SyncEngine(auth: auth, store: store, client: client)
-        let remoteID = try #require(try await client.generateIds(count: 1).first)
+        let engine = try await SyncEngine(
+            auth: auth,
+            store: store,
+            client: client,
+            idPool: fixtureIDPool
+        )
         let remoteRoot: DriveFile
         do {
             remoteRoot = try await client.createDirectory(

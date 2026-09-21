@@ -238,9 +238,15 @@ struct SyncEngineTests {
         try "Original modify content".write(to: secondFile, atomically: true, encoding: .utf8)
         try "Delete me soon".write(to: thirdFile, atomically: true, encoding: .utf8)
 
-        let remoteRootGenIds = try await client.generateIds(count: 1)
+        // Allocate every ID used by this fixture in one real Drive request. The
+        // isolated pool has no refill API so uploads cannot issue a second,
+        // oversized generateIds request during this test.
+        let fixtureIDs = try await client.generateIds(count: 6)
+        try #require(fixtureIDs.count == 6)
         let remoteRootName = "inc_test_\(UUID().uuidString.prefix(8))"
-        let remoteRootID = try #require(remoteRootGenIds.first)
+        let remoteRootID = fixtureIDs[0]
+        let remoteFileID = fixtureIDs[1]
+        let fixtureIDPool = IDPool(api: nil, initialIds: Array(fixtureIDs.dropFirst(2)))
         try await withRemoteTestDirectoryCleanup(client: client, remoteID: remoteRootID) {
             let remoteRoot = try await client.createDirectory(name: remoteRootName, parentId: rootID, remoteId: remoteRootID)
 
@@ -252,7 +258,12 @@ struct SyncEngineTests {
             }
 
             let store = try await StateStore(path: testDbPath)
-            let engine = try await SyncEngine(auth: auth, store: store, client: client)
+            let engine = try await SyncEngine(
+                auth: auth,
+                store: store,
+                client: client,
+                idPool: fixtureIDPool
+            )
 
             // 1. First sync:3 Upload all
             print("🚀 Perform incremental testing pre-initial sync...")
@@ -280,7 +291,6 @@ struct SyncEngineTests {
 
             // 4. Add files directly on the remote end and test that remote changes are incrementally pulled locally.
             print("🚀 Add files remotely and test Changes incremental download...")
-            let remoteFileIds = try await client.generateIds(count: 1)
             let remoteContent = Data("Content generated on Google Drive at \(Date())".utf8)
             var ctx = CC_SHA256_CTX()
             CC_SHA256_Init(&ctx)
@@ -292,7 +302,7 @@ struct SyncEngineTests {
             _ = try await client.uploadMultipart(
                 name: "from_remote.txt",
                 parentId: remoteRoot.id,
-                remoteId: try #require(remoteFileIds.first),
+                remoteId: remoteFileID,
                 content: remoteContent,
                 expectedSha256: expectedSha
             )
@@ -341,9 +351,13 @@ struct SyncEngineTests {
         let fItem = folder1.appendingPathComponent("item.txt")
         try "Item in folder1".write(to: fItem, atomically: true, encoding: .utf8)
 
-        let remoteRootGenIds = try await client.generateIds(count: 1)
+        // The root, one directory, and two files all use IDs from this single
+        // real Drive allocation request.
+        let fixtureIDs = try await client.generateIds(count: 4)
+        try #require(fixtureIDs.count == 4)
         let remoteRootName = "lifecycle_test_\(UUID().uuidString.prefix(8))"
-        let remoteRootID = try #require(remoteRootGenIds.first)
+        let remoteRootID = fixtureIDs[0]
+        let fixtureIDPool = IDPool(api: nil, initialIds: Array(fixtureIDs.dropFirst()))
         try await withRemoteTestDirectoryCleanup(client: client, remoteID: remoteRootID) {
             let remoteRoot = try await client.createDirectory(name: remoteRootName, parentId: rootID, remoteId: remoteRootID)
 
@@ -355,7 +369,12 @@ struct SyncEngineTests {
             }
 
             let store = try await StateStore(path: testDbPath)
-            let engine = try await SyncEngine(auth: auth, store: store, client: client)
+            let engine = try await SyncEngine(
+                auth: auth,
+                store: store,
+                client: client,
+                idPool: fixtureIDPool
+            )
 
             // 1. Initial synchronization: upload directories and files
             print("🚀 [Lifecycle] initial sync...")
