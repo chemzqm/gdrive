@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct ItemCleanupGenerations: Sendable, Equatable {
@@ -10,6 +11,8 @@ private struct ItemCleanupIntentPayload: Codable, Sendable, Equatable {
     let localGeneration: Int64
     let remoteGeneration: Int64
     let dirtyGeneration: Int64
+    let localDevice: Int64?
+    let localInode: Int64?
 
     var generations: ItemCleanupGenerations {
         ItemCleanupGenerations(
@@ -18,9 +21,24 @@ private struct ItemCleanupIntentPayload: Codable, Sendable, Equatable {
 }
 
 private struct PendingItemCleanup: Sendable {
+    let operationID: String
     let itemID: Int64
     let operationType: String
-    let generations: ItemCleanupGenerations
+    let payload: ItemCleanupIntentPayload
+}
+
+private struct CleanupLocalIdentity: Sendable, Equatable {
+    let device: Int64
+    let inode: Int64
+
+    static func read(at url: URL) throws -> CleanupLocalIdentity? {
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return CleanupLocalIdentity(device: Int64(value.st_dev), inode: Int64(value.st_ino))
+    }
 }
 
 actor ItemTaskRegistry {
@@ -245,11 +263,18 @@ extension SyncEngine {
         await taskRegistry.blockCancelAndDrain(itemIDs: ids)
         do {
             let plan = try await makeCleanupPlan(itemID: initial.itemID, expected: expected)
-            let operationID = try await prepareCleanupIntent(
+            let intent = try await prepareCleanupIntent(
                 plan: plan, operationType: operationType)
-            try await removePrimary(plan, operationID)
+            guard try cleanupPreconditionStillHolds(
+                plan: plan, operationType: operationType, payload: intent.payload
+            ) else {
+                try await discardCleanupIntent(operationID: intent.operationID)
+                await taskRegistry.unblock(itemIDs: ids)
+                return
+            }
+            try await removePrimary(plan, intent.operationID)
             try removeCleanupArtifacts(plan)
-            try await deleteCleanupRows(plan, operationID: operationID)
+            try await deleteCleanupRows(plan, operationID: intent.operationID)
             await taskRegistry.unblock(itemIDs: ids)
         } catch {
             await taskRegistry.unblock(itemIDs: ids)
@@ -263,7 +288,7 @@ extension SyncEngine {
         let pending = try await store.read { conn -> [PendingItemCleanup] in
             let stmt = try conn.prepare(
                 """
-                SELECT item_id, operation_type, payload FROM operations
+                SELECT operation_id, item_id, operation_type, payload FROM operations
                 WHERE root_id = ? AND operation_type IN ('trashRemote', 'deleteLocal')
                     AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome')
                 ORDER BY created_at, operation_id;
@@ -271,28 +296,35 @@ extension SyncEngine {
             defer { stmt.reset() }
             stmt.bindInt64(rootID, at: 1)
             var result: [PendingItemCleanup] = []
-            while try stmt.step(), let itemID = stmt.columnInt64(at: 0),
-                  let operationType = stmt.columnText(at: 1),
-                  let payload = stmt.columnText(at: 2) {
+            while try stmt.step(), let operationID = stmt.columnText(at: 0),
+                  let itemID = stmt.columnInt64(at: 1),
+                  let operationType = stmt.columnText(at: 2),
+                  let payload = stmt.columnText(at: 3) {
                 let decoded = try JSONDecoder().decode(
                     ItemCleanupIntentPayload.self, from: Data(payload.utf8))
                 result.append(PendingItemCleanup(
-                    itemID: itemID, operationType: operationType,
-                    generations: decoded.generations))
+                    operationID: operationID, itemID: itemID, operationType: operationType,
+                    payload: decoded))
             }
             return result
         }
         for cleanup in pending {
             let plan = try await makeCleanupPlan(
-                itemID: cleanup.itemID, expected: cleanup.generations)
+                itemID: cleanup.itemID, expected: cleanup.payload.generations)
             do {
+                guard try cleanupPreconditionStillHolds(
+                    plan: plan, operationType: cleanup.operationType, payload: cleanup.payload
+                ) else {
+                    try await discardCleanupIntent(operationID: cleanup.operationID)
+                    continue
+                }
                 if cleanup.operationType == "trashRemote" {
                     try await cleanupLocalDeletionToRemoteUnlocked(
-                        itemID: cleanup.itemID, expected: cleanup.generations,
+                        itemID: cleanup.itemID, expected: cleanup.payload.generations,
                         taskRegistry: taskRegistry)
                 } else {
                     try await cleanupRemoteDeletionToLocalUnlocked(
-                        itemID: cleanup.itemID, expected: cleanup.generations,
+                        itemID: cleanup.itemID, expected: cleanup.payload.generations,
                         taskRegistry: taskRegistry)
                 }
             } catch {
@@ -314,11 +346,13 @@ extension SyncEngine {
 
     private func prepareCleanupIntent(
         plan: ItemCleanupPlan, operationType: String
-    ) async throws -> String {
+    ) async throws -> (operationID: String, payload: ItemCleanupIntentPayload) {
         let payload = ItemCleanupIntentPayload(
             localGeneration: plan.generations.local,
             remoteGeneration: plan.generations.remote,
-            dirtyGeneration: plan.generations.dirty)
+            dirtyGeneration: plan.generations.dirty,
+            localDevice: operationType == "deleteLocal" ? plan.localDevice : nil,
+            localInode: operationType == "deleteLocal" ? plan.localInode : nil)
         guard let payloadText = String(
             bytes: try JSONEncoder().encode(payload), encoding: .utf8) else {
             throw SyncEngineError.general("Unable to encode cleanup intent: \(plan.itemID)")
@@ -341,7 +375,7 @@ extension SyncEngine {
                     throw SyncEngineError.general(
                         "Existing cleanup intent does not match item: \(plan.itemID)")
                 }
-                return operationID
+                return (operationID, decoded)
             }
             let operationID = UUID().uuidString
             let now = Date().timeIntervalSince1970
@@ -362,7 +396,28 @@ extension SyncEngine {
             insert.bindDouble(now, at: 8)
             insert.bindDouble(now, at: 9)
             _ = try insert.step()
-            return operationID
+            return (operationID, payload)
+        }
+    }
+
+    private func cleanupPreconditionStillHolds(
+        plan: ItemCleanupPlan, operationType: String, payload: ItemCleanupIntentPayload
+    ) throws -> Bool {
+        let current = try CleanupLocalIdentity.read(at: plan.localURL)
+        if operationType == "trashRemote" {
+            return current == nil
+        }
+        guard let current else { return true }
+        guard let device = payload.localDevice, let inode = payload.localInode else { return false }
+        return current == CleanupLocalIdentity(device: device, inode: inode)
+    }
+
+    private func discardCleanupIntent(operationID: String) async throws {
+        try await store.write { conn in
+            let stmt = try conn.prepare("DELETE FROM operations WHERE operation_id = ?;")
+            defer { stmt.reset() }
+            stmt.bindText(operationID, at: 1)
+            _ = try stmt.step()
         }
     }
 

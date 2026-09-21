@@ -5,6 +5,8 @@ import Testing
 
 private struct CleanupRequestState: Sendable {
     var trashed: [String] = []
+    var trashAttempts: [String] = []
+    var failNextTrash = false
 }
 
 private final class CleanupProtocol: URLProtocol, @unchecked Sendable {
@@ -13,11 +15,20 @@ private final class CleanupProtocol: URLProtocol, @unchecked Sendable {
 
     override func startLoading() {
         let context = TestHTTPContext<OSAllocatedUnfairLock<CleanupRequestState>>.value(for: request)!
-        if request.httpMethod == "PATCH" {
-            context.withLock { $0.trashed.append(request.url!.lastPathComponent) }
-        }
+        let statusCode = if request.httpMethod == "PATCH" {
+            context.withLock { state in
+                state.trashAttempts.append(request.url!.lastPathComponent)
+                if state.failNextTrash {
+                    state.failNextTrash = false
+                    return 400
+                } else {
+                    state.trashed.append(request.url!.lastPathComponent)
+                    return 204
+                }
+            }
+        } else { 204 }
         let response = HTTPURLResponse(
-            url: request.url!, statusCode: 204, httpVersion: nil, headerFields: nil)!
+            url: request.url!, statusCode: statusCode, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocolDidFinishLoading(self)
     }
@@ -235,6 +246,7 @@ struct ItemCleanupTests {
         let modified = directory.appendingPathComponent("modified.txt")
         let unchanged = directory.appendingPathComponent("unchanged.txt")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let directoryIdentity = try #require(try LocalDirectoryIdentity.read(at: directory))
         let baselineModified = Data("old".utf8)
         let observedModified = Data("new".utf8)
         let baselineUnchanged = Data("same".utf8)
@@ -244,12 +256,15 @@ struct ItemCleanupTests {
             let directoryStmt = try conn.prepare(
                 """
                 INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode,
                     local_status, remote_status, phase, dirty_generation, created_at, updated_at)
-                VALUES (?, ?, 'removed', 'directory', 'removed-directory', 'present', 'trashed',
+                VALUES (?, ?, 'removed', 'directory', 'removed-directory', ?, ?, 'present', 'trashed',
                     'ready', 1, 1, 1);
                 """)
             directoryStmt.bindInt64(fixture.rootID, at: 1)
             directoryStmt.bindInt64(fixture.rootItemID, at: 2)
+            directoryStmt.bindInt64(directoryIdentity.device, at: 3)
+            directoryStmt.bindInt64(directoryIdentity.inode, at: 4)
             _ = try directoryStmt.step()
             let id = conn.lastInsertRowId
             let fileStmt = try conn.prepare(
@@ -302,6 +317,7 @@ struct ItemCleanupTests {
         let nested = child.appendingPathComponent("nested.txt")
         let sibling = fixture.localRoot.appendingPathComponent("nested.txt")
         try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        let childIdentity = try #require(try LocalDirectoryIdentity.read(at: child))
         try Data("child".utf8).write(to: nested)
         try Data("sibling".utf8).write(to: sibling)
         let nestedVersion = try #require(try LocalFileVersion.read(at: nested))
@@ -310,13 +326,16 @@ struct ItemCleanupTests {
             let directory = try conn.prepare(
                 """
                 INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode,
                     local_status, remote_status, phase, dirty_generation, created_at, updated_at)
-                VALUES (?, ?, ?, 'directory', 'same-named-child', 'present', 'trashed',
+                VALUES (?, ?, ?, 'directory', 'same-named-child', ?, ?, 'present', 'trashed',
                     'ready', 1, 1, 1);
                 """)
             directory.bindInt64(fixture.rootID, at: 1)
             directory.bindInt64(fixture.rootItemID, at: 2)
             directory.bindText(fixture.localRoot.lastPathComponent, at: 3)
+            directory.bindInt64(childIdentity.device, at: 4)
+            directory.bindInt64(childIdentity.inode, at: 5)
             _ = try directory.step()
             let directoryID = conn.lastInsertRowId
             let file = try conn.prepare(
@@ -409,6 +428,50 @@ struct ItemCleanupTests {
         }
     }
 
+    @Test("Pending remote trash stops after the local item is restored")
+    func pendingRemoteTrashStopsAfterLocalRestore() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let local = fixture.localRoot.appendingPathComponent("restored.txt")
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_status, remote_status, phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'restored.txt', 'file', 'remote-restored', 'absent', 'present',
+                    'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            _ = try stmt.step()
+            return conn.lastInsertRowId
+        }
+        context.value.withLock { $0.failNextTrash = true }
+
+        await #expect(throws: Error.self) {
+            try await fixture.engine.cleanupLocalDeletionToRemote(
+                itemID: itemID,
+                expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+                taskRegistry: ItemTaskRegistry())
+        }
+        try Data("restored".utf8).write(to: local)
+
+        #expect(try await fixture.engine.recoverPendingItemCleanups(
+            rootID: fixture.rootID, taskRegistry: ItemTaskRegistry()) == 1)
+        #expect(context.value.withLock { $0.trashAttempts } == ["remote-restored"])
+        try await fixture.store.read { conn in
+            let item = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
+            item.bindInt64(itemID, at: 1)
+            #expect(try item.step())
+            #expect(item.columnInt64(at: 0) == 1)
+            let operation = try conn.prepare(
+                "SELECT COUNT(*) FROM operations WHERE item_id = ? AND operation_type = 'trashRemote';")
+            operation.bindInt64(itemID, at: 1)
+            #expect(try operation.step())
+            #expect(operation.columnInt64(at: 0) == 0)
+        }
+    }
+
     @Test("Local trash survives a database cleanup failure and resumes from its intent")
     func localTrashIntentRecovery() async throws {
         let fixture = try await fixture()
@@ -459,6 +522,63 @@ struct ItemCleanupTests {
                 #expect(try stmt.step())
                 #expect(stmt.columnInt64(at: 0) == 0)
             }
+        }
+    }
+
+    @Test("Cleanup replay does not trash a replacement directory")
+    func cleanupReplayDoesNotTrashReplacementDirectory() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let local = fixture.localRoot.appendingPathComponent("replaced")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        let originalIdentity = try #require(try LocalDirectoryIdentity.read(at: local))
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status, phase,
+                    dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'replaced', 'directory', 'remote-replaced', ?, ?, 'present',
+                    'trashed', 'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            stmt.bindInt64(originalIdentity.device, at: 3)
+            stmt.bindInt64(originalIdentity.inode, at: 4)
+            _ = try stmt.step()
+            let id = conn.lastInsertRowId
+            try conn.execute(
+                "CREATE TRIGGER fail_cleanup BEFORE DELETE ON items WHEN OLD.item_id = \(id) " +
+                    "BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END;")
+            return id
+        }
+
+        await #expect(throws: Error.self) {
+            try await fixture.engine.cleanupRemoteDeletionToLocal(
+                itemID: itemID,
+                expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+                taskRegistry: ItemTaskRegistry())
+        }
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        let replacement = local.appendingPathComponent("new.txt")
+        try Data("new".utf8).write(to: replacement)
+        let replacementIdentity = try #require(try LocalDirectoryIdentity.read(at: local))
+        #expect(replacementIdentity != originalIdentity)
+        try await fixture.store.write { try $0.execute("DROP TRIGGER fail_cleanup;") }
+
+        #expect(try await fixture.engine.recoverPendingItemCleanups(
+            rootID: fixture.rootID, taskRegistry: ItemTaskRegistry()) == 1)
+        #expect(try Data(contentsOf: replacement) == Data("new".utf8))
+        try await fixture.store.read { conn in
+            let item = try conn.prepare("SELECT COUNT(*) FROM items WHERE item_id = ?;")
+            item.bindInt64(itemID, at: 1)
+            #expect(try item.step())
+            #expect(item.columnInt64(at: 0) == 1)
+            let operation = try conn.prepare(
+                "SELECT COUNT(*) FROM operations WHERE item_id = ? AND operation_type = 'deleteLocal';")
+            operation.bindInt64(itemID, at: 1)
+            #expect(try operation.step())
+            #expect(operation.columnInt64(at: 0) == 0)
         }
     }
 }
