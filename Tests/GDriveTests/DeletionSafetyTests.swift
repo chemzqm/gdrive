@@ -25,10 +25,10 @@ struct DeletionSafetyTests {
         #expect(try String(contentsOf: file, encoding: .utf8) == "modified")
     }
 
-    @Test("A file created after deletion isolation remains visible")
-    func localDeletionPreservesPostIsolationFile() throws {
+    @Test("A matching file is moved to Trash using its original path")
+    func localDeletionTrashesOriginalPath() throws {
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("local-delete-isolation-\(UUID().uuidString)")
+            .appendingPathComponent("local-delete-original-path-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("document.txt")
@@ -37,17 +37,18 @@ struct DeletionSafetyTests {
         let expected = try #require(observed)
         let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
 
+        var trashedURL: URL?
         let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
             expectedMtime: expected.mtime, expectedSize: expected.size, expectedSHA256: sha,
-            afterIsolation: { try Data("new version".utf8).write(to: file) })
+            trash: { url, _ in trashedURL = url })
 
-        #expect(!deleted)
-        #expect(try String(contentsOf: file, encoding: .utf8) == "new version")
+        #expect(deleted)
+        #expect(trashedURL == file)
     }
 
-    @Test("A trash failure restores the isolated local file")
-    func localDeletionRestoresAfterTrashFailure() throws {
+    @Test("A trash failure leaves the original local file in place")
+    func localDeletionKeepsFileAfterTrashFailure() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("local-delete-trash-failure-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
