@@ -19,6 +19,34 @@ final class SeenItemsTracker: @unchecked Sendable {
         return seen.contains("\(parentId):\(name)")
     }
 }
+
+final class FailedDirectorySubtrees: @unchecked Sendable {
+    private struct Entry {
+        let path: String
+        let device: Int64
+        let inode: Int64
+    }
+
+    private var entries: [Entry] = []
+    private var lock = os_unfair_lock()
+
+    func register(path: String, device: Int64, inode: Int64) {
+        os_unfair_lock_lock(&lock)
+        entries.append(Entry(path: path, device: device, inode: inode))
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func blocks(path: String, device: Int64, inode: Int64, isDirectory: Bool) -> Bool {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        return entries.contains { entry in
+            if path.hasPrefix(entry.path + "/") { return true }
+            return isDirectory && path == entry.path
+                && device == entry.device && inode == entry.inode
+        }
+    }
+}
+
 final class ScanProgress: @unchecked Sendable {
     var scanned = 0
     var skipped = 0
@@ -52,6 +80,43 @@ final class ScanProgress: @unchecked Sendable {
 }
 
 extension IncrementalSyncRun {
+    func preserveStoredDirectorySubtree(itemID: Int64) async throws {
+        struct StoredNode: Sendable {
+            let parentID: Int64
+            let name: String
+            let kind: String
+        }
+        let nodes: [StoredNode] = try await engine.store.read { conn in
+            let stmt = try conn.prepare(
+                """
+                WITH RECURSIVE subtree(item_id) AS (
+                    SELECT ?
+                    UNION ALL
+                    SELECT child.item_id FROM items child
+                    JOIN subtree parent ON child.parent_id = parent.item_id
+                )
+                SELECT item.parent_id, item.name, item.entry_kind
+                FROM items item JOIN subtree ON subtree.item_id = item.item_id
+                WHERE item.parent_id IS NOT NULL;
+                """)
+            defer { stmt.reset() }
+            stmt.bindInt64(itemID, at: 1)
+            var result: [StoredNode] = []
+            while try stmt.step(), let parentID = stmt.columnInt64(at: 0),
+                  let name = stmt.columnText(at: 1), let kind = stmt.columnText(at: 2) {
+                result.append(StoredNode(parentID: parentID, name: name, kind: kind))
+            }
+            return result
+        }
+        for node in nodes {
+            if node.kind == "directory" {
+                seenDirTracker.markSeen(parentId: node.parentID, name: node.name)
+            } else {
+                seenTracker.markSeen(parentId: node.parentID, name: node.name)
+            }
+        }
+    }
+
     func scanLocal() async throws {
         let baselineCache = try await LocalBaselineCache.load(store: engine.store, rootId: rootID)
         let baselineFilePaths = try await engine.store.read { conn -> Set<String> in
@@ -239,6 +304,7 @@ extension IncrementalSyncRun {
         let directoryContext = self.directoryContext
         let seenTracker = self.seenTracker
         let seenDirTracker = self.seenDirTracker
+        let failedDirectorySubtrees = self.failedDirectorySubtrees
         let scanProgress = self.scanProgress
 
         @Sendable func directoryParentID(
@@ -338,7 +404,7 @@ extension IncrementalSyncRun {
 
         @Sendable func renameOrMoveDirectory(
             existing: ExistingLocalItem, parentItemId: Int64, name: String,
-            dev: Int64, ino: Int64
+            relPath: String, dev: Int64, ino: Int64
         ) async throws {
             seenDirTracker.markSeen(parentId: existing.parentId, name: existing.name)
             do {
@@ -365,7 +431,9 @@ extension IncrementalSyncRun {
                     itemId: existing.itemId, parentItemId: parentItemId, name: name,
                     remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
             } catch {
-                if DatabaseFailure.isSQLite(error) { throw error }
+                if self.shouldAbortRun(for: error) { throw error }
+                failedDirectorySubtrees.register(path: relPath, device: dev, inode: ino)
+                try await self.preserveStoredDirectorySubtree(itemID: existing.itemId)
                 let path = directoryContext.getRelPath(for: existing.itemId) ?? existing.name
                 await self.recordIssue(
                     error, stage: .pathUpdate,
@@ -426,8 +494,10 @@ extension IncrementalSyncRun {
                 seenDirTracker.markSeen(parentId: parentItemId, name: name)
                 scanProgress.incDirs()
             } catch {
-                if DatabaseFailure.isSQLite(error) { throw error }
+                if self.shouldAbortRun(for: error) { throw error }
+                failedDirectorySubtrees.register(path: relPath, device: dev, inode: ino)
                 if let intent {
+                    seenDirTracker.markSeen(parentId: parentItemId, name: name)
                     try await DurableCreateIntentStore.markUnknownOutcome(
                         store: engine.store,
                         operationID: intent.operationID,
@@ -483,7 +553,8 @@ extension IncrementalSyncRun {
             if let existing = existingDir,
                 existing.name != name || existing.parentId != parentItemId {
                 try await renameOrMoveDirectory(
-                    existing: existing, parentItemId: parentItemId, name: name, dev: dev, ino: ino)
+                    existing: existing, parentItemId: parentItemId, name: name,
+                    relPath: relPath, dev: dev, ino: ino)
             } else if directoryContext.getItemId(byRelPath: relPath) == nil {
                 try await createLocalDirectory(
                     relPath: relPath, parentItemId: parentItemId, name: name, dev: dev, ino: ino)
@@ -644,6 +715,12 @@ extension IncrementalSyncRun {
                     relPath != ".git", !relPath.hasPrefix(".git/")
                 else { continue }
                 if remoteGate.blocks(relPath) {
+                    continue
+                }
+                if failedDirectorySubtrees.blocks(
+                    path: relPath, device: record.dev, inode: record.ino,
+                    isDirectory: record.type == .directory
+                ) {
                     continue
                 }
                 let name = (relPath as NSString).lastPathComponent

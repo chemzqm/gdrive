@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import os
 import Testing
 @testable import GDrive
 
@@ -76,7 +77,7 @@ struct FailureStateSafetyTests {
         )
     }
 
-    @Test("Directory rename failure does not commit new name to SQLite; retrying succeeds")
+    @Test("Failed directory move does not abort a healthy sibling; retrying succeeds")
     func testDirectoryRenameFailurePreservesBaselineAndRetries() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_dir_rename_\(UUID().uuidString)")
@@ -87,6 +88,10 @@ struct FailureStateSafetyTests {
         let dirA = localRootDir.appendingPathComponent("dir_A")
         let childDirectory = dirA.appendingPathComponent("sub")
         try FileManager.default.createDirectory(at: childDirectory, withIntermediateDirectories: true)
+        let goodFile = localRootDir.appendingPathComponent("good.txt")
+        let goodData = Data("healthy sibling".utf8)
+        try goodData.write(to: goodFile)
+        let goodSHA = SyncEngine.computeSha256(of: goodData)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -168,6 +173,7 @@ struct FailureStateSafetyTests {
         try FileManager.default.moveItem(at: dirA, to: dirB)
 
         let control = FailureControlState()
+        let requestOrder = OSAllocatedUnfairLock(initialState: [String]())
 
         context.value.requestHandler = { request in
             let url = try #require(request.url)
@@ -188,10 +194,18 @@ struct FailureStateSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = Data(#"{"ids": ["mock_id_gen"]}"#.utf8)
+                let json = Data(#"{"ids": ["mock_id_gen", "good-file"]}"#.utf8)
+                return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
+            }
+            if request.httpMethod == "POST" && path.hasSuffix("/upload/drive/v3/files") {
+                requestOrder.withLock { $0.append("good") }
+                let json = Data("""
+                {"id":"good-file","name":"good.txt","size":"\(goodData.count)","sha256Checksum":"\(goodSHA)","version":"1"}
+                """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(dirARemoteId)") {
+                requestOrder.withLock { $0.append("move") }
                 if control.shouldFail {
                     // Inject 500 internal server error
                     let errJson = Data(#"{"error": {"code": 500, "message": "Simulated Drive failure"}}"#.utf8)
@@ -214,13 +228,11 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while updateMetadata fails
-        var failedMoveBlockedDescendants = false
-        do {
-            _ = try await engine.syncIncremental(localPath: localRootDir.path)
-        } catch {
-            failedMoveBlockedDescendants = true
-        }
-        #expect(failedMoveBlockedDescendants)
+        let failedMove = try await engine.syncIncremental(localPath: localRootDir.path)
+        #expect(failedMove.filesUploaded == 1)
+        let firstRunOrder = requestOrder.withLock { $0 }
+        #expect(firstRunOrder.last == "good")
+        #expect(firstRunOrder.dropLast().allSatisfy { $0 == "move" })
         let recorded = try await engine.listSyncIssues(localPath: localRootDir.path)
         #expect(recorded.totalCount == 1)
         #expect(recorded.issues.first?.stage == .pathUpdate)
@@ -228,25 +240,26 @@ struct FailureStateSafetyTests {
         #expect(recorded.issues.first?.occurrenceCount == 1)
 
         // A new incremental run clears the previous run's issues before recording its own failures.
-        await #expect(throws: (any Error).self) {
-            _ = try await engine.syncIncremental(localPath: localRootDir.path)
-        }
+        let retried = try await engine.syncIncremental(localPath: localRootDir.path)
+        #expect(retried.filesUploaded == 0)
         let retriedFailure = try await engine.listSyncIssues(localPath: localRootDir.path)
         #expect(retriedFailure.totalCount == 1)
         #expect(retriedFailure.issues.first?.occurrenceCount == 1)
 
         // SQLite should NOT be updated to 'dir_B' because remote update failed!
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT name FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare("SELECT name, local_status FROM items WHERE item_id = ?;")
             stmt.bindInt64(dirAItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnText(at: 0) == "dir_A", "Directory name in DB must remain dir_A after failed rename")
+            #expect(stmt.columnText(at: 1) == "present")
 
             let child = try conn.prepare(
-                "SELECT parent_id FROM items WHERE item_id = ?;")
+                "SELECT parent_id, local_status FROM items WHERE item_id = ?;")
             child.bindInt64(childItemID, at: 1)
             #expect(try child.step())
             #expect(child.columnInt64(at: 0) == dirAItemId)
+            #expect(child.columnText(at: 1) == "present")
 
             let misplaced = try conn.prepare(
                 "SELECT COUNT(*) FROM items WHERE root_id = ? AND parent_id = ? AND name = 'sub';")
@@ -608,8 +621,8 @@ struct FailureStateSafetyTests {
         }
     }
 
-    @Test("Directory creation failure during incremental scan does not mark committed in SQLite; retrying succeeds")
-    func testDirectoryCreationFailureDoesNotCommitCommittedStateAndRetries() async throws {
+    @Test("Failed directory creation does not abort a healthy sibling; retrying succeeds")
+    func failedDirectoryDoesNotAbortHealthySibling() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a07_dir_create_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -623,6 +636,10 @@ struct FailureStateSafetyTests {
         let nestedData = Data("nested content".utf8)
         try nestedData.write(to: nestedFile)
         let nestedSHA = SyncEngine.computeSha256(of: nestedData)
+        let goodFile = localRootDir.appendingPathComponent("good.txt")
+        let goodData = Data("healthy sibling".utf8)
+        try goodData.write(to: goodFile)
+        let goodSHA = SyncEngine.computeSha256(of: goodData)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -682,7 +699,7 @@ struct FailureStateSafetyTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if path.hasSuffix("/files/generateIds") {
-                let json = Data(#"{"ids": ["directory-d", "directory-sub", "nested-file"]}"#.utf8)
+                let json = Data(#"{"ids": ["directory-d", "directory-sub", "nested-file", "good-file"]}"#.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
             if request.httpMethod == "POST" && path.hasSuffix("/drive/v3/files")
@@ -709,8 +726,9 @@ struct FailureStateSafetyTests {
                 let body = String(bytes: request.extractBodyData ?? Data(), encoding: .utf8)
                     ?? "Invalid UTF-8 data"
                 creationRequests.append(body)
+                let isGood = body.contains("good.txt")
                 let json = Data("""
-                {"id":"nested-file","name":"f.txt","size":"\(nestedData.count)","sha256Checksum":"\(nestedSHA)","version":"1"}
+                {"id":"\(isGood ? "good-file" : "nested-file")","name":"\(isGood ? "good.txt" : "f.txt")","size":"\(isGood ? goodData.count : nestedData.count)","sha256Checksum":"\(isGood ? goodSHA : nestedSHA)","version":"1"}
                 """.utf8)
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
@@ -725,23 +743,25 @@ struct FailureStateSafetyTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         // 1. Run sync while createDirectory fails
-        var firstRunFailed = false
-        do {
-            _ = try await engine.syncIncremental(localPath: localRootDir.path)
-        } catch {
-            firstRunFailed = true
-        }
-        #expect(firstRunFailed)
+        let failedCreate = try await engine.syncIncremental(localPath: localRootDir.path)
+        #expect(failedCreate.filesUploaded == 1)
+        let recorded = try await engine.listSyncIssues(localPath: localRootDir.path)
+        #expect(recorded.totalCount == 1)
+        #expect(recorded.issues.first?.stage == .createDirectory)
+        #expect(recorded.issues.first?.relativePath == "new_folder")
 
         // SQLite: new_folder MUST NOT be committed!
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT phase, remote_status FROM items WHERE root_id = ? AND name = 'new_folder';")
+            let stmt = try conn.prepare(
+                "SELECT phase, remote_status, local_status FROM items " +
+                    "WHERE root_id = ? AND name = 'new_folder';")
             stmt.bindInt64(rootId, at: 1)
             if try stmt.step() {
                 let phase = stmt.columnText(at: 0)
                 let remoteStatus = stmt.columnText(at: 1)
                 #expect(phase != "committed", "Directory must NOT be committed when remote create failed")
                 #expect(remoteStatus != "present", "remote_status must NOT be present when remote create failed")
+                #expect(stmt.columnText(at: 2) == "present")
             }
             let misplaced = try conn.prepare(
                 """
@@ -757,6 +777,13 @@ struct FailureStateSafetyTests {
         #expect(!creationRequests.snapshot().contains { body in
             body.contains("\"name\":\"sub\"") || body.contains("\"name\":\"f.txt\"")
         })
+        #expect(creationRequests.snapshot().contains { $0.contains("good.txt") })
+        let firstRunRequests = creationRequests.snapshot()
+        let failedDirectoryIndex = try #require(
+            firstRunRequests.firstIndex { $0.contains("new_folder") })
+        let healthySiblingIndex = try #require(
+            firstRunRequests.firstIndex { $0.contains("good.txt") })
+        #expect(failedDirectoryIndex < healthySiblingIndex)
 
         // 2. Retry with createDirectory succeeding
         control.shouldFail = false

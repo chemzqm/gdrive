@@ -24,6 +24,7 @@ final class IncrementalSyncRun: Sendable {
     let scheduled: OSAllocatedUnfairLock<Set<Int64>>
     let seenTracker: SeenItemsTracker
     let seenDirTracker: SeenItemsTracker
+    let failedDirectorySubtrees: FailedDirectorySubtrees
     let scanProgress: ScanProgress
     let startTime: DispatchTime
     let recoveredCleanups: Int
@@ -77,6 +78,7 @@ final class IncrementalSyncRun: Sendable {
         self.scheduled = scheduled
         self.seenTracker = seenTracker
         self.seenDirTracker = seenDirTracker
+        self.failedDirectorySubtrees = FailedDirectorySubtrees()
         self.scanProgress = scanProgress
         self.startTime = startTime
         self.recoveredCleanups = recoveredCleanups
@@ -265,6 +267,17 @@ extension IncrementalSyncRun {
         }
         guard currentIdentity == localRootIdentity else {
             throw SyncEngineError.localRootChanged(path: localPath)
+        }
+    }
+
+    func shouldAbortRun(for error: any Error) -> Bool {
+        if DatabaseFailure.isSQLite(error) || error is CancellationError { return true }
+        guard let syncError = error as? SyncEngineError else { return false }
+        switch syncError {
+        case .localRootNotFound, .localRootChanged, .remoteRootLost:
+            return true
+        default:
+            return false
         }
     }
 

@@ -160,6 +160,15 @@ extension IncrementalSyncRun {
         }
 
         for (item, intent) in pendingDirectoryCreates {
+            let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
+            let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
+            if failedDirectorySubtrees.blocks(
+                path: path, device: item.localDevice ?? -1, inode: item.localInode ?? -1,
+                isDirectory: true
+            ) {
+                try await preserveStoredDirectorySubtree(itemID: item.itemId)
+                continue
+            }
             do {
                 _ = try await engine.client.createDirectory(
                     name: item.name,
@@ -185,7 +194,10 @@ extension IncrementalSyncRun {
                     itemId: item.itemId, parentItemId: item.parentId, name: item.name,
                     remoteId: intent.targetRemoteID)
             } catch {
-                if DatabaseFailure.isSQLite(error) { throw error }
+                if shouldAbortRun(for: error) { throw error }
+                failedDirectorySubtrees.register(
+                    path: path, device: item.localDevice ?? -1, inode: item.localInode ?? -1)
+                try await preserveStoredDirectorySubtree(itemID: item.itemId)
                 try await DurableCreateIntentStore.markUnknownOutcome(
                     store: engine.store,
                     operationID: intent.operationID,
@@ -210,7 +222,8 @@ extension IncrementalSyncRun {
             let stmt = try conn.cachedStatement(
                 "UPDATE items SET phase = 'committed', dirty_generation = 0, updated_at = ? WHERE item_id = ?;")
             defer { stmt.reset() }
-            for item in dirItems where !deletionIDs.contains(item.itemId) {
+            for item in dirItems where !deletionIDs.contains(item.itemId)
+                && item.pendingCreate == nil {
                 guard item.local?.status != .unknown, item.remote?.status != .unknown else { continue }
                 stmt.bindDouble(self.now, at: 1)
                 stmt.bindInt64(item.itemId, at: 2)
