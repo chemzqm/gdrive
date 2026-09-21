@@ -229,6 +229,25 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_sync_conflicts_root ON sync_conflicts(root_id);
 
+-- Local files whose content differed from the SQLite baseline when an enclosing
+-- directory was trashed because the remote directory had been deleted.
+-- These rows intentionally do not reference roots/items: cleanup removes those rows.
+CREATE TABLE IF NOT EXISTS trashed_local_changes (
+    change_id TEXT PRIMARY KEY NOT NULL,
+    batch_id TEXT NOT NULL,
+    local_root_path TEXT NOT NULL,
+    relative_path TEXT NOT NULL,
+    original_path TEXT NOT NULL,
+    trash_path TEXT,
+    baseline_sha256 TEXT NOT NULL CHECK(length(baseline_sha256) = 64),
+    observed_sha256 TEXT NOT NULL CHECK(length(observed_sha256) = 64),
+    state TEXT NOT NULL CHECK(state IN ('pending', 'committed')),
+    trashed_at REAL NOT NULL,
+    UNIQUE(batch_id, relative_path)
+);
+CREATE INDEX IF NOT EXISTS idx_trashed_local_changes_root
+    ON trashed_local_changes(local_root_path, trashed_at);
+
 
 -- Nonunique to retain distinct item identities when local names are equivalent.
 CREATE INDEX IF NOT EXISTS idx_items_local_name_key

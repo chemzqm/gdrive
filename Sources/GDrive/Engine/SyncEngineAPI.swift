@@ -44,6 +44,19 @@ public enum SyncConflictResolution: Sendable {
     case remote
 }
 
+/// A locally modified file that was moved to Trash with an enclosing directory
+/// after that directory was deleted remotely.
+public struct TrashedLocalChange: Sendable, Equatable {
+    public let id: String
+    public let localRootPath: String
+    public let relativePath: String
+    public let originalPath: String
+    public let trashPath: String?
+    public let baselineSHA256: String
+    public let observedSHA256: String
+    public let trashedAt: Date
+}
+
 /// SyncEngine Exception type definition
 public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     case localRootNotFound(path: String)

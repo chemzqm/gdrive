@@ -37,6 +37,14 @@ actor RootSyncCoordinator {
         return batch
     }
 
+    func discardPendingChanges(for localRootPath: String, under path: String) {
+        guard var state = states[localRootPath] else { return }
+        state.pending.removeAll { change in
+            change.paths.allSatisfy { Self.contains($0, in: path) }
+        }
+        states[localRootPath] = state
+    }
+
     func finishIfIdle(localRootPath: String) -> Bool {
         guard let state = states[localRootPath] else { return true }
         guard state.pending.isEmpty else { return false }

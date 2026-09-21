@@ -99,6 +99,30 @@ struct RootSyncCoordinatorTests {
         #expect(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: path))
     }
 
+    @Test("Cleanup discards only pending changes in its subtree")
+    func discardsCleanupSubtree() async throws {
+        let root = "/tmp/gdrive-cleanup-pending-\(UUID().uuidString)"
+        let removed = root + "/removed"
+        let keep = LocalChange.modified(path: root + "/keep.txt", isDirectory: false)
+        let crossingMove = LocalChange.moved(
+            from: root + "/outside.txt", to: removed + "/moved.txt", isDirectory: false)
+        try await RootSyncCoordinator.shared.acquire(localRootPath: root)
+        _ = await RootSyncCoordinator.shared.enqueue([
+            .deleted(path: removed, isDirectory: true),
+            .modified(path: removed + "/child.txt", isDirectory: false),
+            .moved(
+                from: removed + "/old.txt", to: removed + "/new.txt", isDirectory: false),
+            crossingMove,
+            keep
+        ], for: root)
+
+        await RootSyncCoordinator.shared.discardPendingChanges(for: root, under: removed)
+
+        let batch = try #require(await RootSyncCoordinator.shared.takePending(for: root))
+        #expect(batch.changes == [crossingMove, keep])
+        #expect(await RootSyncCoordinator.shared.finishIfIdle(localRootPath: root))
+    }
+
     @Test("Pre-baseline active roots route a multi-root watcher batch by path boundary")
     func routesActiveRootsBeforeDatabaseBinding() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
