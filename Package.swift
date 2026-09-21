@@ -98,7 +98,7 @@ let package = Package(
     products: products,
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.0"),
-        .package(path: "/Users/chemzqm/lib/scanner")
+        .package(path: "Vendor/scanner")
     ],
     targets: targets
 )
