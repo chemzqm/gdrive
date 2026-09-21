@@ -481,9 +481,12 @@ extension SyncEngine {
                 try await resolveLocalDeletion(record, storedURL: storedURL)
                 return
             }
-            if conflict.remoteStatus != .present {
-                try await client.untrash(remoteId: conflict.remoteFileId)
+            // Existing remote bodies cannot be overwritten safely yet. Keep the conflict evidence
+            // intact so this path remains gated and can be resolved after safe overwrite is available.
+            guard conflict.remoteStatus != .present else {
+                return
             }
+            try await client.untrash(remoteId: conflict.remoteFileId)
             let digest = try Self.computeFileSha256(at: localURL)
             try await store.batchWrite { conn in
                 let update = try conn.cachedStatement("""

@@ -218,27 +218,27 @@ struct ConflictRecoveryTests {
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
-    @Test("Caller can select the local conflict version")
-    func chooseLocal() async throws {
+    @Test("Selecting the local conflict version keeps the conflict when overwrite is blocked")
+    func chooseLocalKeepsConflictWhenOverwriteIsBlocked() async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
         let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         let conflict = try #require(stats.conflicts.first)
         let conflictPath = try #require(conflict.conflictPath)
+        let uploadsBeforeResolution = context.value.state.withLock { $0.uploads }
+
         try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
+
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
-        #expect(!FileManager.default.fileExists(atPath: conflictPath))
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
-        let state = try await testFixture.store.read { conn in
-            let query = try conn.prepare(
-                "SELECT phase, dirty_generation, base_sha256 FROM items WHERE item_id = \(testFixture.itemID);")
-            defer { query.reset() }
-            #expect(try query.step())
-            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnText(at: 2))
-        }
-        #expect(state.0 == "ready")
-        #expect((state.1 ?? 0) > 0)
-        #expect(state.2 == SyncEngine.computeSha256(of: Data("remote edited content".utf8)))
+        #expect(FileManager.default.fileExists(atPath: conflictPath))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+
+        let retry = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        #expect(retry.filesUploaded == 0)
+        #expect(context.value.state.withLock { $0.uploads } == uploadsBeforeResolution)
+        #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.content }
+            == Data("remote edited content".utf8))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
     }
 
     @Test("Large incremental conflict is downloaded without uploading a conflict copy")
