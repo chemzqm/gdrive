@@ -193,6 +193,10 @@ enum SyncIssueStore {
             return Classification(category: .remoteConflict,
                 action: .renameRemote, retryDelay: nil)
         }
+        if error is LocalFilePublicationRecoveryError {
+            return Classification(category: .localIO,
+                action: .inspectLocalFile, retryDelay: nil)
+        }
         if let driveError = error as? DriveError {
             return classifyDriveError(driveError)
         }

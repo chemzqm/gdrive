@@ -1014,7 +1014,10 @@ public final class DriveClient: Sendable {
         let download = try await downloadVerifiedFile(
             remoteId: remoteId, expectedSha256: expectedSha256,
             temporaryDirectory: temporaryDirectory, onProgress: onProgress)
-        defer { try? FileManager.default.removeItem(at: download.url) }
+        var shouldRemoveDownload = true
+        defer {
+            if shouldRemoveDownload { try? FileManager.default.removeItem(at: download.url) }
+        }
         try await beforePublish?()
         switch try LocalFilePublication.publish(
             download.url, to: destinationURL, expected: expectedDestination,
@@ -1022,6 +1025,14 @@ public final class DriveClient: Sendable {
         case .published(let version): return version
         case .destinationChanged:
             throw SyncEngineError.localFileModified(path: destinationURL.path)
+        case .failedAfterWriteStarted(let failure):
+            shouldRemoveDownload = false
+            throw LocalFilePublicationRecoveryError(
+                destinationPath: failure.destinationPath,
+                stagingURL: download.url,
+                sha256: download.sha256,
+                size: download.size,
+                reason: failure.reason)
         }
     }
 

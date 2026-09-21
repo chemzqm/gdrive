@@ -132,6 +132,10 @@ public final class SyncEngine: Sendable {
     let directoryScan: DirectoryScan
     typealias StableFileDigestCapture = @Sendable (URL) throws -> StableLocalFileDigest
     let stableFileDigestCapture: StableFileDigestCapture
+    typealias FilePublisher = @Sendable (
+        URL, URL, LocalFileVersion?, String
+    ) throws -> LocalFilePublication.Result
+    let filePublisher: FilePublisher
 
     public convenience init(
         auth: Auth,
@@ -144,7 +148,10 @@ public final class SyncEngine: Sendable {
         try await self.init(auth: auth, store: store, client: client, idPool: idPool,
             downloadTemporaryDirectory: downloadTemporaryDirectory,
             conflictDirectory: conflictDirectory, incrementalScan: Self.defaultDirectoryScan,
-            stableFileDigestCapture: { try StableLocalFileDigest.capture(at: $0) })
+            stableFileDigestCapture: { try StableLocalFileDigest.capture(at: $0) },
+            filePublisher: {
+                try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3)
+            })
     }
 
     init(auth: Auth, store: StateStore? = nil, client: DriveClient? = nil, idPool: IDPool? = nil,
@@ -153,6 +160,9 @@ public final class SyncEngine: Sendable {
          incrementalScan: @escaping IncrementalScan,
          stableFileDigestCapture: @escaping StableFileDigestCapture = {
              try StableLocalFileDigest.capture(at: $0)
+         },
+         filePublisher: @escaping FilePublisher = {
+             try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3)
          }) async throws {
         guard downloadTemporaryDirectory.isFileURL else {
             throw SyncEngineError.general("The temporary download directory must be a local file path")
@@ -164,6 +174,7 @@ public final class SyncEngine: Sendable {
         self.conflictDirectory = conflictDirectory
         self.directoryScan = incrementalScan
         self.stableFileDigestCapture = stableFileDigestCapture
+        self.filePublisher = filePublisher
         self.auth = auth
         let effectiveClient = client ?? DriveClient(auth: auth)
         self.client = effectiveClient

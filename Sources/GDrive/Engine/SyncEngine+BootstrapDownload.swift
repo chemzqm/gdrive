@@ -236,30 +236,17 @@ extension SyncEngine {
                         progress.recordDownload(bytes: fileSize, conflict: true)
                         return
                     }
-                    let execution: FileDownloadExecutionResult
-                    do {
-                        execution = try await self.executeFileDownload(
-                            remoteID: item.id,
-                            expectedSHA256: item.sha256Checksum,
-                            destination: localURL,
-                            expectedDestination: nil,
-                            temporaryDirectory: downloadDirectory,
-                            onProgress: { delta in
-                                self.monitor.reportDownloadProgress(
-                                    id: item.id, additionalBytes: delta)
-                            }
-                        )
-                    } catch {
-                        // A local creator may win after enumeration but before publication.
-                        if FileManager.default.fileExists(atPath: localURL.path) {
-                            let fileSize = try await stageConflict(
-                                item, parentItemId: parentItemId,
-                                localURL: localURL, relativePath: relativePath)
-                            progress.recordDownload(bytes: fileSize, conflict: true)
-                            return
+                    let execution = try await self.executeFileDownload(
+                        remoteID: item.id,
+                        expectedSHA256: item.sha256Checksum,
+                        destination: localURL,
+                        expectedDestination: nil,
+                        temporaryDirectory: downloadDirectory,
+                        onProgress: { delta in
+                            self.monitor.reportDownloadProgress(
+                                id: item.id, additionalBytes: delta)
                         }
-                        throw error
-                    }
+                    )
 
                     let published: LocalFileVersion
                     switch execution {

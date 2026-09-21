@@ -4,9 +4,21 @@ import Foundation
 enum LocalFilePublication {
     private static let atomicRenameThreshold: Int64 = 8 * 1024 * 1024
 
+    enum WriteStage: CaseIterable, Sendable, Equatable {
+        case afterTruncate
+        case duringCopy
+        case fsync
+    }
+
+    struct Failure: Sendable, Equatable {
+        let destinationPath: String
+        let reason: String
+    }
+
     enum Result: Sendable, Equatable {
         case published(LocalFileVersion)
         case destinationChanged
+        case failedAfterWriteStarted(Failure)
     }
 
     /// Small or cross-filesystem sources are written through the destination
@@ -15,7 +27,8 @@ enum LocalFilePublication {
         _ source: URL,
         to destination: URL,
         expected: LocalFileVersion?,
-        expectedSHA256: String
+        expectedSHA256: String,
+        writeHook: (@Sendable (WriteStage, Int32, Int32) throws -> Void)? = nil
     ) throws -> Result {
         guard let sourceVersion = try LocalFileVersion.read(at: source) else {
             throw CocoaError(.fileNoSuchFile)
@@ -33,25 +46,32 @@ enum LocalFilePublication {
         guard let descriptor = try openDestination(destination, expected: expected) else {
             return .destinationChanged
         }
-        try writeContents(of: source, version: sourceVersion, to: descriptor)
-        guard try LocalFileVersion.read(at: source) == sourceVersion else {
-            throw SyncEngineError.localFilePublicationFailed(path: source.path)
-        }
+        do {
+            try writeContents(
+                of: source, version: sourceVersion, to: descriptor, writeHook: writeHook)
+            guard try LocalFileVersion.read(at: source) == sourceVersion else {
+                throw SyncEngineError.localFilePublicationFailed(path: source.path)
+            }
 
-        guard let beforeHash = try LocalFileVersion.read(at: destination) else {
-            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+            guard let beforeHash = try LocalFileVersion.read(at: destination) else {
+                throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+            }
+            let digest = try SyncEngine.computeFileSha256(at: destination)
+            guard digest.sha256Hex.caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
+                throw DriveError.checksumMismatch(expected: expectedSHA256, actual: digest.sha256Hex)
+            }
+            guard digest.fileSize == sourceVersion.size else {
+                throw DriveError.sizeMismatch(expected: sourceVersion.size, actual: digest.fileSize)
+            }
+            guard try LocalFileVersion.read(at: destination) == beforeHash else {
+                throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+            }
+            return .published(beforeHash)
+        } catch {
+            return .failedAfterWriteStarted(Failure(
+                destinationPath: destination.path,
+                reason: String(describing: error)))
         }
-        let digest = try SyncEngine.computeFileSha256(at: destination)
-        guard digest.sha256Hex.caseInsensitiveCompare(expectedSHA256) == .orderedSame else {
-            throw DriveError.checksumMismatch(expected: expectedSHA256, actual: digest.sha256Hex)
-        }
-        guard digest.fileSize == sourceVersion.size else {
-            throw DriveError.sizeMismatch(expected: sourceVersion.size, actual: digest.fileSize)
-        }
-        guard try LocalFileVersion.read(at: destination) == beforeHash else {
-            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
-        }
-        return .published(beforeHash)
     }
 
     private static func publicationDevice(
@@ -127,7 +147,10 @@ enum LocalFilePublication {
     }
 
     private static func writeContents(
-        of source: URL, version: LocalFileVersion, to descriptor: Int32
+        of source: URL,
+        version: LocalFileVersion,
+        to descriptor: Int32,
+        writeHook: (@Sendable (WriteStage, Int32, Int32) throws -> Void)?
     ) throws {
         defer { close(descriptor) }
         let input = open(source.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
@@ -137,9 +160,12 @@ enum LocalFilePublication {
             throw SyncEngineError.localFilePublicationFailed(path: source.path)
         }
         guard ftruncate(descriptor, 0) == 0 else { throw posixError() }
+        try writeHook?(.afterTruncate, input, descriptor)
+        try writeHook?(.duringCopy, input, descriptor)
         guard fcopyfile(input, descriptor, nil, copyfile_flags_t(COPYFILE_DATA)) == 0 else {
             throw posixError()
         }
+        try writeHook?(.fsync, input, descriptor)
         guard fsync(descriptor) == 0 else { throw posixError() }
         guard try LocalFileVersion.read(fileDescriptor: input) == version else {
             throw SyncEngineError.localFilePublicationFailed(path: source.path)

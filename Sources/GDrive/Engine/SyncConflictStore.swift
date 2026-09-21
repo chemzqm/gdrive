@@ -458,8 +458,14 @@ extension SyncEngine {
         let result = try LocalFilePublication.publish(
             storedURL, to: localURL, expected: expected,
             expectedSHA256: conflict.remoteSHA256)
-        guard case .published(let published) = result else {
+        let published: LocalFileVersion
+        switch result {
+        case .published(let version):
+            published = version
+        case .destinationChanged:
             throw SyncEngineError.localFileModified(path: localURL.path)
+        case .failedAfterWriteStarted:
+            throw SyncEngineError.localFilePublicationFailed(path: localURL.path)
         }
         try await commitRemoteConflictResolution(
             record, published: published,

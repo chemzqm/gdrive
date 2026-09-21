@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import CryptoKit
 import Testing
@@ -291,6 +292,89 @@ struct BootstrapRecoveryTests {
     }
 
     // MARK: - Bootstrap download recovery
+
+    @Test("Publication I/O error is a failed download, not a user conflict")
+    func publicationIOErrorDoesNotBecomeUserConflict() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "download-publication-io-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let body = Data(repeating: 0x61, count: 64 * 1024)
+        let digest = SyncEngine.computeSha256(of: body)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"C0"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/file") { return (response, body) }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [[
+                    "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                    "size": String(body.count), "sha256Checksum": digest, "parents": ["root"]
+                ]]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let staging = directory.appendingPathComponent("downloads")
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: staging,
+            conflictDirectory: directory.appendingPathComponent("conflicts"),
+            incrementalScan: SyncEngine.defaultDirectoryScan,
+            filePublisher: { source, destination, expected, sha256 in
+                try LocalFilePublication.publish(
+                    source, to: destination, expected: expected, expectedSHA256: sha256,
+                    writeHook: { stage, _, output in
+                        guard stage == .duringCopy else { return }
+                        let prefix = body.prefix(1024)
+                        let count = prefix.withUnsafeBytes { bytes in
+                            write(output, bytes.baseAddress, bytes.count)
+                        }
+                        guard count == prefix.count else {
+                            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                        }
+                        throw POSIXError(.EIO)
+                    })
+            })
+
+        let stats = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+
+        #expect(stats.filesFailed == 1)
+        #expect(stats.conflicts.isEmpty)
+        #expect(stats.remoteWorkPending == 1)
+        let destination = local.appendingPathComponent("file.txt")
+        #expect(try Data(contentsOf: destination) == body.prefix(1024))
+        let recoveryDirectory = staging.appendingPathComponent("root")
+        let recoveryNames = try FileManager.default.contentsOfDirectory(atPath: recoveryDirectory.path)
+        #expect(recoveryNames.count == 1)
+        let recoveryURL = recoveryDirectory.appendingPathComponent(try #require(recoveryNames.first))
+        #expect(try Data(contentsOf: recoveryURL) == body)
+        let persisted = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT bootstrap_state,
+                    (SELECT COUNT(*) FROM sync_conflicts WHERE root_id = roots.root_id),
+                    (SELECT COUNT(*) FROM remote_change_inbox WHERE root_id = roots.root_id)
+                FROM roots;
+                """)
+            _ = try #require(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnInt64(at: 2))
+        }
+        #expect(persisted.0 == "freshCreated")
+        #expect(persisted.1 == 0)
+        #expect(persisted.2 == 1)
+    }
 
     @Test("Bootstrap adoption rejects an edit between hashing and version validation")
     func bootstrapAdoptionRejectsEditBetweenHashAndVersion() async throws {

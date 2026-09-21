@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Testing
 import os
@@ -235,14 +236,81 @@ struct PublicationSafetyTests {
         try Data("original".utf8).write(to: destination)
         try remote.write(to: source)
 
-        do {
-            _ = try LocalFilePublication.publish(
-                source, to: destination, expected: try LocalFileVersion.read(at: destination),
-                expectedSHA256: "incorrect")
+        let result = try LocalFilePublication.publish(
+            source, to: destination, expected: try LocalFileVersion.read(at: destination),
+            expectedSHA256: "incorrect")
+        guard case .failedAfterWriteStarted = result else {
             Issue.record("Publication with an incorrect checksum unexpectedly succeeded")
-        } catch DriveError.checksumMismatch { }
+            return
+        }
 
         #expect(try Data(contentsOf: destination) == remote)
+    }
+
+    @Test(
+        "Publication I/O errors retain verified recovery bytes",
+        arguments: [false, true], LocalFilePublication.WriteStage.allCases)
+    func publicationIOErrorDoesNotBecomeUserConflict(
+        existing: Bool, stage: LocalFilePublication.WriteStage
+    ) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "a11-publish-io-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let credentials = directory.appendingPathComponent("auth.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(AuthData(
+            clientId: "test", accessToken: "test",
+            expiresAt: Date().addingTimeInterval(3600))).write(to: credentials)
+        let auth = try Auth(path: credentials.path)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PublicationURLProtocol.self]
+        let client = DriveClient(
+            auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        let destination = directory.appendingPathComponent("file")
+        if existing { try Data("original local bytes".utf8).write(to: destination) }
+        let expected = try LocalFileVersion.read(at: destination)
+        let staging = directory.appendingPathComponent("downloads")
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: client,
+            downloadTemporaryDirectory: staging,
+            incrementalScan: SyncEngine.defaultDirectoryScan,
+            filePublisher: { source, target, expectedVersion, sha256 in
+                try LocalFilePublication.publish(
+                    source, to: target, expected: expectedVersion, expectedSHA256: sha256,
+                    writeHook: { current, _, output in
+                        guard current == stage else { return }
+                        if current == .duringCopy {
+                            let prefix = PublicationURLProtocol.content.prefix(1024)
+                            let count = prefix.withUnsafeBytes { bytes in
+                                write(output, bytes.baseAddress, bytes.count)
+                            }
+                            guard count == prefix.count else {
+                                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                            }
+                        }
+                        throw POSIXError(.EIO)
+                    })
+            })
+
+        do {
+            _ = try await engine.executeFileDownload(
+                remoteID: "remote",
+                expectedSHA256: SyncEngine.computeSha256(of: PublicationURLProtocol.content),
+                destination: destination,
+                expectedDestination: expected,
+                temporaryDirectory: staging)
+            Issue.record("Injected publication failure unexpectedly succeeded")
+        } catch let error as LocalFilePublicationRecoveryError {
+            #expect(error.destinationPath == destination.path)
+            #expect(error.sha256 == SyncEngine.computeSha256(of: PublicationURLProtocol.content))
+            #expect(error.size == Int64(PublicationURLProtocol.content.count))
+            #expect(try Data(contentsOf: error.stagingURL) == PublicationURLProtocol.content)
+        }
+        #expect(FileManager.default.fileExists(atPath: destination.path))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: staging.path).count == 1)
     }
 
     @Test("Checksum and pre-publication cancellation clean the configured staging folder", arguments: [false, true])

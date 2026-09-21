@@ -6,6 +6,22 @@ enum FileDownloadExecutionResult: Sendable {
     case destinationChanged(DriveClient.VerifiedDownload)
 }
 
+struct LocalFilePublicationRecoveryError: Error, LocalizedError, CustomStringConvertible, Sendable {
+    let destinationPath: String
+    let stagingURL: URL
+    let sha256: String
+    let size: Int64
+    let reason: String
+
+    var errorDescription: String? {
+        "Local publication failed after writing began at \(destinationPath). "
+            + "Verified recovery copy retained at \(stagingURL.path) "
+            + "(SHA-256: \(sha256), size: \(size)): \(reason)"
+    }
+
+    var description: String { errorDescription ?? reason }
+}
+
 enum FileDownloadReceiptExpectation: Sendable {
     case bootstrap(rootID: Int64, parentItemID: Int64, file: DriveFile)
     case incremental(
@@ -41,18 +57,23 @@ extension SyncEngine {
 
         do {
             try await beforePublish?()
-            switch try LocalFilePublication.publish(
-                download.url,
-                to: destination,
-                expected: expectedDestination,
-                expectedSHA256: download.sha256
-            ) {
+            switch try filePublisher(
+                download.url, destination, expectedDestination, download.sha256) {
             case .published(let version):
                 try? FileManager.default.removeItem(at: download.url)
                 return .published(version)
             case .destinationChanged:
                 return .destinationChanged(download)
+            case .failedAfterWriteStarted(let failure):
+                throw LocalFilePublicationRecoveryError(
+                    destinationPath: failure.destinationPath,
+                    stagingURL: download.url,
+                    sha256: download.sha256,
+                    size: download.size,
+                    reason: failure.reason)
             }
+        } catch let error as LocalFilePublicationRecoveryError {
+            throw error
         } catch {
             try? FileManager.default.removeItem(at: download.url)
             throw error
