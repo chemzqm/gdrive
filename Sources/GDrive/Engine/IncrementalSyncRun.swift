@@ -9,6 +9,7 @@ final class IncrementalSyncRun: Sendable {
     let localPath: String
     let rootURL: URL
     let remoteRootID: String
+    let localRootIdentity: LocalDirectoryIdentity
     let downloadDirectory: URL
     let now: TimeInterval
     let maxConcurrency: Int
@@ -36,6 +37,7 @@ final class IncrementalSyncRun: Sendable {
         localPath: String,
         rootURL: URL,
         remoteRootID: String,
+        localRootIdentity: LocalDirectoryIdentity,
         downloadDirectory: URL,
         now: TimeInterval,
         maxConcurrency: Int,
@@ -60,6 +62,7 @@ final class IncrementalSyncRun: Sendable {
         self.localPath = localPath
         self.rootURL = rootURL
         self.remoteRootID = remoteRootID
+        self.localRootIdentity = localRootIdentity
         self.downloadDirectory = downloadDirectory
         self.now = now
         self.maxConcurrency = maxConcurrency
@@ -120,14 +123,29 @@ extension IncrementalSyncRun {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
         let now = Date().timeIntervalSince1970
-        var isDir: ObjCBool = false
-        let localExists = FileManager.default.fileExists(
-            atPath: resolvedLocalPath, isDirectory: &isDir)
-        guard localExists && isDir.boolValue else {
+        guard let currentIdentity = try LocalDirectoryIdentity.read(at: rootURL) else {
             engine.logger.error(
                 "[Sync] The local sync root is missing or invalid: \(resolvedLocalPath). Stopping sync to protect remote files."
             )
             throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
+        }
+        let storedIdentity = try await engine.store.read { conn in
+            let statement = try conn.cachedStatement(
+                "SELECT local_root_device, local_root_inode FROM roots WHERE root_id = ? AND is_active = 1;")
+            defer { statement.reset() }
+            statement.bindInt64(rootID, at: 1)
+            guard try statement.step(),
+                  let device = statement.columnInt64(at: 0),
+                  let inode = statement.columnInt64(at: 1) else {
+                throw SyncEngineError.general("The active local root binding is missing: \(resolvedLocalPath)")
+            }
+            return LocalDirectoryIdentity(device: device, inode: inode)
+        }
+        guard currentIdentity == storedIdentity else {
+            engine.logger.error(
+                "[Sync] The local sync root identity changed: \(resolvedLocalPath). Stopping sync to protect remote files."
+            )
+            throw SyncEngineError.localRootChanged(path: resolvedLocalPath)
         }
         try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
@@ -136,6 +154,12 @@ extension IncrementalSyncRun {
         var prepared = false
         defer {
             if !prepared { engine.cleanupDownloadStagingDirectory(downloadDirectory) }
+        }
+        guard let currentIdentity = try LocalDirectoryIdentity.read(at: rootURL) else {
+            throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
+        }
+        guard currentIdentity == storedIdentity else {
+            throw SyncEngineError.localRootChanged(path: resolvedLocalPath)
         }
         let recoveredCleanups = try await engine.recoverPendingItemCleanups(
             rootID: rootID, taskRegistry: itemTaskRegistry)
@@ -151,6 +175,7 @@ extension IncrementalSyncRun {
         let run = IncrementalSyncRun(
             engine: engine, rootID: rootID, rootItemID: rootItemID,
             localPath: resolvedLocalPath, rootURL: rootURL, remoteRootID: remoteRootID,
+            localRootIdentity: storedIdentity,
             downloadDirectory: downloadDirectory, now: now, maxConcurrency: maxConcurrency,
             effectiveSyncConcurrency: effectiveSyncConcurrency, notifier: notifier,
             remoteChanges: remoteChanges, remoteGate: remoteGate,
@@ -194,6 +219,7 @@ extension IncrementalSyncRun {
         try await recoverPendingDirectories(pendingDirectories)
         try await scanLocal()
         try actionTracker.throwIfDatabaseFailure()
+        try validateLocalRootIdentity()
         try await markMissingAfterSuccessfulScan()
         let dirtyItems = try await loadDirtyItems()
         let eligibleItems = dirtyItems.filter { item in
@@ -215,6 +241,7 @@ extension IncrementalSyncRun {
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
             return !deletionRoots.contains { root in path == root || path.hasPrefix(root + "/") }
         }
+        try validateLocalRootIdentity()
         do {
             try await scheduleFiles(fileItems, duringScan: false)
         } catch {
@@ -227,8 +254,18 @@ extension IncrementalSyncRun {
         try await processCollidedDownloads()
         try actionTracker.throwIfDatabaseFailure()
         try await engine.store.flush()
+        try validateLocalRootIdentity()
         try await reconcileDirectories(dirItems)
         return try await finish()
+    }
+
+    func validateLocalRootIdentity() throws {
+        guard let currentIdentity = try LocalDirectoryIdentity.read(at: rootURL) else {
+            throw SyncEngineError.localRootNotFound(path: localPath)
+        }
+        guard currentIdentity == localRootIdentity else {
+            throw SyncEngineError.localRootChanged(path: localPath)
+        }
     }
 
     private func finish() async throws -> SyncStats {

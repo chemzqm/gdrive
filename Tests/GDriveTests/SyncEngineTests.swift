@@ -666,6 +666,7 @@ struct SyncEngineTests {
                 );
                 """)
             }
+            try await setStoredRootIdentity(store: testStore, rootID: 1, localURL: tempDir)
 
             let engine = try await SyncEngine(auth: auth, store: testStore, client: client)
 

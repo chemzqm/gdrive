@@ -596,6 +596,7 @@ struct BootstrapResumeSafetyTests {
             );
             """)
         }
+        try await setStoredRootIdentity(store: store, rootID: 1, localURL: localRootDir)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)
@@ -821,6 +822,7 @@ struct BootstrapResumeSafetyTests {
             );
             """)
         }
+        try await setStoredRootIdentity(store: store, rootID: 1, localURL: localRootDir)
 
         let auth = try createMockAuth(tempDir: tempDir)
         let client = createMockClient(auth: auth)

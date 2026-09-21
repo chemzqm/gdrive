@@ -97,10 +97,10 @@ extension SyncEngine {
         } else if isLocalEmpty && isRemoteEmpty {
             logger.info("[Sync] Both directories are empty; creating an empty baseline")
             try FileManager.default.createDirectory(atPath: resolvedLocalPath, withIntermediateDirectories: true)
-            var metadata = stat()
-            guard stat(resolvedLocalPath, &metadata) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-            let device = Int64(metadata.st_dev)
-            let inode = Int64(metadata.st_ino)
+            let rootURL = URL(fileURLWithPath: resolvedLocalPath)
+            guard let rootIdentity = try LocalDirectoryIdentity.read(at: rootURL) else {
+                throw SyncEngineError.localRootNotFound(path: resolvedLocalPath)
+            }
             let rootName = URL(fileURLWithPath: resolvedLocalPath).lastPathComponent
             let now = Date().timeIntervalSince1970
             try await store.write { conn in
@@ -111,8 +111,8 @@ extension SyncEngine {
                 ) VALUES ('default', ?, ?, ?, ?, 'localToRemoteEmpty', 'existingKnown', ?, ?);
                 """)
                 stmt.bindText(resolvedLocalPath, at: 1)
-                stmt.bindInt64(device, at: 2)
-                stmt.bindInt64(inode, at: 3)
+                stmt.bindInt64(rootIdentity.device, at: 2)
+                stmt.bindInt64(rootIdentity.inode, at: 3)
                 stmt.bindText(remoteFolderId, at: 4)
                 stmt.bindDouble(now, at: 5)
                 stmt.bindDouble(now, at: 6)
@@ -127,8 +127,8 @@ extension SyncEngine {
                 item.bindInt64(rootID, at: 1)
                 item.bindText(rootName, at: 2)
                 item.bindText(remoteFolderId, at: 3)
-                item.bindInt64(device, at: 4)
-                item.bindInt64(inode, at: 5)
+                item.bindInt64(rootIdentity.device, at: 4)
+                item.bindInt64(rootIdentity.inode, at: 5)
                 item.bindDouble(now, at: 6)
                 item.bindDouble(now, at: 7)
                 _ = try item.step()

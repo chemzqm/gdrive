@@ -23,10 +23,11 @@ extension SyncEngine {
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
 
         // Verify local root directory
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: resolvedLocalPath, isDirectory: &isDir), isDir.boolValue else {
-            throw NSError(domain: "SyncEngine", code: 1, userInfo: [NSLocalizedDescriptionKey: "The local path does not exist or is not a directory: \(resolvedLocalPath)"])
-        }
+        let rootIdentity = try LocalDirectoryIdentity.require(
+            at: rootURL,
+            or: NSError(domain: "SyncEngine", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "The local path does not exist or is not a directory: \(resolvedLocalPath)"
+            ]))
 
         // Verify that the remote root directory exists
         let remoteRoot = try await client.getFile(remoteId: remoteRootId)
@@ -56,34 +57,46 @@ extension SyncEngine {
             INSERT INTO roots (
                 account_id, local_root_path, local_root_device, local_root_inode,
                 remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at
-            ) VALUES ('default', ?, 1, 1, ?, 'localToRemoteEmpty', 'freshCreated', ?, ?)
+            ) VALUES ('default', ?, ?, ?, ?, 'localToRemoteEmpty', 'freshCreated', ?, ?)
             ON CONFLICT (account_id, remote_root_id) DO UPDATE SET updated_at = excluded.updated_at;
             """)
             rootStmt.bindText(resolvedLocalPath, at: 1)
-            rootStmt.bindText(remoteRootId, at: 2)
-            rootStmt.bindDouble(now, at: 3)
-            rootStmt.bindDouble(now, at: 4)
+            rootStmt.bindInt64(rootIdentity.device, at: 2)
+            rootStmt.bindInt64(rootIdentity.inode, at: 3)
+            rootStmt.bindText(remoteRootId, at: 4)
+            rootStmt.bindDouble(now, at: 5)
+            rootStmt.bindDouble(now, at: 6)
             _ = try rootStmt.step()
             rootStmt.reset()
 
-            let rootQuery = try conn.cachedStatement("SELECT root_id FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
+            let rootQuery = try conn.cachedStatement(
+                "SELECT root_id, local_root_device, local_root_inode FROM roots WHERE account_id = 'default' AND remote_root_id = ?;")
             rootQuery.bindText(remoteRootId, at: 1)
-            guard try rootQuery.step(), let rId = rootQuery.columnInt64(at: 0) else {
+            guard try rootQuery.step(), let rId = rootQuery.columnInt64(at: 0),
+                  let storedDevice = rootQuery.columnInt64(at: 1),
+                  let storedInode = rootQuery.columnInt64(at: 2) else {
                 throw NSError(domain: "SyncEngine", code: 3, userInfo: [NSLocalizedDescriptionKey: "Unable to obtain root_id"])
+            }
+            guard storedDevice == rootIdentity.device, storedInode == rootIdentity.inode else {
+                throw SyncEngineError.localRootChanged(path: resolvedLocalPath)
             }
             rootQuery.reset()
 
             let itemStmt = try conn.cachedStatement("""
             INSERT INTO items (
-                root_id, parent_id, name, entry_kind, remote_file_id, created_at, updated_at
-            ) VALUES (?, NULL, ?, 'directory', ?, ?, ?)
+                root_id, parent_id, name, entry_kind, remote_file_id,
+                local_device, local_inode, local_status, remote_status,
+                phase, created_at, updated_at
+            ) VALUES (?, NULL, ?, 'directory', ?, ?, ?, 'present', 'present', 'committed', ?, ?)
             ON CONFLICT (root_id) WHERE parent_id IS NULL DO UPDATE SET updated_at = excluded.updated_at;
             """)
             itemStmt.bindInt64(rId, at: 1)
             itemStmt.bindText(rootURL.lastPathComponent, at: 2)
             itemStmt.bindText(remoteRootId, at: 3)
-            itemStmt.bindDouble(now, at: 4)
-            itemStmt.bindDouble(now, at: 5)
+            itemStmt.bindInt64(rootIdentity.device, at: 4)
+            itemStmt.bindInt64(rootIdentity.inode, at: 5)
+            itemStmt.bindDouble(now, at: 6)
+            itemStmt.bindDouble(now, at: 7)
             _ = try itemStmt.step()
             itemStmt.reset()
 

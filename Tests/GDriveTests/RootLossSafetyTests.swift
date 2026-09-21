@@ -56,6 +56,191 @@ struct RootLossSafetyTests {
         return DriveClient(auth: auth, session: session, requestsPerSecond: nil)
     }
 
+    @Test("Same-path root replacement stops before remote mutation")
+    func samePathReplacementStopsBeforeRemoteMutation() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "root-replacement-\(UUID().uuidString)")
+        let localRoot = directory.appendingPathComponent("local")
+        let displacedRoot = directory.appendingPathComponent("displaced")
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let identity = try #require(try LocalDirectoryIdentity.read(at: localRoot))
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        try await store.write { conn in
+            let root = try conn.prepare("""
+                INSERT INTO roots(account_id, local_root_path, local_root_device, local_root_inode,
+                    remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at)
+                VALUES ('default', ?, ?, ?, 'root', 'localToRemoteEmpty', 'existingKnown', 1, 1);
+                """)
+            root.bindText(localRoot.path, at: 1)
+            root.bindInt64(identity.device, at: 2)
+            root.bindInt64(identity.inode, at: 3)
+            _ = try root.step()
+            let rootID = conn.lastInsertRowId
+            let rootItem = try conn.prepare("""
+                INSERT INTO items(root_id, name, entry_kind, remote_file_id, local_status,
+                    remote_status, phase, created_at, updated_at)
+                VALUES (?, 'local', 'directory', 'root', 'present', 'present', 'committed', 1, 1);
+                """)
+            rootItem.bindInt64(rootID, at: 1)
+            _ = try rootItem.step()
+            let itemID = conn.lastInsertRowId
+            let file = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_status, remote_status, phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'keep.txt', 'file', 'remote-keep',
+                    'present', 'present', 'committed', 0, 1, 1);
+                """)
+            file.bindInt64(rootID, at: 1)
+            file.bindInt64(itemID, at: 2)
+            _ = try file.step()
+        }
+
+        try FileManager.default.moveItem(at: localRoot, to: displacedRoot)
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        context.value.requestHandler = { _ in
+            Issue.record("Root identity validation must happen before remote requests")
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"))
+
+        let error = await #expect(throws: SyncEngineError.self) {
+            try await engine.syncIncremental(localPath: localRoot.path)
+        }
+        #expect(error == .localRootChanged(path: localRoot.path))
+        let state = try await store.read { conn in
+            let query = try conn.prepare(
+                "SELECT local_status, remote_status, phase, dirty_generation FROM items WHERE remote_file_id = 'remote-keep';")
+            defer { query.reset() }
+            #expect(try query.step())
+            return (query.columnText(at: 0), query.columnText(at: 1),
+                query.columnText(at: 2), query.columnInt64(at: 3))
+        }
+        #expect(state.0 == "present")
+        #expect(state.1 == "present")
+        #expect(state.2 == "committed")
+        #expect(state.3 == 0)
+    }
+
+    @Test("Root replacement after scanning stops before deletion propagation")
+    func scanReplacementStopsBeforeRemoteMutation() async throws {
+        final class Requests: @unchecked Sendable {
+            private let lock = NSLock()
+            private var mutationCount = 0
+            func recordMutation() { lock.withLock { mutationCount += 1 } }
+            func count() -> Int { lock.withLock { mutationCount } }
+        }
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "root-scan-replacement-\(UUID().uuidString)")
+        let localRoot = directory.appendingPathComponent("local")
+        let displacedRoot = directory.appendingPathComponent("displaced")
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let localFile = localRoot.appendingPathComponent("keep.txt")
+        let contents = Data("keep".utf8)
+        try contents.write(to: localFile)
+        let identity = try #require(try LocalDirectoryIdentity.read(at: localRoot))
+        let version = try #require(try LocalFileVersion.read(at: localFile))
+        let sha256 = SyncEngine.computeSha256(of: contents)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        try await store.write { conn in
+            let root = try conn.prepare("""
+                INSERT INTO roots(account_id, local_root_path, local_root_device, local_root_inode,
+                    remote_root_id, initial_sync_direction, bootstrap_state, created_at, updated_at)
+                VALUES ('default', ?, ?, ?, 'root', 'localToRemoteEmpty', 'existingKnown', 1, 1);
+                """)
+            root.bindText(localRoot.path, at: 1)
+            root.bindInt64(identity.device, at: 2)
+            root.bindInt64(identity.inode, at: 3)
+            _ = try root.step()
+            let rootID = conn.lastInsertRowId
+            let rootItem = try conn.prepare("""
+                INSERT INTO items(root_id, name, entry_kind, remote_file_id, local_status,
+                    remote_status, phase, created_at, updated_at)
+                VALUES (?, 'local', 'directory', 'root', 'present', 'present', 'committed', 1, 1);
+                """)
+            rootItem.bindInt64(rootID, at: 1)
+            _ = try rootItem.step()
+            let rootItemID = conn.lastInsertRowId
+            let file = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_mtime, local_size, local_sha256,
+                    base_sha256, base_size, remote_sha256, remote_size,
+                    local_status, remote_status, phase, dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'keep.txt', 'file', 'remote-keep', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    'present', 'present', 'committed', 0, 1, 1);
+                """)
+            file.bindInt64(rootID, at: 1)
+            file.bindInt64(rootItemID, at: 2)
+            file.bindInt64(version.device, at: 3)
+            file.bindInt64(version.inode, at: 4)
+            file.bindInt64(version.mtime, at: 5)
+            file.bindInt64(version.size, at: 6)
+            file.bindText(sha256, at: 7)
+            file.bindText(sha256, at: 8)
+            file.bindInt64(version.size, at: 9)
+            file.bindText(sha256, at: 10)
+            file.bindInt64(version.size, at: 11)
+            _ = try file.step()
+            let cursor = try conn.prepare("""
+                INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at)
+                VALUES (?, 'default', 'drive_changes', 'C0', 1);
+                """)
+            cursor.bindInt64(rootID, at: 1)
+            _ = try cursor.step()
+        }
+
+        let requests = Requests()
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if request.httpMethod != "GET" { requests.recordMutation() }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/changes") {
+                return (response, Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            incrementalScan: { request, consume in
+                try await SyncEngine.defaultDirectoryScan(request, consume)
+                try FileManager.default.moveItem(at: localRoot, to: displacedRoot)
+                try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+            })
+
+        let error = await #expect(throws: SyncEngineError.self) {
+            try await engine.syncIncremental(localPath: localRoot.path)
+        }
+        #expect(error == .localRootChanged(path: localRoot.path))
+        #expect(requests.count() == 0)
+        let state = try await store.read { conn in
+            let query = try conn.prepare(
+                "SELECT local_status, remote_status, phase, dirty_generation FROM items WHERE remote_file_id = 'remote-keep';")
+            defer { query.reset() }
+            #expect(try query.step())
+            return (query.columnText(at: 0), query.columnText(at: 1),
+                query.columnText(at: 2), query.columnInt64(at: 3))
+        }
+        #expect(state.0 == "present")
+        #expect(state.1 == "present")
+        #expect(state.2 == "committed")
+        #expect(state.3 == 0)
+    }
+
     @Test(
         "Incremental sync requires a complete active binding for the local path",
         arguments: ["missing", "inactive", "missingRootItem"]
@@ -136,7 +321,6 @@ struct RootLossSafetyTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
-
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
                 INSERT INTO items (root_id, parent_id, name, entry_kind, remote_file_id, phase, created_at, updated_at)
@@ -236,6 +420,7 @@ struct RootLossSafetyTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         _ = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -331,6 +516,7 @@ struct RootLossSafetyTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         _ = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -391,6 +577,7 @@ struct RootLossSafetyTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         _ = try await store.write { conn in
             let stmt = try conn.prepare("""

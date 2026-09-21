@@ -117,17 +117,8 @@ extension IncrementalSyncRun {
 
 extension IncrementalSyncRun {
     func markMissingAfterSuccessfulScan() async throws {
-        // Identify local deleted files and directories (§9.1)
-        // Verify again whether the local root directory exists to avoid all misjudgments caused by the local directory being removed during the scan. absent diffuse deletion
-        var isStillDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: localPath, isDirectory: &isStillDir),
-            isStillDir.boolValue
-        else {
-            engine.logger.error(
-                "[Sync] The local sync root disappeared during scanning: \(localPath). Stopping sync to protect remote files."
-            )
-            throw SyncEngineError.localRootNotFound(path: localPath)
-        }
+        // Identify local deleted files and directories (§9.1). The caller has
+        // already revalidated the bound root identity after the scan.
 
         try await engine.store.write { conn in
             // 1. File deletion detection

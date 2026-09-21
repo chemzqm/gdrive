@@ -44,7 +44,7 @@ struct DurableIntentTests {
     }
 
     private func seedRoot(store: StateStore, localPath: String, remoteID: String) async throws -> (Int64, Int64) {
-        try await store.write { conn in
+        let ids = try await store.write { conn in
             let root = try conn.prepare("""
             INSERT INTO roots (
                 account_id, local_root_path, local_root_device, local_root_inode,
@@ -70,6 +70,9 @@ struct DurableIntentTests {
             _ = try item.step()
             return (rootID, conn.lastInsertRowId)
         }
+        try await setStoredRootIdentity(
+            store: store, rootID: ids.0, localURL: URL(fileURLWithPath: localPath))
+        return ids
     }
 
     @Test("Marking an unknown outcome propagates its SQLite write failure")

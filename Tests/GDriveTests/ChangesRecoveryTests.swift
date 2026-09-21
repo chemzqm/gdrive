@@ -263,6 +263,7 @@ struct ChangesRecoveryTests {
             if cursor { try conn.execute("INSERT INTO cursors(root_id, account_id, cursor_kind, token_value, updated_at) VALUES (\(root), 'default', 'drive_changes', 'start', 1);") }
             return (root, item)
         }
+        try await setStoredRootIdentity(store: store, rootID: ids.0, localURL: local)
         let engine = try await SyncEngine(auth: auth, store: store, client: client, idPool: IDPool(initialIds: (0..<1000).map { "new-\($0)" }),
             downloadTemporaryDirectory: directory.appendingPathComponent("downloads"))
         return Fixture(directory: directory, local: local, store: store, client: client, auth: auth, engine: engine, rootID: ids.0, rootItemID: ids.1)

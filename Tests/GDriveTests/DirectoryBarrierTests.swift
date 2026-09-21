@@ -110,6 +110,7 @@ struct DirectoryBarrierTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -270,6 +271,7 @@ struct DirectoryBarrierTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -405,6 +407,7 @@ struct DirectoryBarrierTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -570,6 +573,7 @@ struct DirectoryBarrierTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -733,6 +737,7 @@ struct DirectoryBarrierTests {
             _ = try stmt.step()
             return conn.lastInsertRowId
         }
+        try await setStoredRootIdentity(store: store, rootID: rootId, localURL: localRootDir)
 
         let rootDirItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
