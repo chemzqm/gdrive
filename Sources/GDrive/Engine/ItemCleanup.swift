@@ -119,15 +119,7 @@ private struct ItemCleanupPlan: Sendable {
     let localSHA256: String?
     let generations: ItemCleanupGenerations
     let nodes: [Node]
-    let extraRemoteIDs: [String]
     let conflictPaths: [URL]
-    let conflictCopyPaths: [URL]
-}
-
-private struct ItemCleanupRelations {
-    let remoteIDs: [String]
-    let conflictPaths: [URL]
-    let copyPaths: [URL]
 }
 
 private struct PendingTrashedLocalChange: Sendable {
@@ -172,9 +164,6 @@ extension SyncEngine {
             taskRegistry: taskRegistry,
             removePrimary: { plan, _ in
                 if let remoteID = plan.remoteID {
-                    try await self.client.trash(remoteId: remoteID)
-                }
-                for remoteID in plan.extraRemoteIDs where remoteID != plan.remoteID {
                     try await self.client.trash(remoteId: remoteID)
                 }
             })
@@ -435,8 +424,7 @@ extension SyncEngine {
                     entryKind: tree.columnText(at: 4) ?? "file",
                     baseSHA256: tree.columnText(at: 5)))
             }
-            let relations = try self.cleanupRelations(
-                conn: conn, rootID: rootID, nodes: &nodes)
+            let conflictPaths = try self.cleanupConflictPaths(conn: conn, nodes: nodes)
             return ItemCleanupPlan(
                 rootID: rootID, itemID: itemID, remoteRootID: remoteRootID,
                 localRootPath: localRootPath,
@@ -444,15 +432,13 @@ extension SyncEngine {
                 localDevice: item.columnInt64(at: 5), localInode: item.columnInt64(at: 6),
                 localMtime: item.columnInt64(at: 7), localSize: item.columnInt64(at: 8),
                 localSHA256: item.columnText(at: 9), generations: actual, nodes: nodes,
-                extraRemoteIDs: relations.remoteIDs, conflictPaths: relations.conflictPaths,
-                conflictCopyPaths: relations.copyPaths)
+                conflictPaths: conflictPaths)
         }
     }
 
-    private func cleanupRelations(
-        conn: SQLiteConnection, rootID: Int64, nodes: inout [ItemCleanupPlan.Node]
-    ) throws -> ItemCleanupRelations {
-        let subtreeIDs = Set(nodes.map(\.id))
+    private func cleanupConflictPaths(
+        conn: SQLiteConnection, nodes: [ItemCleanupPlan.Node]
+    ) throws -> [URL] {
         try conn.execute(
             "CREATE TEMP TABLE IF NOT EXISTS cleanup_item_ids " +
                 "(item_id INTEGER PRIMARY KEY NOT NULL) WITHOUT ROWID;")
@@ -461,44 +447,10 @@ extension SyncEngine {
         let insertID = try conn.prepare(
             "INSERT OR IGNORE INTO cleanup_item_ids(item_id) VALUES (?);")
         defer { insertID.reset() }
-        for itemID in subtreeIDs {
+        for itemID in nodes.map(\.id) {
             insertID.bindInt64(itemID, at: 1)
             _ = try insertID.step()
             insertID.reset()
-        }
-        let copies = try conn.prepare(
-            """
-            SELECT json_extract(payload, '$.copyItemID'), json_extract(payload, '$.copyPath')
-            FROM operations op JOIN cleanup_item_ids ids ON ids.item_id = op.item_id
-            WHERE operation_type = 'resolveConflict'
-                AND payload IS NOT NULL;
-            """)
-        defer { copies.reset() }
-        var copyPaths: [URL] = []
-        var copyIDs: [Int64] = []
-        while try copies.step() {
-            if let id = copies.columnInt64(at: 0) { copyIDs.append(id) }
-            if let value = copies.columnText(at: 1) {
-                copyPaths.append(URL(fileURLWithPath: value))
-            }
-        }
-        var remoteIDs: [String] = []
-        for copyID in copyIDs where !subtreeIDs.contains(copyID) {
-            let copy = try conn.prepare(
-                "SELECT remote_file_id FROM items WHERE root_id = ? AND item_id = ?;")
-            copy.bindInt64(rootID, at: 1)
-            copy.bindInt64(copyID, at: 2)
-            if try copy.step() {
-                let remoteID = copy.columnText(at: 0)
-                nodes.append(.init(
-                    id: copyID, depth: Int64.max, remoteID: remoteID, relativePath: "",
-                    entryKind: "file", baseSHA256: nil))
-                insertID.bindInt64(copyID, at: 1)
-                _ = try insertID.step()
-                insertID.reset()
-                if let remoteID { remoteIDs.append(remoteID) }
-            }
-            copy.reset()
         }
         let conflicts = try conn.prepare(
             """
@@ -512,8 +464,7 @@ extension SyncEngine {
                 conflictPaths.append(URL(fileURLWithPath: value))
             }
         }
-        return ItemCleanupRelations(
-            remoteIDs: remoteIDs, conflictPaths: conflictPaths, copyPaths: copyPaths)
+        return conflictPaths
     }
 
     private func modifiedFilesBeforeDirectoryTrash(
@@ -631,10 +582,6 @@ extension SyncEngine {
                 try DownloadStaging.removeIfEmpty(parent)
                 parent.deleteLastPathComponent()
             }
-        }
-        for path in plan.conflictCopyPaths where FileManager.default.fileExists(atPath: path.path) {
-            var trashURL: NSURL?
-            try FileManager.default.trashItem(at: path, resultingItemURL: &trashURL)
         }
     }
 

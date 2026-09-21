@@ -108,7 +108,7 @@ for conflict in conflicts {
 已修改的文件，可通过 `listTrashedLocalChanges(localPath:)` 查询原路径、实际垃圾桶路径和 SHA-256。
 若远端目录在同步删除期间包含协作者刚修改或新增的内容，需要从 Google Drive 垃圾桶恢复。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
-初始化下载、增量下载及冲突恢复都使用此设置；目录按需创建。
+初始化下载、增量下载及冲突内容刷新都使用此设置；目录按需创建。
 
 ```swift
 // 设置的是基目录；引擎自动追加远程根 ID，不需要调用方追加。
@@ -269,7 +269,7 @@ print("增量同步完成:")
 print("  - 上传文件: \(stats.filesUploaded)")
 print("  - 下载文件: \(stats.filesDownloaded)")
 print("  - 删除项数: \(stats.filesDeleted)")
-print("  - 已解决冲突: \(stats.conflictsResolved)")
+print("  - 待处理冲突: \(stats.conflicts.count)")
 print("  - 跳过未变: \(stats.filesSkipped)")
 ```
 
@@ -287,8 +287,9 @@ Google Drive 文件夹 ID；找不到完整绑定时会在扫描和任何远端�
      - 云端删除项：本地调用 `FileManager.default.trashItem` 移入 macOS 系统废纸篓；目录内相对基线已修改的文件会留下可查询记录。
      - 本地删除项：直接调用 Google Drive Trash；需要恢复时从 Google Drive 垃圾桶找回。
   4. **冲突解决**：
-     - 若双端同时修改且 SHA-256 摘要不同，先保留并上传本地冲突副本，再将远端内容发布到原路径；
-       两项基线提交后才计入 `conflictsResolved`。失败时保留待恢复操作，见 [A12 验收记录](a12-validation.md)。
+     - 若双端同时修改且 SHA-256 摘要不同，保留本地内容，将远端内容写入 conflicts 目录并写入
+       `sync_conflicts`。调用方查询 `stats.conflicts` 或 `listConflicts(localPath:)`，再通过
+       `resolveConflict(id:resolution:)` 明确选择本地或远端版本。
   5. **未变文件缓存**：
      - 文件身份、路径和元数据均命中缓存时，可跳过重复读取与哈希计算；内容变化仍以 SHA-256 判断。
 
@@ -308,7 +309,7 @@ public struct SyncStats: Sendable {
     public var filesDownloaded: Int     // 成功下载的文件数量
     public var bytesDownloaded: Int64   // 成功下载的总字节数
     public var filesDeleted: Int        // 本地/远端删除或移入回收站的项数
-    public var conflictsResolved: Int   // 完成恢复或解决的冲突数量
+    public var conflicts: [SyncConflict] // 等待调用方选择版本的冲突
     public var remoteWorkPending: Int   // 留待后续同步轮次处理的远端工作数量
     public var remoteNameConflicts: Int // 因本地等价名称而受阻的远端对象数量
     public var filesFailed: Int         // 本轮处理失败的文件数量

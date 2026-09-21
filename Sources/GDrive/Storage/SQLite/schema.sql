@@ -83,10 +83,6 @@ CREATE TABLE IF NOT EXISTS items (
         'committed', 'conflict', 'blocked'
     )),
     dirty_generation INTEGER NOT NULL DEFAULT 0 CHECK (dirty_generation >= 0),
-    -- Conflict resolution tracking (§11.3)
-    conflict_id TEXT,
-    conflict_winner TEXT CHECK (conflict_winner IS NULL OR conflict_winner IN ('local', 'remote')),
-
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
 
@@ -136,7 +132,7 @@ CREATE TABLE IF NOT EXISTS operations (
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
     operation_type TEXT NOT NULL CHECK (operation_type IN (
         'createDirectory', 'uploadMultipart', 'createResumableUpload', 'uploadResumable',
-        'download', 'move', 'rename', 'trashRemote', 'deleteLocal', 'resolveConflict'
+        'download', 'move', 'rename', 'trashRemote', 'deleteLocal'
     )),
     state TEXT NOT NULL CHECK (state IN (
         'ready', 'inFlight', 'verify', 'unknownOutcome',
@@ -151,13 +147,12 @@ CREATE TABLE IF NOT EXISTS operations (
     confirmed_offset INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_offset >= 0),
     total_bytes INTEGER CHECK (total_bytes IS NULL OR total_bytes >= 0),
     staging_path TEXT,
-    payload TEXT, -- resolveConflict: fixed identities, paths, digests and generations
+    payload TEXT,
     attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
     last_error_code TEXT,
     last_error_message TEXT,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL,
-    CHECK (operation_type != 'resolveConflict' OR payload IS NOT NULL)
+    updated_at REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_operations_item
@@ -258,9 +253,3 @@ ON items(root_id, parent_id, gdrive_name_key(name));
 -- Scope protection belongs to the item; exclude roots and their descendants at query time.
 CREATE INDEX IF NOT EXISTS idx_items_scope_excluded
     ON items(root_id) WHERE remote_scope_excluded = 1;
-CREATE UNIQUE INDEX IF NOT EXISTS idx_operations_conflict_pending_item
-    ON operations(item_id)
-    WHERE operation_type = 'resolveConflict' AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');
-CREATE INDEX IF NOT EXISTS idx_operations_conflict_pending_root
-    ON operations(root_id)
-    WHERE operation_type = 'resolveConflict' AND state IN ('ready', 'inFlight', 'verify', 'unknownOutcome');

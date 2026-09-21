@@ -25,10 +25,10 @@
 ## 验证
 
 ```sh
-swift test --filter 'ChangesRecoveryTests|DirectoryBarrierTests|ConflictRecoveryTests|FailureStateSafetyTests|BootstrapResumeSafetyTests|RootLossSafetyTests|PublicationSafetyTests|DurableIntentTests|DeletionSafetyTests|ReconcilerTests'
+swift test --filter 'ChangesRecoveryTests|DirectoryBarrierTests|SyncConflictTests|FailureStateSafetyTests|BootstrapResumeSafetyTests|RootLossSafetyTests|PublicationSafetyTests|DurableIntentTests|DeletionSafetyTests|ReconcilerTests'
 ```
 
-86 项测试通过，覆盖现有根丢失、删除、目录后代保护、冲突恢复、失败与发布安全，以及新增 A16 场景：
+86 项测试通过，覆盖现有根丢失、删除、目录后代保护、持久冲突、失败与发布安全，以及新增 A16 场景：
 
 - 扫描交出首文件后暂停尾目录，真实 multipart 请求已完成；在 HTTP 边界通过独立 SQLite 连接核验观察和 create intent 已提交。
 - 尾部正常完成、枚举错误、实际 Task 取消三种结束方式；返回后首文件回执已持久化，未枚举尾目录不会被标记 absent/deleted。

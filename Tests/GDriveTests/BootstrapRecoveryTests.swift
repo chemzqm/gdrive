@@ -65,8 +65,8 @@ extension URLRequest {
     }
 }
 
-@Suite("Directory Tracker Failure and Cancellation Recovery (A06)")
-struct DirectoryTrackerRecoveryTests {
+@Suite("Bootstrap Failure and Cancellation Recovery")
+struct BootstrapRecoveryTests {
     private let context = TestHTTPContext(TestRequestHandler())
 
     private static func bootstrapFailureResponse(
@@ -180,7 +180,7 @@ struct DirectoryTrackerRecoveryTests {
         #expect(stats.bytesDownloaded == contents.values.reduce(0) { $0 + Int64($1.count) })
     }
 
-    // MARK: - Unit Tests: DirectoryTracker (Probe P04 & Error Propagation)
+    // MARK: - Bootstrap download recovery
 
     @Test("A bootstrap download receipt database failure remains recoverable after reopening")
     func downloadReceiptDatabaseFailureThrows() async throws {
@@ -368,129 +368,6 @@ struct DirectoryTrackerRecoveryTests {
         for failure in ["network", "checksum", "publication"] {
             try await run(failure)
         }
-    }
-
-    @Test("P04 probe: Cancelling a task waiting on awaitParentReady resumes with CancellationError in bounded time")
-    func testCancellationWakesUpWaiter() async throws {
-        let tracker = DirectoryTracker(remoteRootId: "remote_root")
-
-        let waiterTask = Task<String, Error> {
-            try await tracker.awaitParentReady(parentRelPath: "sub_dir")
-        }
-
-        // Give the task time to suspend in awaitParentReady
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        // Cancel the waiting task
-        waiterTask.cancel()
-
-        // It must finish immediately (bounded time) throwing CancellationError
-        let startTime = DispatchTime.now()
-        do {
-            _ = try await waiterTask.value
-            Issue.record("Expected CancellationError to be thrown")
-        } catch is CancellationError {
-            // Success
-        } catch {
-            Issue.record("Unexpected error: \(error)")
-        }
-
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000
-        #expect(elapsedMs < 500, "Cancellation wake-up should be instantaneous without requiring markDirectoryReady")
-    }
-
-    @Test("DirectoryTracker wakes up all waiters with failure when markDirectoryFailed is called")
-    func testMarkDirectoryFailedWakesUpWaiters() async throws {
-        let tracker = DirectoryTracker(remoteRootId: "remote_root")
-
-        let task1 = Task<String, Error> {
-            try await tracker.awaitParentReady(parentRelPath: "failing_dir")
-        }
-        let task2 = Task<String, Error> {
-            try await tracker.awaitParentReady(parentRelPath: "failing_dir")
-        }
-
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        enum TestFailure: Error {
-            case simulated403
-        }
-
-        await tracker.markDirectoryFailed(relPath: "failing_dir", error: TestFailure.simulated403)
-
-        // Both task1 and task2 should complete promptly
-        var thrown1 = false
-        var thrown2 = false
-        do {
-            _ = try await task1.value
-        } catch {
-            thrown1 = true
-        }
-
-        do {
-            _ = try await task2.value
-        } catch {
-            thrown2 = true
-        }
-
-        #expect(thrown1)
-        #expect(thrown2)
-
-        // Calling awaitParentReady for an already failed directory should throw immediately
-        var thrown3 = false
-        do {
-            _ = try await tracker.awaitParentReady(parentRelPath: "failing_dir")
-        } catch {
-            thrown3 = true
-        }
-        #expect(thrown3)
-    }
-
-    @Test("DirectoryTracker cancelAll wakes up all pending waiters")
-    func testCancelAllWakesUpAllWaiters() async throws {
-        let tracker = DirectoryTracker(remoteRootId: "remote_root")
-
-        let task1 = Task<String, Error> {
-            try await tracker.awaitParentReady(parentRelPath: "dir1")
-        }
-        let task2 = Task<String, Error> {
-            try await tracker.awaitParentReady(parentRelPath: "dir2")
-        }
-
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        await tracker.cancelAll()
-
-        var thrownCount = 0
-        do { _ = try await task1.value } catch { thrownCount += 1 }
-        do { _ = try await task2.value } catch { thrownCount += 1 }
-
-        #expect(thrownCount == 2)
-    }
-
-    @Test("DirectoryTracker terminal states are immutable: ready cannot become failed, failed cannot become ready")
-    func testTerminalStatesImmutable() async throws {
-        let tracker = DirectoryTracker(remoteRootId: "remote_root")
-
-        // Root is ready
-        let rootId = try await tracker.awaitParentReady(parentRelPath: "")
-        #expect(rootId == "remote_root")
-
-        // Marking root failed should be ignored
-        enum TestErr: Error { case failed }
-        await tracker.markDirectoryFailed(relPath: "", error: TestErr.failed)
-        let rootIdAfter = try await tracker.awaitParentReady(parentRelPath: "")
-        #expect(rootIdAfter == "remote_root")
-
-        // Normal dir marked ready
-        await tracker.markDirectoryReady(relPath: "dirA", remoteId: "remoteA")
-        let dirAId = try await tracker.awaitParentReady(parentRelPath: "dirA")
-        #expect(dirAId == "remoteA")
-
-        // Marking dirA failed afterwards should be ignored
-        await tracker.markDirectoryFailed(relPath: "dirA", error: TestErr.failed)
-        let dirAIdAfter = try await tracker.awaitParentReady(parentRelPath: "dirA")
-        #expect(dirAIdAfter == "remoteA")
     }
 
     // MARK: - Integration Tests: syncLocalToRemoteEmpty with Injections (A06 Swift Acceptance)

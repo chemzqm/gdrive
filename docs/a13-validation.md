@@ -59,5 +59,5 @@ GDRIVE_PERF=1 GDRIVE_PERF_SCANS=10 swift test -c release --filter TransferPerfor
 最终离线回归 **86 个测试、13 个 suite 全部通过**，包含 14 个 A13 测试及其参数化 case。没有运行默认启用的实网测试。`git diff --check` 通过。
 
 ```sh
-swift test --filter 'ChangesRecoveryTests|DirectoryBarrierTests|RootLossSafetyTests|ConflictRecoveryTests|PublicationSafetyTests|DurableIntentTests|BootstrapResumeSafetyTests|ReconcilerTests|StateStoreTests|IDPoolTests|DirectoryTrackerRecoveryTests|FailureStateSafetyTests|DeletionSafetyTests'
+swift test --filter 'ChangesRecoveryTests|DirectoryBarrierTests|RootLossSafetyTests|SyncConflictTests|PublicationSafetyTests|DurableIntentTests|BootstrapResumeSafetyTests|ReconcilerTests|StateStoreTests|IDPoolTests|BootstrapRecoveryTests|FailureStateSafetyTests|DeletionSafetyTests'
 ```

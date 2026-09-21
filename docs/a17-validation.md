@@ -17,7 +17,7 @@
 ```sh
 swift build
 swift test --filter incrementalLargeFileUsesResumableChunks
-swift test --filter 'SyncEngineTests|DirectoryTrackerRecoveryTests|BootstrapResumeSafetyTests|DurableIntentTests|PublicationSafetyTests|ChangesRecoveryTests'
+swift test --filter 'SyncEngineTests|BootstrapRecoveryTests|BootstrapResumeSafetyTests|DurableIntentTests|PublicationSafetyTests|ChangesRecoveryTests'
 ```
 
 新增回归用例创建 9 MiB 增量文件，断言只发起 resumable 会话和两个分块 PUT，不出现 multipart，并核验最终共同基线。初始化、父目录失败/取消、持久创建意图、稳定输入、增量扫描与 Changes 回归也一并执行。

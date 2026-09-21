@@ -25,7 +25,6 @@ final class IncrementalSyncRun: Sendable {
     let seenDirTracker: SeenItemsTracker
     let scanProgress: ScanProgress
     let startTime: DispatchTime
-    let recoveredConflicts: Int
     let recoveredCleanups: Int
     let downloadCache: DownloadCache
     let collidedDownloads: OSAllocatedUnfairLock<[CollidedDownload]>
@@ -53,7 +52,6 @@ final class IncrementalSyncRun: Sendable {
         seenDirTracker: SeenItemsTracker,
         scanProgress: ScanProgress,
         startTime: DispatchTime,
-        recoveredConflicts: Int,
         recoveredCleanups: Int
     ) {
         self.engine = engine
@@ -78,7 +76,6 @@ final class IncrementalSyncRun: Sendable {
         self.seenDirTracker = seenDirTracker
         self.scanProgress = scanProgress
         self.startTime = startTime
-        self.recoveredConflicts = recoveredConflicts
         self.recoveredCleanups = recoveredCleanups
         self.downloadCache = DownloadCache()
         self.collidedDownloads = OSAllocatedUnfairLock(initialState: [])
@@ -141,44 +138,6 @@ extension IncrementalSyncRun {
         }
         let recoveredCleanups = try await engine.recoverPendingItemCleanups(
             rootID: rootID, taskRegistry: itemTaskRegistry)
-        let pendingConflicts = try await ConflictOperation.pending(
-            store: engine.store, rootID: rootID)
-        var recoverableConflicts: [ConflictOperation] = []
-        for pendingOperation in pendingConflicts {
-            do {
-                if try await pendingOperation.canAutomaticallyRecover(store: engine.store) {
-                    recoverableConflicts.append(pendingOperation)
-                } else {
-                    engine.logger.error(
-                        "Pending conflict cannot be recovered automatically and remains blocked [\(pendingOperation.originalPath)]"
-                    )
-                }
-            } catch {
-                engine.logger.error(
-                    "Failed to inspect pending conflict; it remains blocked [\(pendingOperation.originalPath)]: \(error)"
-                )
-            }
-        }
-        let recoveredConflicts = OSAllocatedUnfairLock(initialState: 0)
-        if !recoverableConflicts.isEmpty {
-            await withTaskGroup(of: Void.self) { group in
-                let limit = max(1, min(64, maxConcurrency))
-                for (index, pendingOperation) in recoverableConflicts.enumerated() {
-                    if index >= limit { await group.next() }
-                    group.addTask {
-                        do {
-                            try await engine.resolveConflict(
-                                pendingOperation, temporaryDirectory: downloadDirectory)
-                            recoveredConflicts.withLock { $0 += 1 }
-                        } catch {
-                            engine.logger.error(
-                                "Pending conflict recovery failed and remains blocked [\(pendingOperation.originalPath)]: \(error)"
-                            )
-                        }
-                    }
-                }
-            }
-        }
         let remoteChanges = RemoteChanges(
             store: engine.store, client: engine.client, rootID: rootID, remoteRootID: remoteRootID,
             rootURL: rootURL)
@@ -201,8 +160,7 @@ extension IncrementalSyncRun {
             scheduled: OSAllocatedUnfairLock(initialState: Set<Int64>()),
             seenTracker: SeenItemsTracker(), seenDirTracker: SeenItemsTracker(),
             scanProgress: ScanProgress(),
-            startTime: startTime, recoveredConflicts: recoveredConflicts.withLock { $0 },
-            recoveredCleanups: recoveredCleanups
+            startTime: startTime, recoveredCleanups: recoveredCleanups
         )
         prepared = true
         return run
@@ -293,7 +251,6 @@ extension IncrementalSyncRun {
         stats.filesDownloaded = actionTracker.downloaded
         stats.bytesDownloaded = actionTracker.bytesDown
         stats.filesDeleted = recoveredCleanups + actionTracker.deleted
-        stats.conflictsResolved = recoveredConflicts + actionTracker.conflicts.withLock { $0 }
         stats.conflicts = try await SyncConflictStore.list(store: engine.store, rootID: rootID)
         stats.remoteWorkPending += stats.conflicts.count
         stats.filesFailed = scanProgress.failed + actionTracker.failures.withLock { $0 }

@@ -17,7 +17,6 @@ final class ActionTracker: @unchecked Sendable {
     var downloaded: Int { counts.withLock { $0.downloaded } }
     var bytesDown: Int64 { counts.withLock { $0.bytesDown } }
     var deleted: Int { counts.withLock { $0.deleted } }
-    let conflicts = OSAllocatedUnfairLock(initialState: 0)
     let failures = OSAllocatedUnfairLock(initialState: 0)
     private let databaseFailure = OSAllocatedUnfairLock<Error?>(initialState: nil)
 

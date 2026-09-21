@@ -13,7 +13,6 @@ public struct SyncStats: Sendable {
     public var filesDownloaded: Int = 0
     public var bytesDownloaded: Int64 = 0
     public var filesDeleted: Int = 0
-    public var conflictsResolved: Int = 0
     public var conflicts: [SyncConflict] = []
     /// Durable remote observations/pages still awaiting a later reconcile round.
     public var remoteWorkPending: Int = 0
