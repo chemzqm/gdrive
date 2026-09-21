@@ -112,11 +112,6 @@ public actor DedicatedWriter {
         stats
     }
 
-    /// Reset stats
-    public func resetStats() {
-        stats = WriterStats()
-    }
-
     /// Immediately submit transactions independently (first file intention, key directory unlock, etc., never wait for approval)
     @discardableResult
     public func writeImmediate<T: Sendable>(_ block: @Sendable (SQLiteConnection) throws -> T) throws -> T {
@@ -197,11 +192,6 @@ public actor DedicatedWriter {
                 task.continuation.resume(throwing: error)
             }
         }
-    }
-
-    /// Execute Directly SQL(As schema Initialization)
-    public func executeDirect(_ sql: String) throws {
-        try connection.execute(sql)
     }
 
     /// Force current buffer to be emptied and transaction committed

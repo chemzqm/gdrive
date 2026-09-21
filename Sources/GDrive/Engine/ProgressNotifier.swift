@@ -99,18 +99,6 @@ public final class ProgressNotifier: @unchecked Sendable {
         os_unfair_lock_unlock(&lock)
     }
 
-    /// Take a snapshot of your current progress
-    public func currentProgress() -> SyncProgress {
-        os_unfair_lock_lock(&lock)
-        defer { os_unfair_lock_unlock(&lock) }
-        return SyncProgress(
-            completedFiles: completedFiles,
-            totalDiscoveredFiles: totalDiscoveredFiles,
-            completedBytes: completedBytes,
-            totalDiscoveredBytes: totalDiscoveredBytes
-        )
-    }
-
     /// Review and distribute changes (back office only Ticker triggered, the worker thread never executes an external closure)
     func notifyIfChanged() {
         guard let onProgress = self.onProgress else { return }

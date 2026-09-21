@@ -371,6 +371,13 @@ extension SyncEngine {
                 }
             } catch {
                 if DatabaseFailure.isSQLite(error) { throw error }
+                try await SyncIssueStore.record(
+                    store: store, rootID: rootID,
+                    subject: SyncIssueSubject(
+                        itemID: entry.itemID,
+                        remoteFileID: entry.conflict.remoteFileId,
+                        relativePath: entry.conflict.relativePath),
+                    stage: .conflictRefresh, error: error)
                 logger.error("Failed to refresh sync conflict [\(entry.conflict.relativePath)]: \(error)")
             }
         }

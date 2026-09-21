@@ -156,37 +156,6 @@ enum DurableCreateIntentStore {
         return try box.load()
     }
 
-    static func prepareMultipartUpload(
-        store: StateStore,
-        rootID: Int64,
-        itemID: Int64? = nil,
-        parentItemID: Int64,
-        name: String,
-        targetParentRemoteID: String,
-        candidateRemoteID: String,
-        device: Int64,
-        inode: Int64,
-        mtime: Int64,
-        size: Int64,
-        sha256: String
-    ) async throws -> DurableCreateIntent {
-        try await prepareFileUpload(
-            store: store,
-            rootID: rootID,
-            itemID: itemID,
-            parentItemID: parentItemID,
-            name: name,
-            targetParentRemoteID: targetParentRemoteID,
-            candidateRemoteID: candidateRemoteID,
-            device: device,
-            inode: inode,
-            mtime: mtime,
-            size: size,
-            sha256: sha256,
-            transport: .multipart
-        )
-    }
-
     static func markUnknownOutcome(
         store: StateStore,
         operationID: String,
@@ -213,7 +182,7 @@ enum DurableCreateIntentStore {
     ) throws {
         let stmt = try conn.cachedStatement("""
         UPDATE operations
-        SET state = 'completed', last_error_code = NULL, last_error_message = NULL, updated_at = ?
+        SET state = 'completed', last_error_message = NULL, updated_at = ?
         WHERE operation_id = ?;
         """)
         stmt.bindDouble(now, at: 1)

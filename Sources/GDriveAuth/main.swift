@@ -16,7 +16,7 @@ struct GDriveAuthCLI {
                 if let exp = data.expiresAt { print("Expiration time: \(exp)") }
             } else if CommandLine.arguments.contains("ids") || CommandLine.arguments.contains("generate-ids") {
                 let count = CommandLine.arguments.dropFirst(2).first.flatMap(Int.init) ?? 10
-                let api = DriveAPI(auth: auth)
+                let api = DriveClient(auth: auth)
                 let ids = try await api.generateIds(count: count)
                 print("✅ Retrieved \(ids.count) IDs:")
                 for id in ids.prefix(10) { print("  \(id)") }

@@ -220,6 +220,19 @@ struct FailureStateSafetyTests {
             failedMoveBlockedDescendants = true
         }
         #expect(failedMoveBlockedDescendants)
+        let recorded = try await engine.listSyncIssues(localPath: localRootDir.path)
+        #expect(recorded.totalCount == 1)
+        #expect(recorded.issues.first?.stage == .pathUpdate)
+        #expect(recorded.issues.first?.relativePath == "dir_A")
+        #expect(recorded.issues.first?.occurrenceCount == 1)
+
+        // A new incremental run clears the previous run's issues before recording its own failures.
+        await #expect(throws: (any Error).self) {
+            _ = try await engine.syncIncremental(localPath: localRootDir.path)
+        }
+        let retriedFailure = try await engine.listSyncIssues(localPath: localRootDir.path)
+        #expect(retriedFailure.totalCount == 1)
+        #expect(retriedFailure.issues.first?.occurrenceCount == 1)
 
         // SQLite should NOT be updated to 'dir_B' because remote update failed!
         try await store.read { conn in
@@ -244,7 +257,9 @@ struct FailureStateSafetyTests {
 
         // 2. Allow updateMetadata to succeed on retry
         control.shouldFail = false
-        try await engine.syncIncremental(localPath: localRootDir.path)
+        let recovered = try await engine.syncIncremental(localPath: localRootDir.path)
+        #expect(recovered.issueCount == 0)
+        #expect(try await engine.listSyncIssues(localPath: localRootDir.path).issues.isEmpty)
 
         // SQLite should now be updated to 'dir_B'
         try await store.read { conn in

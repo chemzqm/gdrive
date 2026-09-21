@@ -19,6 +19,7 @@ public struct SyncStats: Sendable {
     /// Remote identities blocked by equivalent local names; rename remotely to resolve.
     public var remoteNameConflicts: Int = 0
     public var filesFailed: Int = 0
+    public var issueCount: Int = 0
     public var elapsedSeconds: Double = 0
 }
 
@@ -61,8 +62,6 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
     case localRootNotFound(path: String)
     case rootBusy(path: String)
     case remoteRootLost(remoteId: String, reason: String)
-    case rootNotConfigured(remoteId: String)
-    case invalidDirectory(path: String)
     case localFileModified(path: String)
     case localFilePublicationFailed(path: String)
     case general(String)
@@ -79,10 +78,6 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
             return "The local sync root is already being synchronized in this process: \(path)"
         case .remoteRootLost(let remoteId, let reason):
             return "The remote sync root was removed or trashed (\(reason)): \(remoteId). Sync stopped to prevent local deletion propagation."
-        case .rootNotConfigured(let remoteId):
-            return "No matching sync root was found. Run initial sync first: \(remoteId)"
-        case .invalidDirectory(let path):
-            return "Path is not a valid directory: \(path)"
         case .localFileModified(let path):
             return "Local file changed during synchronization: \(path)"
         case .localFilePublicationFailed(let path):
@@ -166,11 +161,6 @@ public final class SyncEngine: Sendable {
 
     /// Get a memory snapshot of what's currently being transferred, what's waiting in the queue, and the real-time sliding speed in bytes per second (per 500ms automatic refresh)
     public var transferStatus: TransferSnapshot {
-        monitor.getSnapshot()
-    }
-
-    /// External direct call to obtain current transmission status snapshot
-    public func getTransferStatus() -> TransferSnapshot {
         monitor.getSnapshot()
     }
 

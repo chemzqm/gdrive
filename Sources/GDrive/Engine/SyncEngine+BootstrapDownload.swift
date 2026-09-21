@@ -269,6 +269,16 @@ extension SyncEngine {
                 } catch {
                     recordDatabaseFailure(error)
                     progress.recordFailure()
+                    do {
+                        try await SyncIssueStore.record(
+                            store: self.store, rootID: rootId,
+                            subject: SyncIssueSubject(
+                                itemID: nil, remoteFileID: item.id,
+                                relativePath: relativePath),
+                            stage: .download, error: error)
+                    } catch {
+                        recordDatabaseFailure(error)
+                    }
                     self.logger.error("Failed to download file [\(item.name)]: \(error)")
                 }
             }
@@ -384,6 +394,10 @@ extension SyncEngine {
         stats.filesFailed = filesFailed
         stats.conflicts = try await SyncConflictStore.list(store: store, rootID: rootId)
         stats.remoteWorkPending = filesFailed + stats.conflicts.count
+        if filesFailed == 0 && stats.remoteWorkPending == 0 && stats.conflicts.isEmpty {
+            try await SyncIssueStore.clear(store: store, rootID: rootId)
+        }
+        stats.issueCount = try await SyncIssueStore.count(store: store, rootID: rootId)
         stats.elapsedSeconds = elapsed
         notifier.finish()
 

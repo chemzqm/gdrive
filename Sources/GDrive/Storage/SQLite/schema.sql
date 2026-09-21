@@ -131,25 +131,21 @@ CREATE TABLE IF NOT EXISTS operations (
     root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
     item_id INTEGER NOT NULL REFERENCES items(item_id) ON DELETE CASCADE,
     operation_type TEXT NOT NULL CHECK (operation_type IN (
-        'createDirectory', 'uploadMultipart', 'createResumableUpload', 'uploadResumable',
-        'download', 'move', 'rename', 'trashRemote', 'deleteLocal'
+        'createDirectory', 'uploadMultipart', 'uploadResumable',
+        'trashRemote', 'deleteLocal'
     )),
     state TEXT NOT NULL CHECK (state IN (
         'ready', 'inFlight', 'verify', 'unknownOutcome',
         'completed', 'failed', 'cancelled'
     )),
     expected_local_generation INTEGER NOT NULL DEFAULT 0 CHECK (expected_local_generation >= 0),
-    expected_remote_version INTEGER CHECK (expected_remote_version IS NULL OR expected_remote_version >= 0),
     expected_sha256 TEXT CHECK (expected_sha256 IS NULL OR length(expected_sha256) = 64),
     target_remote_id TEXT,
     target_parent_remote_id TEXT,
     session_uri TEXT,
     confirmed_offset INTEGER NOT NULL DEFAULT 0 CHECK (confirmed_offset >= 0),
     total_bytes INTEGER CHECK (total_bytes IS NULL OR total_bytes >= 0),
-    staging_path TEXT,
     payload TEXT,
-    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
-    last_error_code TEXT,
     last_error_message TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
@@ -225,6 +221,38 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
     UNIQUE(root_id, remote_file_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sync_conflicts_root ON sync_conflicts(root_id);
+
+-- Actionable item-level failures retained until the whole sync root converges.
+CREATE TABLE IF NOT EXISTS sync_issues (
+    issue_id TEXT PRIMARY KEY NOT NULL,
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    subject_key TEXT NOT NULL,
+    item_id INTEGER,
+    remote_file_id TEXT,
+    relative_path TEXT NOT NULL,
+    stage TEXT NOT NULL CHECK(stage IN (
+        'localScan', 'createDirectory', 'upload', 'download',
+        'pathUpdate', 'delete', 'conflictRefresh'
+    )),
+    category TEXT NOT NULL CHECK(category IN (
+        'network', 'rateLimited', 'permissionDenied', 'remoteMissing',
+        'remoteConflict', 'integrityMismatch', 'invalidResponse',
+        'safetyBlocked', 'localChanged', 'localIO', 'unsupportedFilesystem',
+        'staleState', 'unknown'
+    )),
+    suggested_action TEXT NOT NULL CHECK(suggested_action IN (
+        'retry', 'retryLater', 'checkPermissions', 'inspectLocalFile',
+        'renameRemote', 'resolveManually'
+    )),
+    message TEXT NOT NULL,
+    retry_at REAL,
+    first_seen_at REAL NOT NULL,
+    last_seen_at REAL NOT NULL,
+    occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK(occurrence_count >= 1),
+    UNIQUE(root_id, subject_key, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_sync_issues_root_seen
+    ON sync_issues(root_id, last_seen_at DESC, issue_id);
 
 -- Local files whose content differed from the SQLite baseline when an enclosing
 -- directory was trashed because the remote directory had been deleted.

@@ -37,6 +37,26 @@ struct CollidedDownload: Sendable {
 }
 
 extension IncrementalSyncRun {
+    func issueSubject(for item: DirtyRecord, relativePath: String? = nil) -> SyncIssueSubject {
+        let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
+        let path = relativePath ?? (parent.isEmpty ? item.name : "\(parent)/\(item.name)")
+        return SyncIssueSubject(
+            itemID: item.itemId, remoteFileID: item.remoteFileId, relativePath: path)
+    }
+
+    func recordIssue(
+        _ error: Error, stage: SyncIssue.Stage, subject: SyncIssueSubject
+    ) async {
+        guard !(error is CancellationError) else { return }
+        do {
+            try await SyncIssueStore.record(
+                store: engine.store, rootID: rootID, subject: subject,
+                stage: stage, error: error)
+        } catch {
+            actionTracker.recordDatabaseFailure(error)
+        }
+    }
+
     private func downloadPlanIsCurrent(_ item: DirtyRecord) async throws -> Bool {
         try await engine.store.read { conn in
             let stmt = try conn.cachedStatement(
@@ -92,6 +112,9 @@ extension IncrementalSyncRun {
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 actionTracker.recordDatabaseFailure(error)
+                await recordIssue(
+                    error, stage: .download,
+                    subject: issueSubject(for: item, relativePath: entry.relPath))
                 engine.logger.error("Failed to re-reconcile collided download [\(item.name)]: \(error)")
             }
         }
@@ -132,7 +155,20 @@ extension IncrementalSyncRun {
             try actionTracker.throwIfDatabaseFailure()
             guard let decision = decisionForScheduling(item, duringScan: duringScan) else { continue }
             try Task.checkCancellation()
-            try await applyDecision(decision, to: item, receipts: &receipts)
+            do {
+                try await applyDecision(decision, to: item, receipts: &receipts)
+            } catch {
+                switch decision {
+                case .trashRemote, .deleteLocal:
+                    await recordIssue(error, stage: .delete, subject: issueSubject(for: item))
+                case .unchanged
+                    where item.local?.status == .absent && item.remote?.status == .trashed:
+                    await recordIssue(error, stage: .delete, subject: issueSubject(for: item))
+                default:
+                    break
+                }
+                throw error
+            }
             if receipts.count >= 64 {
                 let batch = receipts
                 try await engine.store.write { conn in
@@ -191,6 +227,7 @@ extension IncrementalSyncRun {
     ) async {
         actionTracker.failures.withLock { $0 += 1 }
         actionTracker.recordDatabaseFailure(error)
+        await recordIssue(error, stage: .upload, subject: issueSubject(for: item))
         if let createIntent {
             do {
                 try await DurableCreateIntentStore.markUnknownOutcome(
@@ -429,6 +466,7 @@ extension IncrementalSyncRun {
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 actionTracker.recordDatabaseFailure(error)
+                await recordIssue(error, stage: .download, subject: issueSubject(for: item))
                 engine.logger.error("Incremental download failed [\(item.name)]: \(error)")
             }
             }
@@ -460,7 +498,7 @@ extension IncrementalSyncRun {
         actionTracker.counts.withLock { $0.deleted += 1 }
     }
 
-    private func scheduleConflict(_ item: DirtyRecord, winner: ConflictWinner, conflictId: String) async throws {
+    private func scheduleConflict(_ item: DirtyRecord) async throws {
         try await acquireTransfer()
         do {
             _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
@@ -468,11 +506,10 @@ extension IncrementalSyncRun {
                 syncSemaphore.signal()
             }
             do {
-                guard winner == .remote, let remoteID = item.remoteFileId else {
+                guard let remoteID = item.remoteFileId else {
                     throw SyncEngineError.general(
                         "The conflict lacks valid evidence of the content of both parties")
                 }
-                _ = conflictId
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
                 let relativePath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                 let original = rootURL.appendingPathComponent(relativePath)
@@ -520,6 +557,8 @@ extension IncrementalSyncRun {
             } catch {
                 actionTracker.failures.withLock { $0 += 1 }
                 actionTracker.recordDatabaseFailure(error)
+                await recordIssue(
+                    error, stage: .conflictRefresh, subject: issueSubject(for: item))
                 engine.logger.error(
                     "Failed to handle file conflicts [\(item.name)]: \(error)")
             }
@@ -570,8 +609,8 @@ extension IncrementalSyncRun {
         case .deleteLocal:
             try await deleteLocalFile(item)
 
-        case .conflict(let winner, let conflictId):
-            try await scheduleConflict(item, winner: winner, conflictId: conflictId)
+        case .conflict:
+            try await scheduleConflict(item)
 
         case .unchanged:
             if item.local?.status == .absent && item.remote?.status == .trashed {

@@ -283,14 +283,30 @@ extension SyncEngine {
             return result
         }
         for cleanup in pending {
-            if cleanup.operationType == "trashRemote" {
-                try await cleanupLocalDeletionToRemoteUnlocked(
-                    itemID: cleanup.itemID, expected: cleanup.generations,
-                    taskRegistry: taskRegistry)
-            } else {
-                try await cleanupRemoteDeletionToLocalUnlocked(
-                    itemID: cleanup.itemID, expected: cleanup.generations,
-                    taskRegistry: taskRegistry)
+            let plan = try await makeCleanupPlan(
+                itemID: cleanup.itemID, expected: cleanup.generations)
+            do {
+                if cleanup.operationType == "trashRemote" {
+                    try await cleanupLocalDeletionToRemoteUnlocked(
+                        itemID: cleanup.itemID, expected: cleanup.generations,
+                        taskRegistry: taskRegistry)
+                } else {
+                    try await cleanupRemoteDeletionToLocalUnlocked(
+                        itemID: cleanup.itemID, expected: cleanup.generations,
+                        taskRegistry: taskRegistry)
+                }
+            } catch {
+                if DatabaseFailure.isSQLite(error) { throw error }
+                let root = URL(fileURLWithPath: plan.localRootPath).standardizedFileURL.path
+                let path = plan.localURL.standardizedFileURL.path
+                let relative = path == root ? "" : String(path.dropFirst(root.count + 1))
+                try await SyncIssueStore.record(
+                    store: store, rootID: rootID,
+                    subject: SyncIssueSubject(
+                        itemID: plan.itemID, remoteFileID: plan.remoteID,
+                        relativePath: relative),
+                    stage: .delete, error: error)
+                throw error
             }
         }
         return pending.count

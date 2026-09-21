@@ -700,6 +700,11 @@ struct ChangesRecoveryTests {
         let blocked = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(blocked.remoteWorkPending > 0)
         #expect(blocked.remoteNameConflicts == 1)
+        #expect(blocked.issueCount == 1)
+        let issues = try await testFixture.engine.listSyncIssues(localPath: testFixture.local.path)
+        #expect(issues.totalCount == 1)
+        #expect(issues.issues.first?.category == .remoteConflict)
+        #expect(issues.issues.first?.suggestedAction == .renameRemote)
         #expect(blocked.filesDownloaded == 0)
         #expect(try FileManager.default.contentsOfDirectory(atPath: testFixture.local.path).isEmpty)
         let renamed = remoteFile("two", parent: "root", content: "second", name: "unique")
@@ -707,6 +712,8 @@ struct ChangesRecoveryTests {
             $0.pages["steady"] = DriveChangesPage(nextPageToken: nil, newStartPageToken: "done", changes: [DriveChange(fileId: renamed.id, removed: false, file: renamed)])
         }
         try await converge(testFixture)
+        #expect(try await testFixture.engine.listSyncIssues(
+            localPath: testFixture.local.path).issues.isEmpty)
         #expect(try String(contentsOf: testFixture.local.appendingPathComponent(names[0]), encoding: .utf8) == "first")
         #expect(try String(contentsOf: testFixture.local.appendingPathComponent("unique"), encoding: .utf8) == "second")
     }

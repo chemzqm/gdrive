@@ -1,5 +1,4 @@
 import Foundation
-import CryptoKit
 
 /// Common baseline (B: Baseline)
 public struct ItemBaseline: Sendable, Equatable {
@@ -58,12 +57,6 @@ public struct RemoteObservation: Sendable, Equatable {
     }
 }
 
-/// Conflict Reservation Winner
-public enum ConflictWinner: String, Sendable {
-    case local
-    case remote
-}
-
 /// Reconciler Coordinate Decision Actions
 public enum ReconcileDecision: Sendable, Equatable {
     /// Modify or add locally only -> Upload to remote
@@ -73,7 +66,7 @@ public enum ReconcileDecision: Sendable, Equatable {
     /// Modified by both parties but SHA-256 Same digest -> Zero Transmission Propulsion Common Baseline
     case matchUpdateBaseline(sha256: String, size: Int64)
     /// Modified by both parties and SHA-256 Inconsistent -> Keep conflicting copies of both versions
-    case conflict(winner: ConflictWinner, conflictId: String)
+    case conflict
     /// Local deleted and not modified remotely -> Move Remote to Trash
     case trashRemote
     /// Remote deleted and not modified locally -> Secure Recoverable Delete Local Files
@@ -91,12 +84,6 @@ public enum ReconcileDecision: Sendable, Equatable {
 /// with a common baseline B,Local Observation L,Remote Observation R unbiased item-by-item comparison,mtime Doesn't decide who covers who.
 /// Strictly guaranteed“Existence Evidence”And“Content Evidence”Completeness: Reject any one-sided unknown or missing SHA-256 No evidence of summary deletion, override decision.
 public struct Reconciler: Sendable {
-    // Content identity is deterministic; execution scopes it to the persisted item ID.
-    private static func conflictIdentity(base: String?, local: String?, remote: String?) -> String {
-        let input = [base ?? "", local ?? "", remote ?? ""].joined(separator: ":")
-        return SHA256.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
-    }
-
     public static func decide(
         baseline: ItemBaseline?,
         local: LocalObservation?,
@@ -116,7 +103,7 @@ public struct Reconciler: Sendable {
 
         // 4. No common baseline B(Initial sync or startup file)
         guard let baseSha else {
-            return decideWithoutBaseline(baseSha: baseSha, localSha: localSha, remoteSha: remoteSha,
+            return decideWithoutBaseline(localSha: localSha, remoteSha: remoteSha,
                                          localStatus: localStatus, remoteStatus: remoteStatus, local: local)
         }
 
@@ -132,8 +119,7 @@ public struct Reconciler: Sendable {
 
         if let decision = deletionDecision(localDeleted: localDeleted, remoteDeleted: remoteDeleted,
                                            localChanged: localChanged, remoteChanged: remoteChanged,
-                                           localUnchanged: localUnchanged, remoteUnchanged: remoteUnchanged,
-                                           baseSha: baseSha, localSha: localSha, remoteSha: remoteSha) {
+                                           localUnchanged: localUnchanged, remoteUnchanged: remoteUnchanged) {
             return decision
         }
 
@@ -154,8 +140,7 @@ public struct Reconciler: Sendable {
             if let localSha, let remoteSha, localSha == remoteSha {
                 return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
             } else {
-                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                return .conflict(winner: .remote, conflictId: String(conflictId))
+                return .conflict
             }
         }
 
@@ -193,7 +178,7 @@ public struct Reconciler: Sendable {
     }
 
     private static func decideWithoutBaseline(
-        baseSha: String?, localSha: String?, remoteSha: String?,
+        localSha: String?, remoteSha: String?,
         localStatus: LocalObservation.Status, remoteStatus: RemoteObservation.Status,
         local: LocalObservation?
     ) -> ReconcileDecision {
@@ -210,8 +195,7 @@ public struct Reconciler: Sendable {
             if let localSha, let remoteSha, localSha == remoteSha {
                 return .matchUpdateBaseline(sha256: localSha, size: local?.size ?? 0)
             } else {
-                let conflictId = Self.conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                return .conflict(winner: .remote, conflictId: String(conflictId))
+                return .conflict
             }
         }
         // Neither local nor remote
@@ -232,8 +216,7 @@ public struct Reconciler: Sendable {
     private static func deletionDecision(
         localDeleted: Bool, remoteDeleted: Bool,
         localChanged: Bool, remoteChanged: Bool,
-        localUnchanged: Bool, remoteUnchanged: Bool,
-        baseSha: String?, localSha: String?, remoteSha: String?
+        localUnchanged: Bool, remoteUnchanged: Bool
     ) -> ReconcileDecision? {
         // 5.1 Delete on both ends
         if localDeleted && remoteDeleted {
@@ -243,8 +226,7 @@ public struct Reconciler: Sendable {
         // 5.2 Local deleted, remote not deleted
         if localDeleted && !remoteDeleted {
             if remoteChanged {
-                let id = conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                return .conflict(winner: .remote, conflictId: id)
+                return .conflict
             } else if remoteUnchanged {
                 // Local deletion, remote confirmation unchanged -> Safely move to Remote Recycle Bin
                 return .trashRemote
@@ -254,8 +236,7 @@ public struct Reconciler: Sendable {
         // 5.3 Remote deleted, local not deleted
         if remoteDeleted && !localDeleted {
             if localChanged {
-                let id = conflictIdentity(base: baseSha, local: localSha, remote: remoteSha)
-                return .conflict(winner: .remote, conflictId: id)
+                return .conflict
             } else if localUnchanged {
                 // Remotely deleted, local confirmation unchanged -> Safely delete local files
                 return .deleteLocal

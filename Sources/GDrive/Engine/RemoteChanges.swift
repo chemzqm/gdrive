@@ -621,21 +621,39 @@ struct RemoteChanges: Sendable {
         }
     }
 
-    /// Explicitly expose blocked name mappings without changing the durable inbox payload.
-    func nameConflictCount() async throws -> Int {
+    struct NameConflict: Sendable {
+        let remoteID: String
+        let relativePath: String
+        let message: String
+    }
+
+    func nameConflicts() async throws -> [NameConflict] {
         try await store.read { conn in
-            let queryStatement = try Self.statement(conn, """
-                SELECT COUNT(DISTINCT c.remote_id) FROM remote_change_inbox c
+            let query = try Self.statement(conn, """
+                SELECT DISTINCT c.remote_id, json_extract(c.payload, '$.file.name'), p.item_id
+                FROM remote_change_inbox c
                 CROSS JOIN items p ON p.root_id = c.root_id
                     AND p.remote_file_id = json_extract(c.payload, '$.file.parents[0]')
-                CROSS JOIN items i INDEXED BY idx_items_local_name_key ON i.root_id = p.root_id AND i.parent_id = p.item_id
+                CROSS JOIN items i INDEXED BY idx_items_local_name_key
+                    ON i.root_id = p.root_id AND i.parent_id = p.item_id
                     AND gdrive_name_key(i.name) = gdrive_name_key(json_extract(c.payload, '$.file.name'))
                 WHERE c.root_id = ? AND (i.remote_file_id != c.remote_id
-                    OR (i.remote_file_id IS NULL AND i.name != json_extract(c.payload, '$.file.name')));
+                    OR (i.remote_file_id IS NULL
+                        AND i.name != json_extract(c.payload, '$.file.name')))
+                ORDER BY c.remote_id;
                 """, [.int(rootID)])
-            defer { queryStatement.reset() }
-            _ = try queryStatement.step()
-            return Int(queryStatement.columnInt64(at: 0) ?? 0)
+            defer { query.reset() }
+            var result: [NameConflict] = []
+            while try query.step(), let remoteID = query.columnText(at: 0),
+                  let name = query.columnText(at: 1),
+                  let parentID = query.columnInt64(at: 2) {
+                let parent = try path(conn, itemID: parentID)
+                let relativePath = parent.isEmpty ? name : "\(parent)/\(name)"
+                result.append(NameConflict(
+                    remoteID: remoteID, relativePath: relativePath,
+                    message: "Remote name conflicts with an existing local name: \(relativePath)"))
+            }
+            return result
         }
     }
 

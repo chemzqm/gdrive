@@ -111,6 +111,11 @@ extension IncrementalSyncRun {
                 case .failed(let failure):
                     failures.append(failure)
                     scanProgress.incFailed()
+                    await self.recordIssue(
+                        LocalScanIssueError(description: failure.message), stage: .localScan,
+                        subject: SyncIssueSubject(
+                            itemID: nil, remoteFileID: nil,
+                            relativePath: failure.observation.url.path))
                     engine.logger.error(
                         "Local file reading or hashing failed, retain the existing state and continue synchronization [\(failure.observation.url.path)]: \(failure.message)"
                     )
@@ -361,6 +366,12 @@ extension IncrementalSyncRun {
                     remoteId: existing.remoteId ?? "", updateDescendantPaths: true)
             } catch {
                 if DatabaseFailure.isSQLite(error) { throw error }
+                let path = directoryContext.getRelPath(for: existing.itemId) ?? existing.name
+                await self.recordIssue(
+                    error, stage: .pathUpdate,
+                    subject: SyncIssueSubject(
+                        itemID: existing.itemId, remoteFileID: existing.remoteId,
+                        relativePath: path))
                 engine.logger.error(
                     "Failed to rename or move remote directory [\(existing.name) -> \(name)]: \(error)")
             }
@@ -423,6 +434,12 @@ extension IncrementalSyncRun {
                         error: error
                     )
                 }
+                await self.recordIssue(
+                    error, stage: .createDirectory,
+                    subject: SyncIssueSubject(
+                        itemID: intent?.itemID,
+                        remoteFileID: intent?.targetRemoteID,
+                        relativePath: relPath))
                 engine.logger.error(
                     "Failed to create remote directory [\(relPath)]: \(error)")
             }
@@ -540,6 +557,13 @@ extension IncrementalSyncRun {
                     renamedOrMoved = true
                 } catch {
                     if DatabaseFailure.isSQLite(error) { throw error }
+                    let parent = directoryContext.getRelPath(for: parentItemId) ?? ""
+                    let path = parent.isEmpty ? name : "\(parent)/\(name)"
+                    await self.recordIssue(
+                        error, stage: .pathUpdate,
+                        subject: SyncIssueSubject(
+                            itemID: existing.itemId, remoteFileID: existing.remoteId,
+                            relativePath: path))
                     engine.logger.error(
                         "Failed to rename or move remote file [\(existing.name) -> \(name)]: \(error)")
                     return

@@ -61,6 +61,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
   * `remote_change_inbox`：游标已确认但尚未成功应用的远端事件。
   * `remote_directory_scans`：目录补列任务、扫描身份和分页进度。
   * `sync_conflicts`：等待调用方明确选择版本的内容冲突。
+  * `sync_issues`：条目级失败的结构化记录；同一根、条目和阶段重复失败时更新诊断并累计次数。
   * `trashed_local_changes`：远端目录删除时随目录移入废纸篓的本地修改记录。
 * **`SQLiteConnection.swift`**：
   * 封装底层的 SQLite3 C-API，全生命周期管理编译语句缓存（Prepared Statements），
@@ -155,6 +156,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 | `FileDownload.swift` | 初始化与增量共用的文件下载：校验暂存、目标版本保护发布、按模式提交回执 |
 | `PathOperation.swift` | 文件与目录共用的路径操作：远端重命名/移动及条件回执，本地安全移动/建目录及中断恢复识别 |
 | `TaskLifecycle.swift` | 无结构任务的活跃句柄、取消与排空边界；完成后立即释放句柄，供初始化任务 registry 复用 |
+| `SyncIssueStore.swift` | 条目级失败分类、SQLite 持久化、分页查询和增量轮次开始时的清理 |
 | `SyncEngine+ResumableUpload.swift` | 分块上传、会话恢复、确认偏移和完成状态持久化 |
 | `SyncEngine+Hashing.swift` | 内存和文件流式 SHA-256，保留现有辅助方法名称 |
 | `IncrementalSyncRun.swift` | 单轮增量状态、根校验与恢复、阶段编排、统计和收尾 |
@@ -180,6 +182,12 @@ ID，避免扫描后的父状态变化产生错误层级。
 显式同步入口先执行数据库连通性检查，失败直接抛给调用方。执行中可能影响后续传输或同步
 结果的数据库错误会终止本轮；能够在条目级隔离的数据库错误只记录 error log。显式同步无法
 生成可靠结果时仍按既有 `async throws` 契约返回错误。
+
+可隔离的条目失败同时写入 `sync_issues`，公开为 `SyncIssue`。记录包含条目身份、失败阶段、
+稳定原因分类、建议动作、可选重试时间和出现次数；调用方通过 `listSyncIssues` 分页查询，
+无需解析日志或错误字符串。每轮增量同步在执行任何恢复、Changes 消费和本地扫描前，先清空
+该同步根的旧问题；本轮随后只保留这次执行新产生的问题。初始化同步在成功完成时清空该根的
+问题。问题分类和调用约定见 [同步问题指南](errors.md)。
 
 本地重命名和移动沿用普通增量同步语义：远端元数据更新成功后才更新 items 中的路径；
 失败只记录日志并保持原基线，后续增量同步重新扫描当前文件系统后再次识别差异。

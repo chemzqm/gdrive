@@ -1110,32 +1110,7 @@ public final class DriveClient: Sendable {
         _ = try await executeRequest(req, acceptableStatusCodes: [200, 204])
     }
 
-    // MARK: - Private Auxiliary
-
-    private func checkHTTPStatus(response: URLResponse, data: Data) throws {
-        guard let http = response as? HTTPURLResponse else {
-            throw DriveError.invalidResponse(message: "Response is not HTTP")
-        }
-        if let encounter = parseRateLimit(data: data, response: http) {
-            switch encounter {
-            case .rateLimited429(let delay):
-                throw DriveError.rateLimited429(retryAfter: delay)
-            case .rateLimited403(let reason, let delay):
-                throw DriveError.rateLimited403(reason: reason, retryAfter: delay)
-            case .transientServer503:
-                let detail = (String(bytes: data, encoding: .utf8) ?? "Service Unavailable")
-                throw DriveError.serverError(statusCode: 503, message: detail)
-            }
-        }
-        if !(200..<300).contains(http.statusCode) {
-            let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
-            throw DriveError.serverError(statusCode: http.statusCode, message: detail)
-        }
-    }
 }
-
-/// Compatible aliases
-public typealias DriveAPI = DriveClient
 
 /// Optional smooth pacing with a conservative 1.01s rolling window.
 /// Shared by ordinary requests, streaming requests, and retries for one client.

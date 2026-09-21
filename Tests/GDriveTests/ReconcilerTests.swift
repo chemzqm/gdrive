@@ -45,15 +45,11 @@ struct ReconcilerTests {
         let remote = RemoteObservation(status: .present, sha256: modSha2, size: 130)
 
         let decision = Reconciler.decide(baseline: baseline, local: local, remote: remote)
-        if case .conflict(let winner, _) = decision {
-            #expect(winner == .remote)
-        } else {
-            Issue.record("Expected conflict decision")
-        }
+        #expect(decision == .conflict)
     }
 
-    @Test("Conflict identity is stable with and without a baseline", arguments: [true, false])
-    func stableConflictIdentity(hasBaseline: Bool) {
+    @Test("Conflict decision is stable with and without a baseline", arguments: [true, false])
+    func stableConflictDecision(hasBaseline: Bool) {
         let baseline = hasBaseline ? ItemBaseline(sha256: baseSha, size: 100) : nil
         let local = LocalObservation(status: .present, sha256: modSha1, size: 120)
         let remote = RemoteObservation(status: .present, sha256: modSha2, size: 130)

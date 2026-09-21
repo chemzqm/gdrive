@@ -104,7 +104,7 @@ struct DurableIntentTests {
         let (rootID, rootItemID) = try await seedRoot(store: firstStore, localPath: directory.path, remoteID: "remote-root")
         let sha = String(repeating: "a", count: 64)
 
-        let first = try await DurableCreateIntentStore.prepareMultipartUpload(
+        let first = try await DurableCreateIntentStore.prepareFileUpload(
             store: firstStore,
             rootID: rootID,
             parentItemID: rootItemID,
@@ -115,12 +115,13 @@ struct DurableIntentTests {
             inode: 2,
             mtime: 3,
             size: 4,
-            sha256: sha
+            sha256: sha,
+            transport: .multipart
         )
 
         // A new StateStore represents a new process opening the durable database.
         let restartedStore = try await StateStore(path: databasePath)
-        let recovered = try await DurableCreateIntentStore.prepareMultipartUpload(
+        let recovered = try await DurableCreateIntentStore.prepareFileUpload(
             store: restartedStore,
             rootID: rootID,
             parentItemID: rootItemID,
@@ -131,7 +132,8 @@ struct DurableIntentTests {
             inode: 2,
             mtime: 3,
             size: 4,
-            sha256: sha
+            sha256: sha,
+            transport: .multipart
         )
 
         #expect(recovered.operationID == first.operationID)
@@ -337,7 +339,7 @@ struct DurableIntentTests {
         let databasePath = directory.appendingPathComponent("state.sqlite").path
         let firstStore = try await StateStore(path: databasePath)
         let (rootID, rootItemID) = try await seedRoot(store: firstStore, localPath: localRoot.path, remoteID: "remote-root")
-        let intent = try await DurableCreateIntentStore.prepareMultipartUpload(
+        let intent = try await DurableCreateIntentStore.prepareFileUpload(
             store: firstStore,
             rootID: rootID,
             parentItemID: rootItemID,
@@ -348,7 +350,8 @@ struct DurableIntentTests {
             inode: inode,
             mtime: mtime,
             size: Int64(content.count),
-            sha256: sha
+            sha256: sha,
+            transport: .multipart
         )
         try await DurableCreateIntentStore.markUnknownOutcome(
             store: firstStore,
@@ -520,14 +523,14 @@ struct DurableIntentTests {
             batchTimeoutMs: 50
         )
         let (rootID, rootItemID) = try await seedRoot(store: store, localPath: directory.path, remoteID: "remote-root")
-        await store.writer.resetStats()
+        let statsBefore = await store.getWriterStats()
         let sha = String(repeating: "b", count: 64)
         let count = 128
 
         try await withThrowingTaskGroup(of: Void.self) { group in
             for index in 0..<count {
                 group.addTask {
-                    _ = try await DurableCreateIntentStore.prepareMultipartUpload(
+                    _ = try await DurableCreateIntentStore.prepareFileUpload(
                         store: store,
                         rootID: rootID,
                         parentItemID: rootItemID,
@@ -538,16 +541,17 @@ struct DurableIntentTests {
                         inode: Int64(index + 1),
                         mtime: 1,
                         size: 1,
-                        sha256: sha
+                        sha256: sha,
+                        transport: .multipart
                     )
                 }
             }
             try await group.waitForAll()
         }
 
-        let stats = await store.getWriterStats()
-        #expect(stats.totalItems == count)
-        #expect(stats.immediateCommits == 0)
-        #expect(stats.totalCommits < count / 4)
+        let statsAfter = await store.getWriterStats()
+        #expect(statsAfter.totalItems - statsBefore.totalItems == count)
+        #expect(statsAfter.immediateCommits - statsBefore.immediateCommits == 0)
+        #expect(statsAfter.totalCommits - statsBefore.totalCommits < count / 4)
     }
 }

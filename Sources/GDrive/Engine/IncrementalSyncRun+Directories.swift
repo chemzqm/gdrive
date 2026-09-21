@@ -191,6 +191,8 @@ extension IncrementalSyncRun {
                     operationID: intent.operationID,
                     error: error
                 )
+                await recordIssue(
+                    error, stage: .createDirectory, subject: issueSubject(for: item))
                 engine.logger.error(
                     "Failed to restore remote directory creation [\(item.name)]: \(error)")
             }
@@ -224,17 +226,22 @@ extension IncrementalSyncRun {
                 > secondPath.split(separator: "/").count
         }
         for item in ordered {
-            let expected = ItemCleanupGenerations(
-                local: item.localGeneration, remote: item.remoteGeneration,
-                dirty: item.dirtyGeneration)
-            if item.local?.status == .absent && item.remote?.status == .present {
-                try await engine.cleanupLocalDeletionToRemoteUnlocked(
-                    itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
-            } else {
-                try await engine.cleanupRemoteDeletionToLocalUnlocked(
-                    itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
+            do {
+                let expected = ItemCleanupGenerations(
+                    local: item.localGeneration, remote: item.remoteGeneration,
+                    dirty: item.dirtyGeneration)
+                if item.local?.status == .absent && item.remote?.status == .present {
+                    try await engine.cleanupLocalDeletionToRemoteUnlocked(
+                        itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
+                } else {
+                    try await engine.cleanupRemoteDeletionToLocalUnlocked(
+                        itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
+                }
+                actionTracker.counts.withLock { $0.deleted += 1 }
+            } catch {
+                await recordIssue(error, stage: .delete, subject: issueSubject(for: item))
+                throw error
             }
-            actionTracker.counts.withLock { $0.deleted += 1 }
         }
     }
 }

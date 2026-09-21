@@ -91,6 +91,7 @@ extension SyncEngine {
         maxConcurrency: Int,
         onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
+        try await SyncIssueStore.clear(store: store, rootID: rootId)
         let run = try await IncrementalSyncRun.prepare(
             engine: self,
             rootID: rootId,
@@ -236,7 +237,16 @@ extension IncrementalSyncRun {
         var stats = SyncStats()
         stats.remoteWorkPending = max(try await remoteChanges.pendingCount(), enumerated ? 1 : 0)
         if stats.remoteWorkPending > 0 {
-            stats.remoteNameConflicts = try await remoteChanges.nameConflictCount()
+            let nameConflicts = try await remoteChanges.nameConflicts()
+            stats.remoteNameConflicts = nameConflicts.count
+            for conflict in nameConflicts {
+                await recordIssue(
+                    RemoteNameConflictIssueError(description: conflict.message),
+                    stage: .pathUpdate,
+                    subject: SyncIssueSubject(
+                        itemID: nil, remoteFileID: conflict.remoteID,
+                        relativePath: conflict.relativePath))
+            }
         }
         try await engine.store.flush()
         try await engine.store.checkpoint()
@@ -254,6 +264,7 @@ extension IncrementalSyncRun {
         stats.conflicts = try await SyncConflictStore.list(store: engine.store, rootID: rootID)
         stats.remoteWorkPending += stats.conflicts.count
         stats.filesFailed = scanProgress.failed + actionTracker.failures.withLock { $0 }
+        stats.issueCount = try await SyncIssueStore.count(store: engine.store, rootID: rootID)
         stats.elapsedSeconds = elapsed
         notifier.finish()
         return stats

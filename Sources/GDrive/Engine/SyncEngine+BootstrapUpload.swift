@@ -280,6 +280,37 @@ extension SyncEngine {
         )
         let scanFilters: [FilterRule] = [.excludeDirectory(".git")]
         let request = ScanRequest(root: resolvedLocalPath, filters: scanFilters, options: scanOptions)
+        @Sendable func recordUploadFailure(
+            _ error: Error, intent: DurableCreateIntent?, parentItemID: Int64?,
+            relPath: String, name: String
+        ) async {
+            do {
+                try await SyncIssueStore.record(
+                    store: self.store, rootID: rootId,
+                    subject: SyncIssueSubject(
+                        itemID: intent?.itemID, remoteFileID: intent?.targetRemoteID,
+                        relativePath: relPath),
+                    stage: .upload, error: error)
+            } catch {
+                recordDatabaseError(error)
+            }
+            guard case DriveError.unsafeOverwrite = error, let parentItemID else { return }
+            do {
+                try await self.store.batchWrite { conn in
+                    let stmt = try conn.cachedStatement("""
+                    UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
+                    WHERE root_id = ? AND parent_id = ? AND name = ?;
+                    """)
+                    stmt.bindInt64(rootId, at: 1)
+                    stmt.bindInt64(parentItemID, at: 2)
+                    stmt.bindText(name, at: 3)
+                    _ = try stmt.step()
+                    stmt.reset()
+                }
+            } catch {
+                recordDatabaseError(error)
+            }
+        }
         @Sendable func uploadFile(fullPath: String, relPath: String, parent: BootstrapDirectoryDependency, name: String, fileSize: Int64) async {
             var createIntent: DurableCreateIntent?
             var didAcquireSemaphore = false
@@ -429,23 +460,9 @@ extension SyncEngine {
             } catch {
                 await recordUnknownOutcome(error, createIntent: createIntent)
                 progress.recordFailure()
-                if case DriveError.unsafeOverwrite = error, let parentItemID {
-                    do {
-                        try await self.store.batchWrite { conn in
-                            let stmt = try conn.cachedStatement("""
-                            UPDATE items SET phase = 'blocked', dirty_generation = MAX(dirty_generation, 1)
-                            WHERE root_id = ? AND parent_id = ? AND name = ?;
-                            """)
-                            stmt.bindInt64(rootId, at: 1)
-                            stmt.bindInt64(parentItemID, at: 2)
-                            stmt.bindText(name, at: 3)
-                            _ = try stmt.step()
-                            stmt.reset()
-                        }
-                    } catch {
-                        recordDatabaseError(error)
-                    }
-                }
+                await recordUploadFailure(
+                    error, intent: createIntent, parentItemID: parentItemID,
+                    relPath: relPath, name: name)
                 self.logger.error("Failed to upload file [\(relPath)]: \(error)")
             }
         }
@@ -513,6 +530,17 @@ extension SyncEngine {
                     }
                 }
                 progress.recordDirectoryFailure()
+                do {
+                    try await SyncIssueStore.record(
+                        store: self.store, rootID: rootId,
+                        subject: SyncIssueSubject(
+                            itemID: createIntent?.itemID,
+                            remoteFileID: createIntent?.targetRemoteID,
+                            relativePath: relPath),
+                        stage: .createDirectory, error: error)
+                } catch {
+                    recordDatabaseError(error)
+                }
                 self.logger.error("Failed to create remote directory [\(relPath)]: \(error)")
                 throw error
             }
@@ -604,7 +632,8 @@ extension SyncEngine {
         try await store.flush()
         try await store.checkpoint()
 
-        if progress.filesFailed == 0 && !progress.hasDirectoryFailures {
+        let converged = progress.filesFailed == 0 && !progress.hasDirectoryFailures
+        if converged {
             try await store.write { conn in
                 let stmt = try conn.cachedStatement("""
                 UPDATE roots SET bootstrap_state = 'existingKnown', updated_at = ? WHERE root_id = ?;
@@ -614,6 +643,7 @@ extension SyncEngine {
                 _ = try stmt.step()
                 stmt.reset()
             }
+            try await SyncIssueStore.clear(store: store, rootID: rootId)
         }
 
         let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
@@ -621,6 +651,7 @@ extension SyncEngine {
         stats.filesUploaded = progress.filesUploaded
         stats.filesSkipped = progress.filesSkipped
         stats.filesFailed = progress.filesFailed
+        stats.issueCount = try await SyncIssueStore.count(store: store, rootID: rootId)
         stats.bytesUploaded = progress.bytesUploaded
         stats.elapsedSeconds = elapsed
         notifier.finish()

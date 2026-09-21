@@ -120,7 +120,7 @@ struct ItemCleanupTests {
             _ = try file.step()
             let fileID = conn.lastInsertRowId
             try conn.execute(
-                "INSERT INTO operations(operation_id, root_id, item_id, operation_type, state, created_at, updated_at) VALUES ('pending-child', \(fixture.rootID), \(fileID), 'download', 'ready', 1, 1);")
+                "INSERT INTO operations(operation_id, root_id, item_id, operation_type, state, created_at, updated_at) VALUES ('pending-child', \(fixture.rootID), \(fileID), 'uploadMultipart', 'ready', 1, 1);")
             try conn.execute(
                 "INSERT INTO remote_change_inbox(root_id, remote_id, payload) VALUES (\(fixture.rootID), 'remote-child', '{}');")
             try conn.execute(

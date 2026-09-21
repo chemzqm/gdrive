@@ -245,7 +245,7 @@ struct GDriveBenchMain {
         let idDispenser: IDDispenser
         do {
             let auth = try Auth()
-            let api = DriveAPI(auth: auth, requestsPerSecond: nil)
+            let api = DriveClient(auth: auth, requestsPerSecond: nil)
             let idPool = IDPool(api: api)
 
             let existingCount = await idPool.count

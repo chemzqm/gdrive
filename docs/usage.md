@@ -370,8 +370,26 @@ Task {
 - `NSError (domain: "SyncEngine")`: 核心状态机校验不通过（如目标路径非空、目录拓扑断链等）。
 
 同步可能将单项传输错误记录在日志及 `SyncStats.filesFailed` 中并继续处理其他文件；
-调用方既要使用 `do-catch` 处理整轮失败，也要检查返回统计。临时性网络或限流错误可退避重试，
-根丢失、名称冲突和覆盖保护等情况需要先解决相应原因。
+`SyncStats.issueCount` 返回当前同步根仍保留的结构化问题数。调用方既要使用 `do-catch` 处理
+整轮失败，也要检查返回统计，并可分页读取具体问题：
+
+```swift
+var offset = 0
+repeat {
+    let page = try await engine.listSyncIssues(
+        localPath: localDir, limit: 100, offset: offset)
+    for issue in page.issues {
+        logger.error("\(issue.relativePath): \(issue.category), \(issue.suggestedAction)")
+    }
+    guard let nextOffset = page.nextOffset else { break }
+    offset = nextOffset
+} while true
+```
+
+`SyncIssue` 提供条目身份、失败阶段、原因分类、建议动作、可选 `retryAt`、首次/最近出现时间
+及累计次数。每轮增量同步开始时先删除该同步根的旧问题，因此查询结果表示最近一轮增量同步
+新产生的问题；同一轮内同一条目和阶段重复失败仍会累计次数。初始化同步成功时也会清空旧问题。
+详细分类见 [同步问题指南](errors.md)。
 
 ---
 
@@ -393,12 +411,11 @@ Task {
 ## 8. 实时传输与速率监控 (`TransferSnapshot`)
 
 同步引擎内置了线程安全的 `TransferMonitor`，并在内存中每 500ms 自动采样并刷新一次最新状态。
-`transferStatus` 和 `getTransferStatus()` 均同步返回 `TransferSnapshot`，无需 `await` 或 `try`，
-读取过程不涉及磁盘或网络 I/O：
+`transferStatus` 同步返回 `TransferSnapshot`，无需 `await` 或 `try`，读取过程不涉及磁盘或网络 I/O：
 
 ```swift
 // 直接从内存获取最新快照
-let status = engine.transferStatus // 或 engine.getTransferStatus()
+let status = engine.transferStatus
 
 // 1. 正在活跃传输的文件列表
 for item in status.activeUploads {
