@@ -44,6 +44,8 @@ extension SyncEngine {
 
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
+        try await validateRootBinding(
+            localPath: resolvedLocalPath, remoteRootID: remoteRootId)
 
         // Verify that the remote root directory exists
         let remoteRoot = try await client.getFile(remoteId: remoteRootId)
@@ -86,6 +88,8 @@ extension SyncEngine {
 
         // 1. Register or get Root Records and root entries
         let (rootId, rootItemId): (Int64, Int64) = try await store.write { conn in
+            try Self.validateRootBinding(
+                conn: conn, localPath: resolvedLocalPath, remoteRootID: remoteRootId)
             let rootStmt = try conn.cachedStatement("""
             INSERT INTO roots (
                 account_id, local_root_path, local_root_device, local_root_inode,

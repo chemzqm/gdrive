@@ -23,6 +23,8 @@ extension SyncEngine {
         onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
+        try await validateRootBinding(
+            localPath: resolvedLocalPath, remoteRootID: remoteFolderId)
 
         // 1. Check SQLite Whether there is already an active synchronization root
         let existingRoot: ExistingSyncRoot? = try await store.read { conn in
@@ -104,6 +106,8 @@ extension SyncEngine {
             let rootName = URL(fileURLWithPath: resolvedLocalPath).lastPathComponent
             let now = Date().timeIntervalSince1970
             try await store.write { conn in
+                try Self.validateRootBinding(
+                    conn: conn, localPath: resolvedLocalPath, remoteRootID: remoteFolderId)
                 let stmt = try conn.cachedStatement("""
                 INSERT INTO roots (
                     account_id, local_root_path, local_root_device, local_root_inode,

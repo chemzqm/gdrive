@@ -61,6 +61,12 @@ public struct TrashedLocalChange: Sendable, Equatable {
 public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sendable, Equatable {
     case localRootNotFound(path: String)
     case localRootChanged(path: String)
+    case rootBindingConflict(
+        localPath: String,
+        remoteRootId: String,
+        existingLocalPath: String,
+        existingRemoteRootId: String
+    )
     case rootBusy(path: String)
     case remoteRootLost(remoteId: String, reason: String)
     case localFileModified(path: String)
@@ -77,6 +83,9 @@ public enum SyncEngineError: Error, LocalizedError, CustomStringConvertible, Sen
             return "The local sync root no longer exists or is not a valid directory: \(path). Sync stopped to prevent remote deletion propagation."
         case .localRootChanged(let path):
             return "The local sync root was replaced by a different directory: \(path). Sync stopped to prevent remote deletion propagation."
+        case .rootBindingConflict(
+            let localPath, let remoteRootId, let existingLocalPath, let existingRemoteRootId):
+            return "The requested sync root binding \(localPath) <-> \(remoteRootId) conflicts with the existing binding \(existingLocalPath) <-> \(existingRemoteRootId)."
         case .rootBusy(let path):
             return "The local sync root is already being synchronized in this process: \(path)"
         case .remoteRootLost(let remoteId, let reason):
