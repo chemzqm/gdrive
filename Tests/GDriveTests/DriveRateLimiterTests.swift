@@ -41,4 +41,15 @@ struct DriveRateLimiterTests {
             #expect(error is CancellationError)
         }
     }
+
+    @Test func extremeRetryAfterDoesNotOverflowSleepConversion() async {
+        let limiter = DriveRateLimiter()
+        await limiter.reportRateLimit(retryAfter: .greatestFiniteMagnitude)
+        let waiter = Task { try await limiter.acquire() }
+        await Task.yield()
+        waiter.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await waiter.value
+        }
+    }
 }

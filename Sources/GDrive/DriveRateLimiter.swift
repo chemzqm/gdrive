@@ -3,7 +3,8 @@ import Foundation
 /// Coordinates a shared cooldown after rate-limit or transient failures.
 /// RequestRateGate in DriveClient independently enforces the configurable requests/second cap.
 public actor DriveRateLimiter {
-    private var cooldownUntil: Date?
+    private let clock = ContinuousClock()
+    private var cooldownUntil: ContinuousClock.Instant?
 
     public init() {}
 
@@ -12,19 +13,19 @@ public actor DriveRateLimiter {
         while true {
             try Task.checkCancellation()
             guard let cooldown = cooldownUntil else { return }
-            let remaining = cooldown.timeIntervalSinceNow
-            if remaining <= 0 {
+            if clock.now >= cooldown {
                 cooldownUntil = nil
                 return
             }
-            try await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            try await clock.sleep(until: cooldown)
         }
     }
 
     /// Extend the shared cooldown without changing the request rate.
     public func reportRateLimit(retryAfter: Double? = nil) {
-        let delay = max(retryAfter ?? 1.5, 1.0)
-        let newCooldown = Date().addingTimeInterval(delay)
+        let requestedDelay = retryAfter ?? 1.5
+        let delay = requestedDelay.isNaN ? 1.5 : min(max(requestedDelay, 1.0), 3_600.0)
+        let newCooldown = clock.now.advanced(by: .seconds(delay))
         if let existing = cooldownUntil {
             cooldownUntil = max(existing, newCooldown)
         } else {
@@ -34,6 +35,6 @@ public actor DriveRateLimiter {
 
     public var isCoolingDown: Bool {
         guard let cooldown = cooldownUntil else { return false }
-        return cooldown > Date()
+        return cooldown > clock.now
     }
 }
