@@ -200,6 +200,47 @@ struct RetrySemanticsTests {
         #expect(try Data(contentsOf: destination) == body)
     }
 
+    @Test("Streaming download retries after a partial response body")
+    func downloadRetriesPartialBody() async throws {
+        let body = Data("complete download".utf8)
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let requestCount = OSAllocatedUnfairLock(initialState: 0)
+        let client = DriveClient(
+            auth: auth, session: session, requestsPerSecond: nil, maxRetries: 1,
+            retrySleep: { _ in },
+            downloadAttempt: { request, destination, onProgress in
+                let attempt = requestCount.withLock { count in
+                    count += 1
+                    return count
+                }
+                if attempt == 1 {
+                    let partial = Data(body.prefix(4))
+                    try partial.write(to: destination)
+                    onProgress?(Int64(partial.count))
+                    throw URLError(.networkConnectionLost)
+                }
+                try body.write(to: destination)
+                onProgress?(6)
+                onProgress?(Int64(body.count - 6))
+                return HTTPURLResponse(
+                    url: request.url!, statusCode: 200, httpVersion: nil,
+                    headerFields: ["Content-Length": String(body.count)])!
+            })
+        let destination = directory.appendingPathComponent("destination")
+        let staging = directory.appendingPathComponent("staging", isDirectory: true)
+        let progress = OSAllocatedUnfairLock<Int64>(initialState: 0)
+
+        try await client.downloadFile(
+            remoteId: "file", destinationURL: destination, temporaryDirectory: staging,
+            onProgress: { delta in progress.withLock { $0 += delta } })
+
+        #expect(requestCount.withLock { $0 } == 2)
+        #expect(try Data(contentsOf: destination) == body)
+        #expect(progress.withLock { $0 } == Int64(body.count))
+    }
+
     @Test("executeRequest throws distinct rateLimited429 error when retries are exhausted")
     func executeRequestThrowsRateLimited429() async throws {
         defer { context.value.requestHandler = nil }

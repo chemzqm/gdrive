@@ -174,6 +174,30 @@ private struct DownloadContextState {
     var errorBodyBytesWritten = 0
 }
 
+private final class DownloadProgressHighWater: Sendable {
+    private struct State {
+        var attemptBytes: Int64 = 0
+        var reportedBytes: Int64 = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+
+    func beginAttempt() {
+        state.withLock { $0.attemptBytes = 0 }
+    }
+
+    func record(_ delta: Int64) -> Int64 {
+        guard delta > 0 else { return 0 }
+        return state.withLock { state in
+            state.attemptBytes += delta
+            guard state.attemptBytes > state.reportedBytes else { return 0 }
+            let newlyReported = state.attemptBytes - state.reportedBytes
+            state.reportedBytes = state.attemptBytes
+            return newlyReported
+        }
+    }
+}
+
 private final class DownloadSessionDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private final class Context: @unchecked Sendable {
         let handle: FileHandle
@@ -291,12 +315,14 @@ private final class DownloadSessionDelegate: NSObject, URLSessionDataDelegate, @
 /// - Response Field One-Time Validation (id,name,mimeType,parents,size,sha256Checksum,version)
 public final class DriveClient: Sendable {
     typealias RetrySleep = @Sendable (TimeInterval) async throws -> Void
+    typealias DownloadAttempt = @Sendable (
+        URLRequest, URL, (@Sendable (Int64) -> Void)?
+    ) async throws -> HTTPURLResponse
 
     public let auth: Auth
     public let rateLimiter: DriveRateLimiter
     private let session: URLSession
-    private let downloadDelegate: DownloadSessionDelegate
-    private let downloadSession: URLSession
+    private let downloadAttempt: DownloadAttempt
     private let retrySleep: RetrySleep
     private let retryLimitOverride: Int?
     private let logger = Logger(label: "gdrive.client")
@@ -332,9 +358,13 @@ public final class DriveClient: Sendable {
         self.auth = auth
         self.session = session
         let downloadDelegate = DownloadSessionDelegate()
-        self.downloadDelegate = downloadDelegate
-        self.downloadSession = URLSession(
+        let downloadSession = URLSession(
             configuration: session.configuration, delegate: downloadDelegate, delegateQueue: nil)
+        self.downloadAttempt = { request, destinationURL, onProgress in
+            try await downloadDelegate.download(
+                using: downloadSession, request: request,
+                destinationURL: destinationURL, onProgress: onProgress)
+        }
         self.rateLimiter = rateLimiter
         self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = nil
@@ -349,14 +379,19 @@ public final class DriveClient: Sendable {
         rateLimiter: DriveRateLimiter = DriveRateLimiter(),
         requestsPerSecond: Int? = 65,
         maxRetries: Int,
-        retrySleep: @escaping RetrySleep
+        retrySleep: @escaping RetrySleep,
+        downloadAttempt: DownloadAttempt? = nil
     ) {
         self.auth = auth
         self.session = session
         let downloadDelegate = DownloadSessionDelegate()
-        self.downloadDelegate = downloadDelegate
-        self.downloadSession = URLSession(
+        let downloadSession = URLSession(
             configuration: session.configuration, delegate: downloadDelegate, delegateQueue: nil)
+        self.downloadAttempt = downloadAttempt ?? { request, destinationURL, onProgress in
+            try await downloadDelegate.download(
+                using: downloadSession, request: request,
+                destinationURL: destinationURL, onProgress: onProgress)
+        }
         self.rateLimiter = rateLimiter
         self.requestGate = RequestRateGate(requestsPerSecond: requestsPerSecond)
         self.retryLimitOverride = max(0, maxRetries)
@@ -551,27 +586,25 @@ public final class DriveClient: Sendable {
         var attempt = 0
         var currentRequest = request
         var didRefreshAfterUnauthorized = false
+        let progressHighWater = DownloadProgressHighWater()
 
         while true {
             attempt += 1
+            progressHighWater.beginAttempt()
             try await rateLimiter.acquire()
 
             try await requestGate.wait()
             let http: HTTPURLResponse
             do {
-                http = try await downloadDelegate.download(
-                    using: downloadSession,
-                    request: currentRequest,
-                    destinationURL: destinationURL,
-                    onProgress: onProgress)
+                http = try await downloadAttempt(
+                    currentRequest, destinationURL, { delta in
+                        let newlyReported = progressHighWater.record(delta)
+                        if newlyReported > 0 { onProgress?(newlyReported) }
+                    })
             } catch {
-                let receivedBytes = (try? FileManager.default.attributesOfItem(
-                    atPath: destinationURL.path)[.size] as? NSNumber)?.int64Value ?? 0
                 try? FileManager.default.removeItem(at: destinationURL)
                 try Task.checkCancellation()
-                // A partial 2xx body has already contributed progress. Retrying it would
-                // double-count bytes, and the previous AsyncBytes path did not retry here.
-                guard receivedBytes == 0, attempt <= retryLimit else { throw error }
+                guard attempt <= retryLimit else { throw error }
                 let jitter = Double.random(in: 0.1...0.5)
                 let delay = min(16.0, pow(2.0, Double(attempt - 1)) + jitter)
                 await rateLimiter.reportRateLimit(retryAfter: delay)
