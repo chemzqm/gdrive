@@ -448,6 +448,18 @@ extension SyncEngine {
             throw SyncEngineError.general(
                 "The remote conflict copy is unavailable: \(conflict.relativePath)")
         }
+        if try LocalFileVersion.read(at: storedURL) == nil {
+            let published = try StableLocalFileDigest.capture(at: localURL)
+            guard published.sha256Hex.caseInsensitiveCompare(conflict.remoteSHA256) == .orderedSame,
+                  published.fileSize == conflict.remoteSize else {
+                throw SyncEngineError.general(
+                    "The remote conflict copy is unavailable: \(conflict.relativePath)")
+            }
+            try await commitRemoteConflictResolution(
+                record, published: published.version,
+                remotePresent: conflict.remoteStatus == .present)
+            return
+        }
         let digest = try Self.computeFileSha256(at: storedURL)
         guard digest.sha256Hex.caseInsensitiveCompare(conflict.remoteSHA256) == .orderedSame,
               digest.fileSize == conflict.remoteSize else {
@@ -470,7 +482,7 @@ extension SyncEngine {
         try await commitRemoteConflictResolution(
             record, published: published,
             remotePresent: conflict.remoteStatus == .present)
-        try FileManager.default.removeItem(at: storedURL)
+        try? FileManager.default.removeItem(at: storedURL)
     }
 
     private func commitRemoteConflictResolution(

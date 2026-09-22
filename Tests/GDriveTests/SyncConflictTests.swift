@@ -150,10 +150,12 @@ struct SyncConflictTests {
         let local: URL
         let original: URL
         let engine: SyncEngine
+        let store: StateStore
         let remoteID: String
     }
     private func fixture(
         localContent: Data = Data("local edited content".utf8),
+        remoteContent: Data = Data("remote edited content".utf8),
         filePublisher: @escaping SyncEngine.FilePublisher = {
             try LocalFilePublication.publish($0, to: $1, expected: $2,
                                              expectedSHA256: $3, expectedLocalSHA256: $4)
@@ -193,10 +195,25 @@ struct SyncConflictTests {
             return ItemIdentity(remoteID: queryStatement.columnText(at: 0)!)
         }
         try localContent.write(to: original)
-        context.value.state.withLock { $0.files[ids.remoteID]!.content = Data("remote edited content".utf8) }
+        context.value.state.withLock { $0.files[ids.remoteID]!.content = remoteContent }
         return Fixture(
             directory: directory, local: local, original: original,
-            engine: engine, remoteID: ids.remoteID)
+            engine: engine, store: store, remoteID: ids.remoteID)
+    }
+
+    private func recreatedEngine(for fixture: Fixture) async throws -> SyncEngine {
+        let auth = try Auth(path: fixture.directory.appendingPathComponent("auth.json").path)
+        let configuration = URLSessionConfiguration.ephemeral
+        context.configure(configuration)
+        configuration.protocolClasses = [ConflictProtocol.self]
+        let client = DriveClient(
+            auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
+        let store = try await StateStore(path: fixture.store.path)
+        return try await SyncEngine(
+            auth: auth, store: store, client: client, idPool: IDPool(api: nil, initialIds: []),
+            downloadTemporaryDirectory: fixture.directory.appendingPathComponent("downloads"),
+            conflictDirectory: fixture.directory.appendingPathComponent("conflicts"),
+            incrementalScan: SyncEngine.defaultDirectoryScan)
     }
     @Test("Incremental conflict is durable until the caller selects the remote version")
     func convergence() async throws {
@@ -222,6 +239,98 @@ struct SyncConflictTests {
             at: testFixture.local, includingPropertiesForKeys: nil)
         #expect(localEntries.map(\.lastPathComponent) == ["file.txt"])
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Large remote conflict resolution consumes its copy without reporting cleanup failure")
+    func largeRemoteResolution() async throws {
+        let remote = Data(repeating: 0x52, count: 8 * 1024 * 1024 + 1)
+        let testFixture = try await fixture(remoteContent: remote)
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try Data(contentsOf: testFixture.original) == remote)
+        #expect(!FileManager.default.fileExists(atPath: conflictPath))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Large remote conflict resolution publishes when the local target is missing")
+    func largeRemoteResolutionWithoutLocalTarget() async throws {
+        let remote = Data(repeating: 0x53, count: 8 * 1024 * 1024 + 1)
+        let testFixture = try await fixture(remoteContent: remote)
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        try FileManager.default.removeItem(at: testFixture.original)
+
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try Data(contentsOf: testFixture.original) == remote)
+        #expect(!FileManager.default.fileExists(atPath: conflictPath))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Large remote conflict resolution retries after its database commit fails")
+    func largeRemoteResolutionRetriesCommit() async throws {
+        let remote = Data(repeating: 0x54, count: 8 * 1024 * 1024 + 1)
+        let testFixture = try await fixture(remoteContent: remote)
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+            CREATE TRIGGER reject_conflict_resolution BEFORE DELETE ON sync_conflicts
+            BEGIN SELECT RAISE(ABORT, 'injected conflict resolution failure'); END;
+            """)
+        }
+
+        await #expect(throws: (any Error).self) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        }
+        #expect(!FileManager.default.fileExists(atPath: conflictPath))
+        #expect(try Data(contentsOf: testFixture.original) == remote)
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).count == 1)
+        try await testFixture.store.write {
+            try $0.execute("DROP TRIGGER reject_conflict_resolution;")
+        }
+
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("A recreated engine repairs a large conflict receipt after publication")
+    func recreatedEngineRepairsLargeRemoteResolution() async throws {
+        let remote = Data(repeating: 0x55, count: 8 * 1024 * 1024 + 1)
+        let testFixture = try await fixture(remoteContent: remote)
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+            CREATE TRIGGER reject_conflict_resolution BEFORE DELETE ON sync_conflicts
+            BEGIN SELECT RAISE(ABORT, 'injected conflict resolution failure'); END;
+            """)
+        }
+        await #expect(throws: (any Error).self) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        }
+        #expect(!FileManager.default.fileExists(atPath: conflictPath))
+        try await testFixture.store.write {
+            try $0.execute("DROP TRIGGER reject_conflict_resolution;")
+        }
+        let recreated = try await recreatedEngine(for: testFixture)
+
+        try await recreated.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try Data(contentsOf: testFixture.original) == remote)
+        #expect(try await recreated.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
     @Test("A local edit during a download becomes a queryable conflict")
