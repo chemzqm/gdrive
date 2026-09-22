@@ -289,8 +289,8 @@ public final class SyncEngine: Sendable {
         operation: @Sendable () async throws -> T
     ) async throws -> T {
         let resolvedLocalPath = Self.normalizedPath(localPath)
-        try validateOperationalStateIsOutsideSyncRoot(resolvedLocalPath)
         try await verifyDatabaseConnection()
+        try await validateOperationalStateIsOutsideSyncRoots(resolvedLocalPath)
         let token = try await RootSyncCoordinator.shared.acquire(
             localRootPath: resolvedLocalPath)
         let result: Result<T, any Error>
@@ -301,6 +301,39 @@ public final class SyncEngine: Sendable {
         }
         await RootSyncCoordinator.shared.release(token)
         return try result.get()
+    }
+
+    private func validateOperationalStateIsOutsideSyncRoots(_ localPath: String) async throws {
+        try await store.read { conn in
+            var rootPaths = Set([localPath])
+            let roots = try conn.cachedStatement("""
+                SELECT local_root_path FROM roots WHERE account_id = 'default';
+                """)
+            defer { roots.reset() }
+            while try roots.step() {
+                guard let rootPath = roots.columnText(at: 0) else {
+                    throw SyncEngineError.general("Stored root binding is incomplete")
+                }
+                rootPaths.insert(Self.normalizedPath(rootPath))
+            }
+
+            for rootPath in rootPaths {
+                try self.validateOperationalStateIsOutsideSyncRoot(rootPath)
+            }
+
+            let conflicts = try conn.cachedStatement("""
+                SELECT conflict_path FROM sync_conflicts WHERE conflict_path IS NOT NULL;
+                """)
+            defer { conflicts.reset() }
+            while try conflicts.step() {
+                guard let conflictPath = conflicts.columnText(at: 0) else { continue }
+                if RootSyncCoordinator.contains(conflictPath, in: localPath) {
+                    throw SyncEngineError.general(
+                        "The sync root contains a persisted conflict copy: \(conflictPath). "
+                            + "Move conflict storage outside the sync root: \(localPath).")
+                }
+            }
+        }
     }
 
     private func validateOperationalStateIsOutsideSyncRoot(_ localPath: String) throws {

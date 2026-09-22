@@ -154,6 +154,122 @@ struct RootBindingSafetyTests {
         }
     }
 
+    private func seedConflict(
+        store: StateStore,
+        rootID: Int64,
+        localRoot: URL,
+        conflictPath: URL
+    ) async throws {
+        try await store.write { conn in
+            let rootItem = try conn.prepare(
+                "SELECT item_id FROM items WHERE root_id = ? AND parent_id IS NULL;")
+            rootItem.bindInt64(rootID, at: 1)
+            _ = try #require(try rootItem.step())
+            let rootItemID = try #require(rootItem.columnInt64(at: 0))
+
+            let item = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    remote_sha256, remote_size, local_status, remote_status, phase,
+                    created_at, updated_at)
+                VALUES (?, ?, 'file.txt', 'file', 'remote-file', ?, 1,
+                    'absent', 'present', 'blocked', 1, 1);
+                """)
+            item.bindInt64(rootID, at: 1)
+            item.bindInt64(rootItemID, at: 2)
+            item.bindText(String(repeating: "a", count: 64), at: 3)
+            _ = try item.step()
+            let itemID = conn.lastInsertRowId
+
+            let conflict = try conn.prepare("""
+                INSERT INTO sync_conflicts(
+                    conflict_id, root_id, item_id, remote_file_id, relative_path,
+                    local_path, conflict_path, remote_sha256, remote_size,
+                    remote_status, created_at, updated_at)
+                VALUES ('conflict', ?, ?, 'remote-file', 'file.txt', ?, ?, ?, 1,
+                    'present', 1, 1);
+                """)
+            conflict.bindInt64(rootID, at: 1)
+            conflict.bindInt64(itemID, at: 2)
+            conflict.bindText(localRoot.appendingPathComponent("file.txt").path, at: 3)
+            conflict.bindText(conflictPath.path, at: 4)
+            conflict.bindText(String(repeating: "a", count: 64), at: 5)
+            _ = try conflict.step()
+        }
+    }
+
+    @Test("Operational directories cannot overlap another bound sync root")
+    private func operationalDirectoryCannotOverlapAnotherBoundRoot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cross-root-state-overlap-\(UUID().uuidString)")
+        let localA = directory.appendingPathComponent("local-a")
+        let localB = directory.appendingPathComponent("local-b")
+        let external = directory.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: localA, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: localB, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await StateStore(path: external.appendingPathComponent("state.sqlite").path)
+        _ = try await seedBinding(store: store, localRoot: localA, remoteRootID: "root-a")
+        context.value.requestHandler = { _ in
+            Issue.record("Cross-root rejection must happen before any remote request")
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let auth = try createMockAuth(tempDir: external)
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: external.appendingPathComponent("downloads"),
+            conflictDirectory: localA.appendingPathComponent("conflicts"))
+
+        let error = await #expect(throws: SyncEngineError.self) {
+            try await engine.syncLocalToRemoteEmpty(
+                localPath: localB.path, remoteRootId: "root-b")
+        }
+        guard case .general(let message) = error else {
+            Issue.record("Expected an operational-state overlap error")
+            return
+        }
+        #expect(message.contains("conflict directory"))
+        #expect(message.contains(localA.path))
+    }
+
+    @Test("Persisted conflict copies cannot be inside a bound sync root")
+    private func persistedConflictCannotBeInsideBoundRoot() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "persisted-conflict-overlap-\(UUID().uuidString)")
+        let localRoot = directory.appendingPathComponent("local")
+        let external = directory.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await StateStore(path: external.appendingPathComponent("state.sqlite").path)
+        let rootID = try await seedBinding(
+            store: store, localRoot: localRoot, remoteRootID: "root")
+        try await seedConflict(
+            store: store, rootID: rootID, localRoot: localRoot,
+            conflictPath: localRoot.appendingPathComponent("saved-conflict"))
+        context.value.requestHandler = { _ in
+            Issue.record("Persisted-conflict rejection must happen before any remote request")
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let auth = try createMockAuth(tempDir: external)
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: external.appendingPathComponent("downloads"),
+            conflictDirectory: external.appendingPathComponent("conflicts"))
+
+        let error = await #expect(throws: SyncEngineError.self) {
+            try await engine.syncIncremental(localPath: localRoot.path)
+        }
+        guard case .general(let message) = error else {
+            Issue.record("Expected a persisted-conflict overlap error")
+            return
+        }
+        #expect(message.contains("persisted conflict"))
+        #expect(message.contains(localRoot.path))
+    }
+
     @Test("A remote root cannot be rebound to another local root", arguments: Entry.allCases)
     private func cannotBindRemoteRootToDifferentLocalRoot(entry: Entry) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
