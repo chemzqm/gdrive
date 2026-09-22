@@ -97,7 +97,7 @@ extension StateStore {
                 let statement = try conn.cachedStatement("""
                 INSERT INTO items (
                     root_id, parent_id, name, entry_kind, remote_file_id,
-                    local_mtime, local_size, local_sha256,
+                    local_mtime, local_ctime, local_size, local_sha256,
                     base_sha256, base_size,
                     remote_sha256, remote_size, remote_status,
                     local_generation, local_status, phase,
@@ -105,7 +105,7 @@ extension StateStore {
                     created_at, updated_at
                 ) VALUES (
                     ?, ?, ?, 'file', ?,
-                    ?, ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?,
                     ?, ?, 'present',
                     1, 'present', 'committed',
@@ -115,7 +115,8 @@ extension StateStore {
                 ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                 DO UPDATE SET
                     remote_file_id = excluded.remote_file_id,
-                    local_mtime = excluded.local_mtime, local_size = excluded.local_size,
+                    local_mtime = excluded.local_mtime, local_ctime = excluded.local_ctime,
+                    local_size = excluded.local_size,
                     local_sha256 = excluded.local_sha256,
                     base_sha256 = excluded.base_sha256, base_size = excluded.base_size,
                     remote_sha256 = excluded.remote_sha256, remote_size = excluded.remote_size,
@@ -129,16 +130,17 @@ extension StateStore {
                 statement.bindText(file.name, at: 3)
                 statement.bindText(file.id, at: 4)
                 statement.bindInt64(published.mtime, at: 5)
-                statement.bindInt64(published.size, at: 6)
-                statement.bindText(file.sha256Checksum, at: 7)
+                statement.bindInt64(published.ctime, at: 6)
+                statement.bindInt64(published.size, at: 7)
                 statement.bindText(file.sha256Checksum, at: 8)
-                statement.bindInt64(published.size, at: 9)
-                statement.bindText(file.sha256Checksum, at: 10)
-                statement.bindInt64(published.size, at: 11)
-                statement.bindInt64(published.device, at: 12)
-                statement.bindInt64(published.inode, at: 13)
-                statement.bindDouble(now, at: 14)
+                statement.bindText(file.sha256Checksum, at: 9)
+                statement.bindInt64(published.size, at: 10)
+                statement.bindText(file.sha256Checksum, at: 11)
+                statement.bindInt64(published.size, at: 12)
+                statement.bindInt64(published.device, at: 13)
+                statement.bindInt64(published.inode, at: 14)
                 statement.bindDouble(now, at: 15)
+                statement.bindDouble(now, at: 16)
                 _ = try statement.step()
                 statement.reset()
                 guard conn.changes == 1 else { return }
@@ -161,6 +163,7 @@ extension StateStore {
                     local_sha256 = remote_sha256,
                     local_size = remote_size,
                     local_mtime = ?,
+                    local_ctime = ?,
                     local_device = ?,
                     local_inode = ?,
                     local_status = 'present',
@@ -174,13 +177,14 @@ extension StateStore {
                     AND remote_generation = ? AND dirty_generation = ?;
                 """)
                 statement.bindInt64(published.mtime, at: 1)
-                statement.bindInt64(published.device, at: 2)
-                statement.bindInt64(published.inode, at: 3)
-                statement.bindDouble(now, at: 4)
-                statement.bindInt64(itemID, at: 5)
-                statement.bindInt64(localGeneration, at: 6)
-                statement.bindInt64(remoteGeneration, at: 7)
-                statement.bindInt64(dirtyGeneration, at: 8)
+                statement.bindInt64(published.ctime, at: 2)
+                statement.bindInt64(published.device, at: 3)
+                statement.bindInt64(published.inode, at: 4)
+                statement.bindDouble(now, at: 5)
+                statement.bindInt64(itemID, at: 6)
+                statement.bindInt64(localGeneration, at: 7)
+                statement.bindInt64(remoteGeneration, at: 8)
+                statement.bindInt64(dirtyGeneration, at: 9)
                 _ = try statement.step()
                 statement.reset()
                 guard conn.changes == 1 else { return }

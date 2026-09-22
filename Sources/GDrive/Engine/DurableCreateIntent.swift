@@ -111,6 +111,7 @@ enum DurableCreateIntentStore {
         device: Int64,
         inode: Int64,
         mtime: Int64,
+        ctime: Int64? = nil,
         size: Int64,
         sha256: String,
         transport: FileUploadTransport
@@ -130,6 +131,7 @@ enum DurableCreateIntentStore {
                     device: device,
                     inode: inode,
                     mtime: mtime,
+                    ctime: ctime,
                     size: size,
                     sha256: sha256,
                     operationType: operationType,
@@ -246,6 +248,7 @@ enum DurableCreateIntentStore {
         device: Int64,
         inode: Int64,
         mtime: Int64,
+        ctime: Int64?,
         size: Int64,
         sha256: String,
         operationType: String,
@@ -255,7 +258,8 @@ enum DurableCreateIntentStore {
             let update = try conn.cachedStatement("""
             UPDATE items SET
                 remote_file_id = COALESCE(remote_file_id, ?),
-                local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?, local_sha256 = ?,
+                local_device = ?, local_inode = ?, local_mtime = ?, local_ctime = ?,
+                local_size = ?, local_sha256 = ?,
                 local_status = 'present', phase = 'inFlight', dirty_generation = MAX(dirty_generation, 1), updated_at = ?
             WHERE item_id = ? AND root_id = ? AND entry_kind = 'file';
             """)
@@ -263,11 +267,12 @@ enum DurableCreateIntentStore {
             update.bindInt64(device, at: 2)
             update.bindInt64(inode, at: 3)
             update.bindInt64(mtime, at: 4)
-            update.bindInt64(size, at: 5)
-            update.bindText(sha256, at: 6)
-            update.bindDouble(now, at: 7)
-            update.bindInt64(requestedItemID, at: 8)
-            update.bindInt64(rootID, at: 9)
+            update.bindInt64(ctime, at: 5)
+            update.bindInt64(size, at: 6)
+            update.bindText(sha256, at: 7)
+            update.bindDouble(now, at: 8)
+            update.bindInt64(requestedItemID, at: 9)
+            update.bindInt64(rootID, at: 10)
             _ = try update.step()
             update.reset()
             guard conn.changes == 1 else {
@@ -277,16 +282,17 @@ enum DurableCreateIntentStore {
             let insert = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
-                local_device, local_inode, local_mtime, local_size, local_sha256,
+                local_device, local_inode, local_mtime, local_ctime, local_size, local_sha256,
                 local_generation, local_status, remote_status, phase, dirty_generation,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, 1, 'present', 'unknown', 'inFlight', 1, ?, ?)
+            ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?, ?, ?, 1, 'present', 'unknown', 'inFlight', 1, ?, ?)
             ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
             DO UPDATE SET
                 remote_file_id = COALESCE(items.remote_file_id, excluded.remote_file_id),
                 local_device = excluded.local_device,
                 local_inode = excluded.local_inode,
                 local_mtime = excluded.local_mtime,
+                local_ctime = excluded.local_ctime,
                 local_size = excluded.local_size,
                 local_sha256 = excluded.local_sha256,
                 local_status = 'present',
@@ -302,10 +308,11 @@ enum DurableCreateIntentStore {
             insert.bindInt64(device, at: 5)
             insert.bindInt64(inode, at: 6)
             insert.bindInt64(mtime, at: 7)
-            insert.bindInt64(size, at: 8)
-            insert.bindText(sha256, at: 9)
-            insert.bindDouble(now, at: 10)
+            insert.bindInt64(ctime, at: 8)
+            insert.bindInt64(size, at: 9)
+            insert.bindText(sha256, at: 10)
             insert.bindDouble(now, at: 11)
+            insert.bindDouble(now, at: 12)
             _ = try insert.step()
             insert.reset()
             guard conn.changes == 1 else {

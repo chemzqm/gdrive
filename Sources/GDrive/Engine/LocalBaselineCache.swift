@@ -7,6 +7,7 @@ public struct CachedItemMetadata: Sendable {
     public let name: String
     public let remoteFileId: String?
     public let mtime: Int64
+    public let ctime: Int64
     public let size: Int64
     public let baseSha256: String?
 
@@ -16,6 +17,7 @@ public struct CachedItemMetadata: Sendable {
         name: String,
         remoteFileId: String?,
         mtime: Int64,
+        ctime: Int64,
         size: Int64,
         baseSha256: String?
     ) {
@@ -24,6 +26,7 @@ public struct CachedItemMetadata: Sendable {
         self.name = name
         self.remoteFileId = remoteFileId
         self.mtime = mtime
+        self.ctime = ctime
         self.size = size
         self.baseSha256 = baseSha256
     }
@@ -31,7 +34,7 @@ public struct CachedItemMetadata: Sendable {
 
 /// Rapid Change Detector (FastChangeDetector)
 /// Follow the v1.md §6.2 Specification:
-/// Use scanner `.basic` Mode Acquired FileMetadata (device + inode) and mtime + size Compare to baseline cache
+/// Use scanner `.basic` Mode Acquired FileMetadata (device + inode) and mtime + ctime + size Compare to baseline cache
 /// When all match, the file is unmodified with a very high probability, skipping content reading and SHA-256 Calculated (Skip Rate > 95%)
 public final class LocalBaselineCache: @unchecked Sendable {
     public struct Key: Hashable, Sendable {
@@ -55,11 +58,13 @@ public final class LocalBaselineCache: @unchecked Sendable {
 
         try await store.read { conn in
             let stmt = try conn.cachedStatement("""
-            SELECT item_id, parent_id, name, remote_file_id, local_device, local_inode, local_mtime, local_size, base_sha256
+            SELECT item_id, parent_id, name, remote_file_id, local_device, local_inode,
+                   local_mtime, local_ctime, local_size, base_sha256
             FROM items
             WHERE root_id = ?
               AND entry_kind = 'file'
               AND local_inode IS NOT NULL
+              AND local_ctime IS NOT NULL
               AND phase = 'committed'
               AND base_sha256 IS NOT NULL
               AND dirty_generation = 0
@@ -74,13 +79,14 @@ public final class LocalBaselineCache: @unchecked Sendable {
                       let dev = stmt.columnInt64(at: 4),
                       let ino = stmt.columnInt64(at: 5),
                       let mtime = stmt.columnInt64(at: 6),
-                      let size = stmt.columnInt64(at: 7) else {
+                      let ctime = stmt.columnInt64(at: 7),
+                      let size = stmt.columnInt64(at: 8) else {
                     continue
                 }
 
                 let parentId = stmt.columnInt64(at: 1)
                 let remoteId = stmt.columnText(at: 3)
-                let sha256 = stmt.columnText(at: 8)
+                let sha256 = stmt.columnText(at: 9)
 
                 let meta = CachedItemMetadata(
                     itemId: itemId,
@@ -88,6 +94,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
                     name: name,
                     remoteFileId: remoteId,
                     mtime: mtime,
+                    ctime: ctime,
                     size: size,
                     baseSha256: sha256
                 )
@@ -101,7 +108,9 @@ public final class LocalBaselineCache: @unchecked Sendable {
 
     /// Check if the file is completely unchanged
     /// - Returns: If it does not change to return to the existing CachedItemMetadata,Go back if changed or as a new file nil
-    public func lookupUnchanged(device: Int64, inode: Int64, mtime: Int64, size: Int64) -> CachedItemMetadata? {
+    public func lookupUnchanged(
+        device: Int64, inode: Int64, mtime: Int64, ctime: Int64, size: Int64
+    ) -> CachedItemMetadata? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
 
@@ -109,7 +118,7 @@ public final class LocalBaselineCache: @unchecked Sendable {
             return nil
         }
 
-        if cached.mtime == mtime && cached.size == size {
+        if cached.mtime == mtime && cached.ctime == ctime && cached.size == size {
             return cached
         }
 
@@ -117,13 +126,14 @@ public final class LocalBaselineCache: @unchecked Sendable {
     }
 
     func lookupUnchanged(
-        device: Int64, inode: Int64, mtime: Int64, size: Int64,
+        device: Int64, inode: Int64, mtime: Int64, ctime: Int64, size: Int64,
         parentId: Int64, name: String
     ) -> CachedItemMetadata? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
         return cache[Key(device: device, inode: inode)]?.first {
-            $0.parentId == parentId && $0.name == name && $0.mtime == mtime && $0.size == size
+            $0.parentId == parentId && $0.name == name
+                && $0.mtime == mtime && $0.ctime == ctime && $0.size == size
         }
     }
 

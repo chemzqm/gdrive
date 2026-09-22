@@ -334,6 +334,7 @@ struct FailureStateSafetyTests {
         let fileAAttrs = try FileManager.default.attributesOfItem(atPath: fileA.path)
         let fileADev = (fileAAttrs[.systemNumber] as? NSNumber)?.int64Value ?? 1
         let fileAIno = (fileAAttrs[.systemFileNumber] as? NSNumber)?.int64Value ?? 0
+        let fileAVersion = try #require(try LocalFileVersion.read(at: fileA))
 
         let fileAItemId = try await store.write { conn in
             let stmt = try conn.prepare("""
@@ -356,12 +357,14 @@ struct FailureStateSafetyTests {
 
         try await store.write { conn in
             let stmt = try conn.prepare("""
-                UPDATE items SET local_mtime = 1700000000000000000, local_size = 12,
+                UPDATE items SET local_mtime = ?, local_ctime = ?, local_size = 12,
                     base_size = 12, remote_size = 12,
                     local_sha256 = ?, base_sha256 = ?, remote_sha256 = ? WHERE item_id = ?;
                 """)
-            for index in 1...3 { stmt.bindText(originalSHA, at: Int32(index)) }
-            stmt.bindInt64(fileAItemId, at: 4)
+            stmt.bindInt64(fileAVersion.mtime, at: 1)
+            stmt.bindInt64(fileAVersion.ctime, at: 2)
+            for index in 3...5 { stmt.bindText(originalSHA, at: Int32(index)) }
+            stmt.bindInt64(fileAItemId, at: 6)
             _ = try stmt.step()
         }
 
@@ -458,16 +461,28 @@ struct FailureStateSafetyTests {
         let stats = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(stats.filesUploaded == 0) // A11 blocks unconditioned remote overwrites.
         #expect(stats.filesFailed == (contentChanged ? 1 : 0))
-        #expect(stats.filesSkipped == (contentChanged ? 0 : 1))
+        // Rename changes ctime, so even unchanged bytes are hashed once before the new path is trusted.
+        #expect(stats.filesSkipped == 0)
 
         try await store.read { conn in
-            let stmt = try conn.prepare("SELECT name, base_sha256, local_sha256, dirty_generation FROM items WHERE item_id = ?;")
+            let stmt = try conn.prepare(
+                "SELECT name, base_sha256, local_sha256, dirty_generation, "
+                    + "local_mtime, local_ctime, local_size, phase, remote_status "
+                    + "FROM items WHERE item_id = ?;")
             stmt.bindInt64(fileAItemId, at: 1)
             #expect(try stmt.step())
             #expect(stmt.columnText(at: 0) == "file_B.txt", "File name in DB must be updated to file_B.txt after successful retry")
             #expect(stmt.columnText(at: 1) == originalSHA)
             #expect(stmt.columnText(at: 2) == expectedSHA)
             #expect((stmt.columnInt64(at: 3) ?? 0) == (contentChanged ? 1 : 0))
+            if !contentChanged {
+                let current = try #require(try LocalFileVersion.read(at: fileB))
+                #expect(stmt.columnInt64(at: 4) == current.mtime)
+                #expect(stmt.columnInt64(at: 5) == current.ctime)
+                #expect(stmt.columnInt64(at: 6) == current.size)
+                #expect(stmt.columnText(at: 7) == "committed")
+                #expect(stmt.columnText(at: 8) == "present")
+            }
         }
         let second = try await engine.syncIncremental(localPath: localRootDir.path)
         #expect(second.filesUploaded == 0)

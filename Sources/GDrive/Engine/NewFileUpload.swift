@@ -84,6 +84,7 @@ extension SyncEngine {
             device: input.version.device,
             inode: input.version.inode,
             mtime: input.version.mtime,
+            ctime: input.version.ctime,
             size: input.size,
             sha256: input.sha256,
             transport: input.data == nil ? .resumable : .multipart
@@ -155,7 +156,7 @@ extension DurableCreateIntentStore {
             let statement = try conn.cachedStatement("""
             UPDATE items SET
                 remote_file_id = ?,
-                local_device = ?, local_inode = ?, local_mtime = ?,
+                local_device = ?, local_inode = ?, local_mtime = ?, local_ctime = ?,
                 local_size = ?, local_sha256 = ?, local_status = 'present',
                 base_sha256 = ?, base_size = ?,
                 remote_sha256 = ?, remote_size = ?, remote_status = 'present',
@@ -168,17 +169,18 @@ extension DurableCreateIntentStore {
             statement.bindInt64(input.version.device, at: 2)
             statement.bindInt64(input.version.inode, at: 3)
             statement.bindInt64(input.version.mtime, at: 4)
-            statement.bindInt64(input.size, at: 5)
-            statement.bindText(input.sha256, at: 6)
+            statement.bindInt64(input.version.ctime, at: 5)
+            statement.bindInt64(input.size, at: 6)
             statement.bindText(input.sha256, at: 7)
-            statement.bindInt64(input.size, at: 8)
-            statement.bindText(input.sha256, at: 9)
-            statement.bindInt64(input.size, at: 10)
-            statement.bindDouble(now, at: 11)
-            statement.bindInt64(expectation.itemID, at: 12)
-            statement.bindInt64(expectation.localGeneration, at: 13)
-            statement.bindInt64(expectation.remoteGeneration, at: 14)
-            statement.bindInt64(expectation.dirtyGeneration, at: 15)
+            statement.bindText(input.sha256, at: 8)
+            statement.bindInt64(input.size, at: 9)
+            statement.bindText(input.sha256, at: 10)
+            statement.bindInt64(input.size, at: 11)
+            statement.bindDouble(now, at: 12)
+            statement.bindInt64(expectation.itemID, at: 13)
+            statement.bindInt64(expectation.localGeneration, at: 14)
+            statement.bindInt64(expectation.remoteGeneration, at: 15)
+            statement.bindInt64(expectation.dirtyGeneration, at: 16)
             _ = try statement.step()
             statement.reset()
             guard conn.changes == 1 else { return }

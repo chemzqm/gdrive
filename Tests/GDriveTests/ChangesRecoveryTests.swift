@@ -285,6 +285,50 @@ struct ChangesRecoveryTests {
         Issue.record("Remote work did not converge within the bounded fixture")
     }
 
+    @Test("Restored mtime cannot hide same-size content changes from the baseline cache")
+    func restoredMtimeStillHashesChangedContent() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let local = testFixture.local.appendingPathComponent("same-size.txt")
+        let original = Data("AAAA".utf8)
+        let changed = Data("BBBB".utf8)
+        try original.write(to: local)
+
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        #expect(first.filesUploaded == 1)
+        let baseline = try #require(try LocalFileVersion.read(at: local))
+
+        try changed.write(to: local)
+        let seconds = Int(baseline.mtime / 1_000_000_000)
+        let nanoseconds = Int(baseline.mtime % 1_000_000_000)
+        let times = [
+            timespec(tv_sec: seconds, tv_nsec: nanoseconds),
+            timespec(tv_sec: seconds, tv_nsec: nanoseconds)
+        ]
+        let result = times.withUnsafeBufferPointer {
+            utimensat(AT_FDCWD, local.path, $0.baseAddress, 0)
+        }
+        #expect(result == 0)
+        let modified = try #require(try LocalFileVersion.read(at: local))
+        #expect(modified.device == baseline.device)
+        #expect(modified.inode == baseline.inode)
+        #expect(modified.mtime == baseline.mtime)
+        #expect(modified.size == baseline.size)
+        #expect(modified.ctime != baseline.ctime)
+
+        let second = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        #expect(second.filesSkipped == 0)
+        #expect(second.filesFailed == 1)
+        let stored = try await testFixture.store.read { conn in
+            let query = try conn.prepare(
+                "SELECT local_sha256, dirty_generation FROM items WHERE name = 'same-size.txt';")
+            _ = try #require(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1))
+        }
+        #expect(stored.0 == SyncEngine.computeSha256(of: changed))
+        #expect((stored.1 ?? 0) > 0)
+    }
+
     @Test("An incremental upload receipt SQLite failure drains then propagates")
     func incrementalUploadReceiptSQLiteFailurePropagates() async throws {
         let testFixture = try await fixture()

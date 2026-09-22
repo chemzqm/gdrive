@@ -366,6 +366,7 @@ extension IncrementalSyncRun {
                 expected.device == item.localDevice,
                 expected.inode == item.localInode,
                 expected.mtime == item.localMtime,
+                expected.ctime == item.localCtime,
                 expected.size == item.local?.size
             else {
                 throw SyncEngineError.localFileModified(path: url.path)
@@ -630,7 +631,9 @@ extension IncrementalSyncRun {
             }
             receipts.append { conn in
                 let stmt = try conn.cachedStatement(
-                    "UPDATE items SET dirty_generation = 0 WHERE item_id = ? AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;"
+                    "UPDATE items SET phase = 'committed', dirty_generation = 0 "
+                        + "WHERE item_id = ? AND local_generation = ? "
+                        + "AND remote_generation = ? AND dirty_generation = ?;"
                 )
                 stmt.bindInt64(item.itemId, at: 1)
                 stmt.bindInt64(item.localGeneration, at: 2)

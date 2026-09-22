@@ -16,6 +16,7 @@ struct DirtyRecord: Sendable {
     let localDevice: Int64?
     let localInode: Int64?
     let localMtime: Int64?
+    let localCtime: Int64?
 }
 
 extension IncrementalSyncRun {
@@ -36,7 +37,7 @@ extension IncrementalSyncRun {
                        op.operation_id, op.target_remote_id, op.target_parent_remote_id,
                        op.expected_local_generation, op.expected_sha256, op.total_bytes,
                        items.local_generation, items.remote_generation, items.dirty_generation,
-                       items.local_device, items.local_inode, items.local_mtime
+                       items.local_device, items.local_inode, items.local_mtime, items.local_ctime
                 FROM \(source)
                 LEFT JOIN operations op ON op.operation_id = (
                     SELECT candidate.operation_id
@@ -106,7 +107,8 @@ extension IncrementalSyncRun {
                         dirtyGeneration: stmt.columnInt64(at: 21) ?? 0,
                         localDevice: stmt.columnInt64(at: 22),
                         localInode: stmt.columnInt64(at: 23),
-                        localMtime: stmt.columnInt64(at: 24)
+                        localMtime: stmt.columnInt64(at: 24),
+                        localCtime: stmt.columnInt64(at: 25)
                     ))
             }
             stmt.reset()

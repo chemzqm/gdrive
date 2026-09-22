@@ -158,6 +158,7 @@ extension IncrementalSyncRun {
             let dev: Int64
             let ino: Int64
             let mtime: Int64
+            let ctime: Int64
             let fileSize: Int64
         }
 
@@ -197,19 +198,20 @@ extension IncrementalSyncRun {
                     let dev = observation.device
                     let ino = observation.inode
                     let mtime = observation.mtime
+                    let ctime = observation.ctime
                     let fileSize = observation.size
                     let sha256Hex = result.sha256
                     let stmt = try conn.cachedStatement(
                         """
                         INSERT INTO items (
                             root_id, parent_id, name, entry_kind,
-                            local_device, local_inode, local_mtime, local_size, local_sha256,
+                            local_device, local_inode, local_mtime, local_ctime, local_size, local_sha256,
                             remote_status,
                             local_generation, local_status, phase, dirty_generation,
                             created_at, updated_at
                         ) VALUES (
                             ?, ?, ?, 'file',
-                            ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?,
                             'absent',
                             1, 'present', 'ready', 1,
                             ?, ?
@@ -219,6 +221,7 @@ extension IncrementalSyncRun {
                             local_device = excluded.local_device,
                             local_inode = excluded.local_inode,
                             local_mtime = excluded.local_mtime,
+                            local_ctime = excluded.local_ctime,
                             local_size = excluded.local_size,
                             local_sha256 = excluded.local_sha256,
                             local_status = 'present',
@@ -235,10 +238,11 @@ extension IncrementalSyncRun {
                     stmt.bindInt64(dev, at: 4)
                     stmt.bindInt64(ino, at: 5)
                     stmt.bindInt64(mtime, at: 6)
-                    stmt.bindInt64(fileSize, at: 7)
-                    stmt.bindText(sha256Hex, at: 8)
-                    stmt.bindDouble(now, at: 9)
+                    stmt.bindInt64(ctime, at: 7)
+                    stmt.bindInt64(fileSize, at: 8)
+                    stmt.bindText(sha256Hex, at: 9)
                     stmt.bindDouble(now, at: 10)
+                    stmt.bindDouble(now, at: 11)
                     guard try stmt.step(), let id = stmt.columnInt64(at: 0) else {
                         throw SyncEngineError.general(
                             "Local file replaces an existing directory at \(observation.url.path); preserving the baseline")
@@ -253,16 +257,17 @@ extension IncrementalSyncRun {
                         """
                         INSERT INTO items (
                             root_id, parent_id, name, entry_kind,
-                            local_device, local_inode, local_mtime, local_size,
+                            local_device, local_inode, local_mtime, local_ctime, local_size,
                             local_status, remote_status, local_generation,
                             phase, dirty_generation, created_at, updated_at
-                        ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?,
+                        ) VALUES (?, ?, ?, 'file', ?, ?, ?, ?, ?,
                             'unknown', 'absent', 1, 'waitingEvidence', 1, ?, ?)
                         ON CONFLICT (root_id, parent_id, name) WHERE parent_id IS NOT NULL
                         DO UPDATE SET
                             local_device = excluded.local_device,
                             local_inode = excluded.local_inode,
                             local_mtime = excluded.local_mtime,
+                            local_ctime = excluded.local_ctime,
                             local_size = excluded.local_size,
                             local_status = 'unknown',
                             local_generation = items.local_generation + 1,
@@ -277,9 +282,10 @@ extension IncrementalSyncRun {
                     stmt.bindInt64(observation.device, at: 4)
                     stmt.bindInt64(observation.inode, at: 5)
                     stmt.bindInt64(observation.mtime, at: 6)
-                    stmt.bindInt64(observation.size, at: 7)
-                    stmt.bindDouble(now, at: 8)
+                    stmt.bindInt64(observation.ctime, at: 7)
+                    stmt.bindInt64(observation.size, at: 8)
                     stmt.bindDouble(now, at: 9)
+                    stmt.bindDouble(now, at: 10)
                     _ = try stmt.step()
                     guard conn.changes == 1 else {
                         throw SyncEngineError.general(
@@ -370,14 +376,14 @@ extension IncrementalSyncRun {
 
         @Sendable func fileMatchesBaseline(
             renamedOrMoved: Bool, device: Int64, inode: Int64,
-            mtime: Int64, size: Int64, parentItemID: Int64, name: String
+            mtime: Int64, ctime: Int64, size: Int64, parentItemID: Int64, name: String
         ) -> Bool {
             if renamedOrMoved {
                 return baselineCache.lookupUnchanged(
-                    device: device, inode: inode, mtime: mtime, size: size) != nil
+                    device: device, inode: inode, mtime: mtime, ctime: ctime, size: size) != nil
             }
             return baselineCache.lookupUnchanged(
-                device: device, inode: inode, mtime: mtime, size: size,
+                device: device, inode: inode, mtime: mtime, ctime: ctime, size: size,
                 parentId: parentItemID, name: name) != nil
         }
 
@@ -654,13 +660,14 @@ extension IncrementalSyncRun {
             let dev = record.dev
             let ino = record.ino
             let mtime = record.mtime
+            let ctime = record.ctime
             let fileSize = record.fileSize
 
             // The cache only contains committed, clean remote-present baselines.
             // Matching the path as well as identity preserves the rename path below,
             // while an ordinary unchanged file needs no per-item SQLite round trip.
             if baselineCache.lookupUnchanged(
-                    device: dev, inode: ino, mtime: mtime, size: fileSize,
+                    device: dev, inode: ino, mtime: mtime, ctime: ctime, size: fileSize,
                     parentId: parentItemId, name: name) != nil {
                 seenTracker.markSeen(parentId: parentItemId, name: name)
                 scanProgress.incSkipped()
@@ -719,7 +726,8 @@ extension IncrementalSyncRun {
             // Quick change comparison (§6.2)
             if fileMatchesBaseline(
                 renamedOrMoved: renamedOrMoved, device: dev, inode: ino,
-                mtime: mtime, size: fileSize, parentItemID: parentItemId, name: name
+                mtime: mtime, ctime: ctime, size: fileSize,
+                parentItemID: parentItemId, name: name
             ) {
                 scanProgress.incSkipped()
                 return
@@ -729,7 +737,7 @@ extension IncrementalSyncRun {
                 IncrementalLocalObservation(
                     parentID: parentItemId, name: name,
                     url: URL(fileURLWithPath: fullPath),
-                    device: dev, inode: ino, mtime: mtime, size: fileSize))
+                    device: dev, inode: ino, mtime: mtime, ctime: ctime, size: fileSize))
             // First ready file goes immediately; subsequent work uses bounded natural chunks.
             if !firstObservationSent || pendingObservations.count >= 64 {
                 try await commitObservations(pendingObservations)
@@ -754,6 +762,9 @@ extension IncrementalSyncRun {
                     let mtime =
                         (record.metadata?.modificationTime.seconds ?? 0) * 1_000_000_000
                         + Int64(record.metadata?.modificationTime.nanoseconds ?? 0)
+                    let ctime =
+                        (record.metadata?.changeTime.seconds ?? 0) * 1_000_000_000
+                        + Int64(record.metadata?.changeTime.nanoseconds ?? 0)
                     let fileSize = record.metadata?.fileSize ?? 0
 
                     itemsInBatch.append(
@@ -763,6 +774,7 @@ extension IncrementalSyncRun {
                             dev: dev,
                             ino: ino,
                             mtime: mtime,
+                            ctime: ctime,
                             fileSize: fileSize
                         ))
                 }

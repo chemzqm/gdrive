@@ -2,7 +2,7 @@
 -- Conforms to v1.md and AGENTS.md requirements:
 -- - Bidirectional sync baseline with SQLite as single source of truth
 -- - Only SHA-256 for content verification and sync decision
--- - Scanner FileIdentity (device + inode) and mtime/size cache for fast local change detection
+-- - Scanner FileIdentity (device + inode) and mtime/ctime/size cache for fast local change detection
 -- - Parent-child tree structure (parent_id + name) instead of full path blobs
 -- - B/L/R (Baseline, Local, Remote) three-party observations with dirty generation tracking
 -- - Operation intent durability before remote requests
@@ -50,8 +50,9 @@ CREATE TABLE IF NOT EXISTS items (
     local_inode INTEGER,
 
     -- Local metadata cache for fast change detection (§6.2)
-    -- local_mtime: nanoseconds since epoch (sec * 1_000_000_000 + nsec)
+    -- local_mtime/local_ctime: nanoseconds since epoch (sec * 1_000_000_000 + nsec)
     local_mtime INTEGER,
+    local_ctime INTEGER,
     local_size INTEGER CHECK (local_size IS NULL OR local_size >= 0),
 
     -- Baseline (B): Agreed synchronized state

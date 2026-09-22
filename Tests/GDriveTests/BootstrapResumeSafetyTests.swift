@@ -192,9 +192,9 @@ struct BootstrapResumeSafetyTests {
             let inFlightStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
-                local_device, local_inode, local_mtime, local_size, local_sha256,
+                local_device, local_inode, local_mtime, local_ctime, local_size, local_sha256,
                 phase, dirty_generation, created_at, updated_at
-            ) VALUES (?, ?, 'inflight.bin', 'file', 'r_inflight', 1, 1001, 100, 500, ?, 'inFlight', 1, 1, 1);
+            ) VALUES (?, ?, 'inflight.bin', 'file', 'r_inflight', 1, 1001, 100, 101, 500, ?, 'inFlight', 1, 1, 1);
             """)
             inFlightStatement.bindInt64(rootId, at: 1)
             inFlightStatement.bindInt64(rootItemId, at: 2)
@@ -206,9 +206,9 @@ struct BootstrapResumeSafetyTests {
             let dirtyStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
-                local_device, local_inode, local_mtime, local_size, local_sha256,
+                local_device, local_inode, local_mtime, local_ctime, local_size, local_sha256,
                 base_sha256, base_size, remote_status, phase, dirty_generation, created_at, updated_at
-            ) VALUES (?, ?, 'dirty.txt', 'file', 'r_dirty', 1, 1002, 200, 600, ?, ?, 600, 'present', 'committed', 1, 1, 1);
+            ) VALUES (?, ?, 'dirty.txt', 'file', 'r_dirty', 1, 1002, 200, 201, 600, ?, ?, 600, 'present', 'committed', 1, 1, 1);
             """)
             dirtyStatement.bindInt64(rootId, at: 1)
             dirtyStatement.bindInt64(rootItemId, at: 2)
@@ -221,9 +221,9 @@ struct BootstrapResumeSafetyTests {
             let syncedStatement = try conn.cachedStatement("""
             INSERT INTO items (
                 root_id, parent_id, name, entry_kind, remote_file_id,
-                local_device, local_inode, local_mtime, local_size, local_sha256,
+                local_device, local_inode, local_mtime, local_ctime, local_size, local_sha256,
                 base_sha256, base_size, remote_status, phase, dirty_generation, created_at, updated_at
-            ) VALUES (?, ?, 'synced.txt', 'file', 'r_synced', 1, 1003, 300, 700, ?, ?, 700, 'present', 'committed', 0, 1, 1);
+            ) VALUES (?, ?, 'synced.txt', 'file', 'r_synced', 1, 1003, 300, 301, 700, ?, ?, 700, 'present', 'committed', 0, 1, 1);
             """)
             syncedStatement.bindInt64(rootId, at: 1)
             syncedStatement.bindInt64(rootItemId, at: 2)
@@ -237,9 +237,14 @@ struct BootstrapResumeSafetyTests {
         #expect(cache.count == 1)
 
         // Verify lookupUnchanged
-        #expect(cache.lookupUnchanged(device: 1, inode: 1001, mtime: 100, size: 500) == nil)
-        #expect(cache.lookupUnchanged(device: 1, inode: 1002, mtime: 200, size: 600) == nil)
-        let hit = cache.lookupUnchanged(device: 1, inode: 1003, mtime: 300, size: 700)
+        #expect(cache.lookupUnchanged(
+            device: 1, inode: 1001, mtime: 100, ctime: 101, size: 500) == nil)
+        #expect(cache.lookupUnchanged(
+            device: 1, inode: 1002, mtime: 200, ctime: 201, size: 600) == nil)
+        #expect(cache.lookupUnchanged(
+            device: 1, inode: 1003, mtime: 300, ctime: 302, size: 700) == nil)
+        let hit = cache.lookupUnchanged(
+            device: 1, inode: 1003, mtime: 300, ctime: 301, size: 700)
         #expect(hit != nil)
         #expect(hit?.name == "synced.txt")
         #expect(hit?.remoteFileId == "r_synced")

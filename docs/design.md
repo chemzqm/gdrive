@@ -296,9 +296,9 @@ Reconciler 和持久化 cleanup 语义清理旧远端对象；旧行删除后才
 ### 2.5 快速变更与决策层 (`LocalBaselineCache.swift`, `Reconciler.swift`)
 
 * **`LocalBaselineCache.swift`**：
-  * 快速变更检测机制：利用文件系统元数据（`device` + `inode` + `mtime` +
-    `fileSize`）比对已提交基线。
-  * 四项元数据完全一致时，**不进行任何文件内容读取与 SHA-256 哈希计算**，在纳秒
+  * 快速变更检测机制：利用文件系统元数据（`device` + `inode` + `mtime` + `ctime` +
+    `fileSize`）比对已提交基线。缺少 ctime 的行不进入快缓存。
+  * 五项元数据完全一致时，**不进行任何文件内容读取与 SHA-256 哈希计算**，在纳秒
     级秒级跳过数万个未修改文件。
 * **`Reconciler.swift`**：
   * 三方决策器：基于共同基线 $B$、本地状态 $L$ 和远端状态 $R$，按照确定性规则产

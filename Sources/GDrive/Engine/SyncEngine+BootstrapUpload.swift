@@ -613,10 +613,13 @@ extension SyncEngine {
                         let dev = Int64(metadata?.identity.device ?? 1)
                         let ino = Int64(metadata?.identity.inode ?? 0)
                         let mtime = (metadata?.modificationTime.seconds ?? 0) * 1_000_000_000 + Int64(metadata?.modificationTime.nanoseconds ?? 0)
+                        let ctime = (metadata?.changeTime.seconds ?? 0) * 1_000_000_000 + Int64(metadata?.changeTime.nanoseconds ?? 0)
                         let fileSize = metadata?.fileSize ?? 0
 
                         // Rapid change detection (§6.2):dev + inode + mtime + size Matching skips content reading and hash calculations
-                        if baselineCache.lookupUnchanged(device: dev, inode: ino, mtime: mtime, size: fileSize) != nil {
+                        if baselineCache.lookupUnchanged(
+                            device: dev, inode: ino, mtime: mtime, ctime: ctime,
+                            size: fileSize) != nil {
                             progress.recordSkipped()
                             continue
                         }

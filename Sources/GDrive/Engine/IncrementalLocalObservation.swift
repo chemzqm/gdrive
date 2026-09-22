@@ -8,6 +8,7 @@ struct IncrementalLocalObservation: Sendable {
     let device: Int64
     let inode: Int64
     let mtime: Int64
+    let ctime: Int64
     let size: Int64
     struct Hashed: Sendable {
         let observation: IncrementalLocalObservation
