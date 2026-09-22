@@ -34,6 +34,13 @@ struct RootBindingSafetyTests {
 
     private let context = TestHTTPContext(TestRequestHandler())
 
+    private enum OperationalState: String, CaseIterable, Sendable {
+        case credentials
+        case database
+        case downloads
+        case conflicts
+    }
+
     private func createMockAuth(tempDir: URL) throws -> Auth {
         let authURL = tempDir.appendingPathComponent("auth.json")
         let authData = AuthData(
@@ -53,6 +60,53 @@ struct RootBindingSafetyTests {
         configuration.protocolClasses = [MockRootBindingURLProtocol.self]
         return DriveClient(
             auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
+    }
+
+    @Test("Operational state cannot overlap a sync root", arguments: OperationalState.allCases)
+    private func operationalStateCannotOverlapSyncRoot(_ state: OperationalState) async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "state-overlap-\(UUID().uuidString)")
+        let localRoot = directory.appendingPathComponent("local")
+        let external = directory.appendingPathComponent("external")
+        try FileManager.default.createDirectory(at: localRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: external, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let credentialsDirectory = state == .credentials ? localRoot : external
+        let auth = try createMockAuth(tempDir: credentialsDirectory)
+        let databaseDirectory = state == .database ? localRoot : external
+        let store = try await StateStore(
+            path: databaseDirectory.appendingPathComponent("state.sqlite").path)
+        let downloads = (state == .downloads ? localRoot : external)
+            .appendingPathComponent("downloads")
+        let conflicts = (state == .conflicts ? localRoot : external)
+            .appendingPathComponent("conflicts")
+
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: downloads, conflictDirectory: conflicts)
+
+        let error = await #expect(throws: SyncEngineError.self) {
+            try await engine.syncLocalToRemoteEmpty(
+                localPath: localRoot.path, remoteRootId: "root")
+        }
+        guard case .general(let message) = error else {
+            Issue.record("Expected an operational-state overlap error")
+            return
+        }
+        let expectedDescription = switch state {
+        case .credentials: "credential"
+        case .database: "database"
+        case .downloads: "download temporary"
+        case .conflicts: "conflict"
+        }
+        #expect(message.contains(expectedDescription))
+        let rootCount = try await store.read { conn in
+            let query = try conn.prepare("SELECT COUNT(*) FROM roots;")
+            _ = try #require(try query.step())
+            return query.columnInt64(at: 0)
+        }
+        #expect(rootCount == 0)
     }
 
     @discardableResult

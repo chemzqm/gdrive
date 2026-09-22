@@ -36,4 +36,12 @@ actor RootSyncCoordinator {
         }
         return resolved.standardizedFileURL.path
     }
+
+    nonisolated static func contains(_ candidatePath: String, in directoryPath: String) -> Bool {
+        let directory = normalizedPath(directoryPath)
+        let candidate = normalizedPath(candidatePath)
+        guard candidate != directory else { return true }
+        let prefix = directory.hasSuffix("/") ? directory : directory + "/"
+        return candidate.hasPrefix(prefix)
+    }
 }

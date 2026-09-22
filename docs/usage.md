@@ -134,7 +134,9 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 
 `setDownloadTemporaryDirectory(_ directory: URL) throws` 接受本地文件 URL，配置由引擎实例持有，
 不写入数据库。同步轮次选定目录后，后续设置变更不会移动或重定向该轮在途下载。
-目录不能位于当前同步根或同一 StateStore 中其他已激活的同步根内（包括符号链接指向这些目录的情况）。
+开始同步前，引擎会解析符号链接和缺失路径的既有祖先，拒绝包含认证文件或 SQLite 状态库的同步根，
+也拒绝与下载暂存目录或冲突目录重叠的同步根。请把这些运行状态放在所有同步根之外。
+下载暂存目录也不能位于同一 StateStore 中其他已激活的同步根内。
 临时目录可以与下载目标位于不同文件系统，但必须位于所有同步目录之外。
 
 普通失败会清理未发布的下载临时文件。覆盖已有文件时保留原 inode，通过截断和分块写入更新正文；

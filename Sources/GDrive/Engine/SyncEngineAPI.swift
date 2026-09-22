@@ -288,8 +288,9 @@ public final class SyncEngine: Sendable {
         localPath: String,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
-        try await verifyDatabaseConnection()
         let resolvedLocalPath = Self.normalizedPath(localPath)
+        try validateOperationalStateIsOutsideSyncRoot(resolvedLocalPath)
+        try await verifyDatabaseConnection()
         let token = try await RootSyncCoordinator.shared.acquire(
             localRootPath: resolvedLocalPath)
         let result: Result<T, any Error>
@@ -300,6 +301,31 @@ public final class SyncEngine: Sendable {
         }
         await RootSyncCoordinator.shared.release(token)
         return try result.get()
+    }
+
+    private func validateOperationalStateIsOutsideSyncRoot(_ localPath: String) throws {
+        let protectedFiles = [
+            ("Google Drive credential file", auth.fileURL.path),
+            ("SQLite state database", store.path)
+        ]
+        for (description, path) in protectedFiles
+        where RootSyncCoordinator.contains(path, in: localPath) {
+            throw SyncEngineError.general(
+                "The local sync root contains the \(description): \(path). "
+                    + "Configure operational state outside the sync root.")
+        }
+
+        let protectedDirectories = [
+            ("download temporary directory", downloadTemporaryDirectory.path),
+            ("conflict directory", conflictDirectory.path)
+        ]
+        for (description, path) in protectedDirectories
+        where RootSyncCoordinator.contains(path, in: localPath)
+            || RootSyncCoordinator.contains(localPath, in: path) {
+            throw SyncEngineError.general(
+                "The local sync root overlaps the \(description): \(path). "
+                    + "Configure operational state outside the sync root.")
+        }
     }
 
     private func verifyDatabaseConnection() async throws {
