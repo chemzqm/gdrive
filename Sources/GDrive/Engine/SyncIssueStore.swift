@@ -159,18 +159,20 @@ enum SyncIssueStore {
             query.bindInt64(Int64(limit), at: 2)
             query.bindInt64(Int64(offset), at: 3)
             var issues: [SyncIssue] = []
-            while try query.step(),
-                  let id = query.columnText(at: 0),
-                  let path = query.columnText(at: 3),
-                  let stageValue = query.columnText(at: 4),
-                  let stage = SyncIssue.Stage(rawValue: stageValue),
-                  let categoryValue = query.columnText(at: 5),
-                  let category = SyncIssue.Category(rawValue: categoryValue),
-                  let actionValue = query.columnText(at: 6),
-                  let action = SyncIssue.SuggestedAction(rawValue: actionValue),
-                  let message = query.columnText(at: 7),
-                  let firstSeen = query.columnDouble(at: 9),
-                  let lastSeen = query.columnDouble(at: 10) {
+            var scannedRows = 0
+            while try query.step() {
+                scannedRows += 1
+                guard let id = query.columnText(at: 0),
+                      let path = query.columnText(at: 3),
+                      let stageValue = query.columnText(at: 4),
+                      let stage = SyncIssue.Stage(rawValue: stageValue),
+                      let categoryValue = query.columnText(at: 5),
+                      let category = SyncIssue.Category(rawValue: categoryValue),
+                      let actionValue = query.columnText(at: 6),
+                      let action = SyncIssue.SuggestedAction(rawValue: actionValue),
+                      let message = query.columnText(at: 7),
+                      let firstSeen = query.columnDouble(at: 9),
+                      let lastSeen = query.columnDouble(at: 10) else { continue }
                 issues.append(SyncIssue(
                     id: id, itemId: query.columnInt64(at: 1),
                     remoteFileId: query.columnText(at: 2), relativePath: path,
@@ -181,7 +183,7 @@ enum SyncIssueStore {
                     lastSeenAt: Date(timeIntervalSince1970: lastSeen),
                     occurrenceCount: Int(query.columnInt64(at: 11) ?? 1)))
             }
-            let consumed = offset + issues.count
+            let consumed = offset + scannedRows
             return SyncIssuePage(
                 issues: issues, totalCount: total,
                 nextOffset: consumed < total ? consumed : nil)

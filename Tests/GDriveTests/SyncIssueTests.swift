@@ -84,4 +84,39 @@ struct SyncIssueTests {
         try await SyncIssueStore.clear(store: reopened, rootID: rootID)
         #expect(try await SyncIssueStore.count(store: reopened, rootID: rootID) == 0)
     }
+
+    @Test("A malformed issue does not truncate later valid rows")
+    func malformedRowDoesNotTruncatePage() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        try await SyncIssueStore.record(
+            store: fixture.store, rootID: fixture.rootID,
+            subject: SyncIssueSubject(
+                itemID: nil, remoteFileID: "valid", relativePath: "valid.txt"),
+            stage: .download,
+            error: DriveError.checksumMismatch(expected: "expected", actual: "actual"))
+        try await fixture.store.write { conn in
+            try conn.execute("PRAGMA ignore_check_constraints = ON;")
+            defer { try? conn.execute("PRAGMA ignore_check_constraints = OFF;") }
+            try conn.execute(
+                """
+                INSERT INTO sync_issues(
+                    issue_id, root_id, subject_key, relative_path, stage,
+                    category, suggested_action, message, first_seen_at,
+                    last_seen_at, occurrence_count
+                ) VALUES (
+                    'malformed', \(fixture.rootID), 'malformed', 'bad.txt',
+                    'invalid-stage', 'unknown', 'retry', 'bad row',
+                    9999999999, 9999999999, 1
+                );
+                """)
+        }
+
+        let page = try await SyncIssueStore.page(
+            store: fixture.store, rootID: fixture.rootID, limit: 2, offset: 0)
+
+        #expect(page.totalCount == 2)
+        #expect(page.issues.map(\.remoteFileId) == ["valid"])
+        #expect(page.nextOffset == nil)
+    }
 }
