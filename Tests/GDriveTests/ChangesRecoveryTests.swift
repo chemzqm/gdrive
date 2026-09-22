@@ -759,6 +759,45 @@ struct ChangesRecoveryTests {
         #expect(try String(contentsOf: occupied, encoding: .utf8) == "untracked local file")
     }
 
+    @Test("A remote rename recovers a file whose first download never landed")
+    func remoteRenameRecoversFileWithoutLocalIdentity() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let original = remoteFile("pending-file", parent: "root", name: "original.txt")
+        let body = context.value.state.withLock { state -> Data in
+            state.pages["start"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "steady",
+                changes: [DriveChange(fileId: original.id, removed: false, file: original)])
+            return state.contents.removeValue(forKey: original.id) ?? Data()
+        }
+
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(first.filesDownloaded == 0)
+        #expect(first.filesFailed == 1)
+        #expect(!FileManager.default.fileExists(
+            atPath: testFixture.local.appendingPathComponent(original.name).path))
+        let renamed = DriveFile(
+            id: original.id, name: "renamed.txt", parents: ["root"],
+            size: original.size, sha256Checksum: original.sha256Checksum, version: "2")
+        context.value.state.withLock {
+            $0.files[renamed.id] = renamed
+            $0.contents[renamed.id] = body
+            $0.pages["steady"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "done",
+                changes: [DriveChange(fileId: renamed.id, removed: false, file: renamed)])
+        }
+
+        let second = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(second.filesDownloaded == 1)
+        #expect(second.filesFailed == 0)
+        #expect(second.remoteWorkPending == 0)
+        #expect(try Data(contentsOf: testFixture.local.appendingPathComponent(renamed.name)) == body)
+        #expect(!FileManager.default.fileExists(
+            atPath: testFixture.local.appendingPathComponent(original.name).path))
+    }
+
     @Test("Rebuilding a lost cursor re-probes old queued payloads")
     func staleQueuedObservation() async throws {
         let testFixture = try await fixture()

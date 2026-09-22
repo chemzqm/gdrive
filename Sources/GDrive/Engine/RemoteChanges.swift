@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 
@@ -468,17 +469,30 @@ struct RemoteChanges: Sendable {
         let isDirectory: Bool
         let device: Int64?
         let inode: Int64?
+        let localStatus: String?
         let version: Int64?
     }
     private func item(_ conn: SQLiteConnection, remoteID: String) throws -> Item? {
         let queryStatement = try Self.statement(conn, """
-            SELECT item_id, parent_id, name, entry_kind, local_device, local_inode, remote_version
+            SELECT item_id, parent_id, name, entry_kind, local_device, local_inode,
+                local_status, remote_version
             FROM items WHERE root_id = ? AND remote_file_id = ?;
             """, [.int(rootID), .text(remoteID)])
         defer { queryStatement.reset() }
         guard try queryStatement.step(), let id = queryStatement.columnInt64(at: 0), let name = queryStatement.columnText(at: 2) else { return nil }
         return Item(id: id, parentID: queryStatement.columnInt64(at: 1), name: name, isDirectory: queryStatement.columnText(at: 3) == "directory",
-                    device: queryStatement.columnInt64(at: 4), inode: queryStatement.columnInt64(at: 5), version: queryStatement.columnInt64(at: 6))
+                    device: queryStatement.columnInt64(at: 4), inode: queryStatement.columnInt64(at: 5),
+                    localStatus: queryStatement.columnText(at: 6), version: queryStatement.columnInt64(at: 7))
+    }
+    private func unlandedFileHasNoSource(_ item: Item, source: URL) throws -> Bool {
+        guard !item.isDirectory, item.localStatus == "absent",
+              item.device == nil, item.inode == nil else { return false }
+        var sourceStat = stat()
+        if lstat(source.path, &sourceStat) == 0 { return false }
+        guard errno == ENOENT else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return true
     }
     private func path(_ conn: SQLiteConnection, itemID: Int64) throws -> String {
         guard let path = try conn.itemRelativePath(itemID: itemID) else {
@@ -541,6 +555,7 @@ struct RemoteChanges: Sendable {
         let moved = existing.map { $0.parentID != parent.id || $0.name != file.name } ?? false
         if let existing, moved {
             let source = rootURL.appendingPathComponent(try path(conn, itemID: existing.id))
+            if try unlandedFileHasNoSource(existing, source: source) { return .ready(nil) }
             return .ready(.move(
                 source: source,
                 destination: destination,
