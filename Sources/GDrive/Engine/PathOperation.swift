@@ -49,7 +49,7 @@ enum LocalPathOperation: Sendable, Equatable {
         }
     }
 
-    func execute() throws -> Bool {
+    func execute(beforeMove: (@Sendable () throws -> Void)? = nil) throws -> Bool {
         switch self {
         case .move(let source, let destination, let kind, let device, let inode):
             guard let device, let inode else { return false }
@@ -60,7 +60,15 @@ enum LocalPathOperation: Sendable, Equatable {
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(),
                     withIntermediateDirectories: true)
-                try FileManager.default.moveItem(at: source, to: destination)
+                try beforeMove?()
+                try Self.renameExclusive(source, to: destination)
+                guard let destinationIdentity = try Self.identity(at: destination),
+                      destinationIdentity.kind == kind,
+                      destinationIdentity.device == device,
+                      destinationIdentity.inode == inode else {
+                    try Self.renameExclusive(destination, to: source)
+                    return false
+                }
             } else if let destinationIdentity = try Self.identity(at: destination) {
                 // A previous process may have moved it before its receipt committed.
                 return destinationIdentity.kind == kind
@@ -90,6 +98,14 @@ enum LocalPathOperation: Sendable, Equatable {
         }
         return Identity(
             device: Int64(value.st_dev), inode: Int64(value.st_ino), kind: kind)
+    }
+
+    private static func renameExclusive(_ source: URL, to destination: URL) throws {
+        guard renameatx_np(
+            AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_EXCL)) == 0
+        else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
     }
 }
 
