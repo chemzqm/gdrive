@@ -214,6 +214,8 @@ public actor Auth {
         encoder.dateEncodingStrategy = .iso8601
         let raw = try encoder.encode(data)
         try raw.write(to: fileURL, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
     }
 
     // MARK: - Helpers

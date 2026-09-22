@@ -112,6 +112,9 @@ struct RetrySemanticsTests {
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o644],
+            ofItemAtPath: directory.appendingPathComponent("auth.json").path)
         let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
         request.setValue("Bearer stale-token", forHTTPHeaderField: "Authorization")
@@ -122,6 +125,10 @@ struct RetrySemanticsTests {
         #expect(result.refreshes == 1)
         #expect(result.authorizationHeaders == ["Bearer stale-token", "Bearer fresh-token"])
         #expect(await auth.authData().accessToken == "fresh-token")
+        let permissions = try FileManager.default.attributesOfItem(
+            atPath: directory.appendingPathComponent("auth.json").path
+        )[.posixPermissions] as? NSNumber
+        #expect(permissions?.intValue == 0o600)
     }
 
     @Test("Cancellation during retry backoff stops before another request")
