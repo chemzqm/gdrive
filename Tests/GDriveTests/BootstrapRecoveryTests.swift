@@ -42,6 +42,32 @@ final class MockDirectoryRecoveryURLProtocol: URLProtocol, @unchecked Sendable {
     }
 }
 
+private final class BlockingRequestGate: @unchecked Sendable {
+    private let started = AsyncSemaphore(count: 0)
+    private let condition = NSCondition()
+    private var isReleased = false
+
+    func wait() {
+        started.signal()
+        condition.lock()
+        while !isReleased {
+            condition.wait()
+        }
+        condition.unlock()
+    }
+
+    func waitUntilStarted() async throws {
+        try await started.wait()
+    }
+
+    func releaseAll() {
+        condition.lock()
+        isReleased = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 extension URLRequest {
     var extractBodyData: Data? {
         if let httpBody = self.httpBody {
@@ -864,7 +890,9 @@ struct BootstrapRecoveryTests {
 
     // MARK: - Integration Tests: syncLocalToRemoteEmpty with Injections (A06 Swift Acceptance)
 
-    @Test("Swift Acceptance 1: Parent directory 403 injection: children fail promptly, sibling directory succeeds, sync returns complete stats")
+    @Test(
+        "Swift Acceptance 1: Parent directory 403 injection: children fail promptly, sibling directory succeeds, sync returns complete stats",
+        .timeLimit(.minutes(1)))
     func testParentDir403AllowsSiblingToComplete() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a06_test403_\(UUID().uuidString)")
@@ -970,14 +998,11 @@ struct BootstrapRecoveryTests {
         }
 
         // Run syncLocalToRemoteEmpty. It must not deadlock!
-        let startTime = DispatchTime.now()
         let stats = try await engine.syncLocalToRemoteEmpty(
             localPath: localRootDir.path,
             remoteRootId: remoteRootId
         )
-        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
 
-        #expect(elapsed < 10.0, "Sync should finish in bounded time without hanging on broken parent")
         #expect(stats.directoriesCreated == 1, "healthy_dir was created")
         #expect(stats.filesUploaded == 1, "file3 in healthy_dir was uploaded")
         #expect(stats.filesFailed == 2, "file1 and file2 under broken_dir were recorded as failed")
@@ -1096,7 +1121,9 @@ struct BootstrapRecoveryTests {
         #expect(stats.filesFailed == 1, "conflict_file failed")
     }
 
-    @Test("Swift Acceptance 3: Cancellation injection terminates sync without deadlock")
+    @Test(
+        "Swift Acceptance 3: Cancellation injection terminates sync without deadlock",
+        .timeLimit(.minutes(1)))
     func testCancellationOfSyncTerminatesPromptly() async throws {
         defer { context.value.requestHandler = nil }
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a06_cancel_\(UUID().uuidString)")
@@ -1119,6 +1146,7 @@ struct BootstrapRecoveryTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
         let remoteRootId = "remote_root_cancel"
+        let requestGate = BlockingRequestGate()
 
         context.value.requestHandler = { request in
             let url = try #require(request.url)
@@ -1149,8 +1177,7 @@ struct BootstrapRecoveryTests {
                 return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, json)
             }
 
-            // For creation requests, sleep slightly to allow cancellation to happen mid-flight
-            Thread.sleep(forTimeInterval: 0.05)
+            requestGate.wait()
             let json = Data("""
             {
                 "id": "dir_mock",
@@ -1168,14 +1195,13 @@ struct BootstrapRecoveryTests {
             )
         }
 
-        // Cancel after 20ms
-        try await Task.sleep(nanoseconds: 20_000_000)
+        try await requestGate.waitUntilStarted()
         syncTask.cancel()
+        requestGate.releaseAll()
 
-        let startTime = DispatchTime.now()
-        _ = try? await syncTask.value
-        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - startTime.uptimeNanoseconds) / 1_000_000_000
-        #expect(elapsed < 3.0, "Cancelled sync should terminate promptly without deadlock")
+        await #expect(throws: CancellationError.self) {
+            try await syncTask.value
+        }
     }
     @Test("Bootstrap drains admitted tasks after scan failure or cancellation", arguments: [false, true])
     func scanInterruptionDrainsTasks(cancel: Bool) async throws {

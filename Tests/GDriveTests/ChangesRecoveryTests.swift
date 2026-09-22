@@ -1109,6 +1109,23 @@ struct ChangesRecoveryTests {
         return false
     }
 
+    private func waitForCommittedUpload(_ name: String, store: StateStore) async throws {
+        while true {
+            try Task.checkCancellation()
+            let committed = try await store.read { conn in
+                let statement = try conn.prepare(
+                    "SELECT phase, dirty_generation FROM items WHERE name = ?;")
+                statement.bindText(name, at: 1)
+                defer { statement.reset() }
+                return try statement.step()
+                    && statement.columnText(at: 0) == "committed"
+                    && statement.columnInt64(at: 1) == 0
+            }
+            if committed { return }
+            await Task.yield()
+        }
+    }
+
     @Test(
         "File and directory replacements converge in one incremental sync",
         arguments: [false, true])
@@ -1440,7 +1457,10 @@ struct ChangesRecoveryTests {
         #expect(!FileManager.default.fileExists(atPath: staging.path))
     }
 
-    @Test("A16 first upload completes while the scanner's tail is paused", arguments: ["complete", "error", "cancel"])
+    @Test(
+        "A16 first upload completes while the scanner's tail is paused",
+        .timeLimit(.minutes(1)),
+        arguments: ["complete", "error", "cancel"])
     func uploadBeforeScanEnd(ending: String) async throws {
         let testFixture = try await fixture()
         defer { testFixture.cleanup() }
@@ -1468,8 +1488,8 @@ struct ChangesRecoveryTests {
         let engine = try await SyncEngine(auth: testFixture.auth, store: testFixture.store, client: testFixture.client,
             idPool: IDPool(initialIds: ["first-id"]), incrementalScan: { _, consume in
                 try await consume(batch)
-                // Do not supply the tail until the real multipart request has completed.
-                #expect(try await waitForUpload("first"))
+                // Do not supply the tail until the upload receipt is committed.
+                try await waitForCommittedUpload("first", store: testFixture.store)
                 if ending == "error" { throw POSIXError(.EIO) }
                 if ending == "cancel" {
                     withUnsafeCurrentTask { $0?.cancel() }
