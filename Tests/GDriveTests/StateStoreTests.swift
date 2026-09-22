@@ -265,4 +265,59 @@ struct StateStoreTests {
         }
         #expect(count2 == Int64(concurrentWrites + 5))
     }
+
+    @Test("A failed group commit isolates the invalid write")
+    func testGroupCommitFailureIsolation() async throws {
+        let tempDB = FileManager.default.temporaryDirectory
+            .appendingPathComponent("statestore-groupcommit-failure-\(UUID().uuidString).sqlite").path
+        defer {
+            try? FileManager.default.removeItem(atPath: tempDB)
+            try? FileManager.default.removeItem(atPath: "\(tempDB)-wal")
+            try? FileManager.default.removeItem(atPath: "\(tempDB)-shm")
+        }
+
+        let store = try await StateStore(
+            path: tempDB, maxReaders: 1, batchCapacity: 3, batchTimeoutMs: 1_000)
+        try await store.write { conn in
+            try conn.execute("CREATE TABLE isolated_writes (value TEXT PRIMARY KEY);")
+            try conn.execute("INSERT INTO isolated_writes(value) VALUES ('duplicate');")
+        }
+
+        let values = ["valid-a", "duplicate", "valid-b"]
+        var outcomes: [String: Bool] = [:]
+        await withTaskGroup(of: (String, Bool).self) { group in
+            for value in values {
+                group.addTask {
+                    do {
+                        try await store.batchWrite { conn in
+                            let statement = try conn.prepare(
+                                "INSERT INTO isolated_writes(value) VALUES (?);")
+                            statement.bindText(value, at: 1)
+                            _ = try statement.step()
+                        }
+                        return (value, true)
+                    } catch {
+                        return (value, false)
+                    }
+                }
+            }
+            for await (value, succeeded) in group {
+                outcomes[value] = succeeded
+            }
+        }
+
+        #expect(outcomes["valid-a"] == true)
+        #expect(outcomes["duplicate"] == false)
+        #expect(outcomes["valid-b"] == true)
+        let storedValues = try await store.read { conn -> [String] in
+            let statement = try conn.prepare(
+                "SELECT value FROM isolated_writes ORDER BY value;")
+            var result: [String] = []
+            while try statement.step(), let value = statement.columnText(at: 0) {
+                result.append(value)
+            }
+            return result
+        }
+        #expect(storedValues == ["duplicate", "valid-a", "valid-b"])
+    }
 }

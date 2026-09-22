@@ -177,20 +177,32 @@ public actor DedicatedWriter {
                     try task.block(connection)
                 }
             }
-            stats.totalCommits += 1
-            stats.totalItems += currentBatch.count
-            switch reason {
-            case .capacity: stats.capacityTriggeredCommits += 1
-            case .timeout: stats.timeoutTriggeredCommits += 1
-            case .immediate: break
-            }
+            recordCommit(reason: reason, itemCount: currentBatch.count)
             for task in currentBatch {
                 task.continuation.resume()
             }
         } catch {
             for task in currentBatch {
-                task.continuation.resume(throwing: error)
+                do {
+                    try connection.transaction {
+                        try task.block(connection)
+                    }
+                    recordCommit(reason: reason, itemCount: 1)
+                    task.continuation.resume()
+                } catch {
+                    task.continuation.resume(throwing: error)
+                }
             }
+        }
+    }
+
+    private func recordCommit(reason: FlushReason, itemCount: Int) {
+        stats.totalCommits += 1
+        stats.totalItems += itemCount
+        switch reason {
+        case .capacity: stats.capacityTriggeredCommits += 1
+        case .timeout: stats.timeoutTriggeredCommits += 1
+        case .immediate: break
         }
     }
 
