@@ -27,6 +27,7 @@ private struct ChangesServer: Sendable {
 private struct ChangesProtocolState: Sendable {
     let heldDownload = OSAllocatedUnfairLock<(@Sendable () -> Void)?>(initialState: nil)
     let holdDownloads = OSAllocatedUnfairLock(initialState: false)
+    let uploadStarted = AsyncSemaphore(count: 0)
     let state = OSAllocatedUnfairLock(initialState: ChangesServer())
 }
 private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
@@ -41,6 +42,7 @@ private final class ChangesProtocol: URLProtocol, @unchecked Sendable {
             return state.uploadDelay
         }
         if delay > 0 {
+            self.server.uploadStarted.signal()
             DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
                 self.server.state.withLock { $0.activeUploads -= 1 }
                 self.respond()
@@ -1434,6 +1436,37 @@ struct ChangesRecoveryTests {
         #expect(result.filesFailed == 0)
         #expect(context.value.state.withLock { $0.peakUploads } == 2)
         #expect(context.value.state.withLock { $0.activeUploads } == 0)
+    }
+
+    @Test("Same-named incremental uploads have distinct monitor entries", .timeLimit(.minutes(1)))
+    func sameNamedIncrementalUploadsHaveDistinctMonitorEntries() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let first = testFixture.local.appendingPathComponent("dir-a/shared.txt")
+        let second = testFixture.local.appendingPathComponent("dir-b/shared.txt")
+        try FileManager.default.createDirectory(
+            at: first.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(
+            at: second.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("first".utf8).write(to: first)
+        try Data("second".utf8).write(to: second)
+        context.value.state.withLock { $0.uploadDelay = 0.2 }
+
+        let sync = Task {
+            try await testFixture.engine.syncIncremental(
+                localPath: testFixture.local.path, maxConcurrency: 2)
+        }
+        await context.value.uploadStarted.wait()
+        await context.value.uploadStarted.wait()
+        testFixture.engine.monitor.refreshSnapshot()
+        let snapshot = testFixture.engine.transferStatus
+
+        #expect(snapshot.activeUploads.count == 2)
+        #expect(Set(snapshot.activeUploads.map(\.fileId)) == Set([first.path, second.path]))
+        #expect(snapshot.activeUploads.allSatisfy { $0.name == "shared.txt" })
+        let result = try await sync.value
+        #expect(result.filesUploaded == 2)
+        #expect(result.filesFailed == 0)
     }
 
     @Test("A17 incremental large files use bounded resumable chunks")

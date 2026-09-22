@@ -260,23 +260,24 @@ extension IncrementalSyncRun {
 
     private func scheduleUpload(_ item: DirtyRecord) async throws {
         let upBytes = item.local?.size ?? 0
+        let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
+        let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
+        let localFileURL = rootURL.appendingPathComponent(relPath)
+        let monitorID = localFileURL.path
         notifier.addDiscovered(files: 1, bytes: upBytes)
         try await acquireTransfer()
-        engine.monitor.enqueueUpload(id: item.name, name: item.name, totalBytes: upBytes)
+        engine.monitor.enqueueUpload(id: monitorID, name: item.name, totalBytes: upBytes)
         do {
             _ = try await itemTaskRegistry.start(itemIDs: [item.itemId]) { [self] in
             var createIntent = item.pendingCreate
             defer {
-                engine.monitor.finishUpload(id: item.name)
+                engine.monitor.finishUpload(id: monitorID)
                 syncSemaphore.signal()
                 notifier.addCompleted(files: 1, bytes: upBytes)
             }
 
             do {
                 try Task.checkCancellation()
-                let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
-                let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
-                let localFileURL = rootURL.appendingPathComponent(relPath)
                 if createIntent == nil, let remoteID = item.remoteFileId {
                     throw DriveError.unsafeOverwrite(fileId: remoteID)
                 }
@@ -299,7 +300,7 @@ extension IncrementalSyncRun {
                     fSize = res.fileSize
                 }
                 engine.monitor.startUpload(
-                    id: item.name, name: item.name, totalBytes: fSize)
+                    id: monitorID, name: item.name, totalBytes: fSize)
 
                 let input = try StableUploadInput.capture(at: localFileURL)
                 guard input.size == fSize, input.sha256 == sha256Hex else {
@@ -351,7 +352,7 @@ extension IncrementalSyncRun {
             }
             }
         } catch {
-            engine.monitor.finishUpload(id: item.name)
+            engine.monitor.finishUpload(id: monitorID)
             syncSemaphore.signal()
             notifier.addCompleted(files: 1, bytes: upBytes)
             throw error
