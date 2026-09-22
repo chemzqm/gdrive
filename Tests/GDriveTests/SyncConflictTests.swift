@@ -152,7 +152,13 @@ struct SyncConflictTests {
         let engine: SyncEngine
         let remoteID: String
     }
-    private func fixture(localContent: Data = Data("local edited content".utf8)) async throws -> Fixture {
+    private func fixture(
+        localContent: Data = Data("local edited content".utf8),
+        filePublisher: @escaping SyncEngine.FilePublisher = {
+            try LocalFilePublication.publish($0, to: $1, expected: $2,
+                                             expectedSHA256: $3, expectedLocalSHA256: $4)
+        }
+    ) async throws -> Fixture {
         context.value.state.withLock { $0 = ConflictServerState() }
         context.value.downloadHook.withLock { $0 = nil }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("a12-\(UUID().uuidString)")
@@ -173,7 +179,8 @@ struct SyncConflictTests {
         let engine = try await SyncEngine(auth: auth, store: store, client: client,
             idPool: IDPool(initialIds: (0..<1000).map { "id-\($0)" }),
             downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
-            conflictDirectory: directory.appendingPathComponent("conflicts"))
+            conflictDirectory: directory.appendingPathComponent("conflicts"),
+            incrementalScan: SyncEngine.defaultDirectoryScan, filePublisher: filePublisher)
         let first = try await engine.syncLocalToRemoteEmpty(localPath: local.path, remoteRootId: "root")
         #expect(first.filesUploaded == 1)
         struct ItemIdentity: Sendable {
@@ -236,6 +243,36 @@ struct SyncConflictTests {
             == Data("remote edited content".utf8))
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
             == [conflict])
+    }
+
+    @Test("Large publication rollback reuses the download for a durable conflict")
+    func publicationRollbackBecomesConflict() async throws {
+        let localEdit = Data("edited at publication".utf8)
+        let testFixture = try await fixture(localContent: Data("baseline".utf8),
+            filePublisher: { source, destination, expected, remoteSHA256, localSHA256 in
+                #expect(localSHA256 == SyncEngine.computeSha256(of: Data("baseline".utf8)))
+                return try LocalFilePublication.publish(
+                    source, to: destination, expected: expected, expectedSHA256: remoteSHA256,
+                    expectedLocalSHA256: localSHA256,
+                    renameHook: { stage in
+                        if stage == .beforeSwap { try localEdit.write(to: destination) }
+                    })
+            })
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let remote = Data(repeating: 0x52, count: 8 * 1024 * 1024 + 1)
+        context.value.state.withLock { $0.files[testFixture.remoteID]!.content = remote }
+        let downloads = context.value.state.withLock { $0.downloads }
+
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(stats.filesFailed == 0)
+        #expect(stats.filesDownloaded == 0)
+        let conflict = try #require(stats.conflicts.first)
+        let conflictPath = try #require(conflict.conflictPath)
+        #expect(try Data(contentsOf: testFixture.original) == localEdit)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == remote)
+        #expect(context.value.state.withLock { $0.downloads } == downloads + 1)
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
     }
 
     @Test("Selecting the local conflict version keeps the conflict when overwrite is blocked")

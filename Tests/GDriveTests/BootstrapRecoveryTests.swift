@@ -332,9 +332,10 @@ struct BootstrapRecoveryTests {
             downloadTemporaryDirectory: staging,
             conflictDirectory: directory.appendingPathComponent("conflicts"),
             incrementalScan: SyncEngine.defaultDirectoryScan,
-            filePublisher: { source, destination, expected, sha256 in
+            filePublisher: { source, destination, expected, sha256, localSHA256 in
                 try LocalFilePublication.publish(
                     source, to: destination, expected: expected, expectedSHA256: sha256,
+                    expectedLocalSHA256: localSHA256,
                     writeHook: { stage, _, output in
                         guard stage == .duringCopy else { return }
                         let prefix = body.prefix(1024)

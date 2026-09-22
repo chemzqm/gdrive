@@ -224,6 +224,33 @@ struct PublicationSafetyTests {
         #expect(!FileManager.default.fileExists(atPath: download.path))
     }
 
+    @Test("Large publication rolls back edits around the swap",
+          arguments: [LocalFilePublication.RenameStage.beforeSwap, .afterSwap], [false, true])
+    func largePublicationRestoresLocalEdit(stage: LocalFilePublication.RenameStage, databaseHash: Bool) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("publish-race-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("file")
+        let source = directory.appendingPathComponent("download")
+        let original = Data("original".utf8)
+        let edited = Data("modified".utf8)
+        let remote = Data(repeating: 0x52, count: 8 * 1024 * 1024 + 1)
+        try original.write(to: destination)
+        try remote.write(to: source)
+        let expected = try LocalFileVersion.read(at: destination)
+        let result = try LocalFilePublication.publish(
+            source, to: destination, expected: expected,
+            expectedSHA256: SyncEngine.computeSha256(of: remote),
+            expectedLocalSHA256: databaseHash ? SyncEngine.computeSha256(of: original) : nil,
+            renameHook: { current in
+                guard current == stage else { return }
+                try edited.write(to: current == .beforeSwap ? destination : source)
+            })
+        #expect(result == .destinationChanged)
+        #expect(try Data(contentsOf: destination) == edited)
+        #expect(try Data(contentsOf: source) == remote)
+    }
+
     @Test("A failure after publication starts is not reported as a local modification")
     func postWriteFailureClassification() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
@@ -277,9 +304,10 @@ struct PublicationSafetyTests {
             auth: auth, store: store, client: client,
             downloadTemporaryDirectory: staging,
             incrementalScan: SyncEngine.defaultDirectoryScan,
-            filePublisher: { source, target, expectedVersion, sha256 in
+            filePublisher: { source, target, expectedVersion, sha256, localSHA256 in
                 try LocalFilePublication.publish(
                     source, to: target, expected: expectedVersion, expectedSHA256: sha256,
+                    expectedLocalSHA256: localSHA256,
                     writeHook: { current, _, output in
                         guard current == stage else { return }
                         if current == .duringCopy {

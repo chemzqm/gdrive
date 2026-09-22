@@ -133,7 +133,7 @@ public final class SyncEngine: Sendable {
     typealias StableFileDigestCapture = @Sendable (URL) throws -> StableLocalFileDigest
     let stableFileDigestCapture: StableFileDigestCapture
     typealias FilePublisher = @Sendable (
-        URL, URL, LocalFileVersion?, String
+        URL, URL, LocalFileVersion?, String, String?
     ) throws -> LocalFilePublication.Result
     let filePublisher: FilePublisher
 
@@ -150,7 +150,7 @@ public final class SyncEngine: Sendable {
             conflictDirectory: conflictDirectory, incrementalScan: Self.defaultDirectoryScan,
             stableFileDigestCapture: { try StableLocalFileDigest.capture(at: $0) },
             filePublisher: {
-                try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3)
+                try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3, expectedLocalSHA256: $4)
             })
     }
 
@@ -162,7 +162,7 @@ public final class SyncEngine: Sendable {
              try StableLocalFileDigest.capture(at: $0)
          },
          filePublisher: @escaping FilePublisher = {
-             try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3)
+             try LocalFilePublication.publish($0, to: $1, expected: $2, expectedSHA256: $3, expectedLocalSHA256: $4)
          }) async throws {
         guard downloadTemporaryDirectory.isFileURL else {
             throw SyncEngineError.general("The temporary download directory must be a local file path")

@@ -39,6 +39,7 @@ extension SyncEngine {
         destination: URL,
         expectedDestination: LocalFileVersion?,
         temporaryDirectory: URL,
+        expectedLocalSHA256: String? = nil,
         cached: DriveClient.VerifiedDownload? = nil,
         onProgress: (@Sendable (Int64) -> Void)? = nil,
         beforePublish: (@Sendable () async throws -> Void)? = nil
@@ -58,7 +59,7 @@ extension SyncEngine {
         do {
             try await beforePublish?()
             switch try filePublisher(
-                download.url, destination, expectedDestination, download.sha256) {
+                download.url, destination, expectedDestination, download.sha256, expectedLocalSHA256) {
             case .published(let version):
                 try? FileManager.default.removeItem(at: download.url)
                 return .published(version)

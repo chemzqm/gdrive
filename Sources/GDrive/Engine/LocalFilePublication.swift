@@ -10,6 +10,11 @@ enum LocalFilePublication {
         case fsync
     }
 
+    enum RenameStage: Sendable {
+        case beforeSwap
+        case afterSwap
+    }
+
     struct Failure: Sendable, Equatable {
         let destinationPath: String
         let reason: String
@@ -28,6 +33,8 @@ enum LocalFilePublication {
         to destination: URL,
         expected: LocalFileVersion?,
         expectedSHA256: String,
+        expectedLocalSHA256: String? = nil,
+        renameHook: (@Sendable (RenameStage) throws -> Void)? = nil,
         writeHook: (@Sendable (WriteStage, Int32, Int32) throws -> Void)? = nil
     ) throws -> Result {
         guard let sourceVersion = try LocalFileVersion.read(at: source) else {
@@ -40,7 +47,8 @@ enum LocalFilePublication {
         if sourceVersion.size > atomicRenameThreshold,
            sourceVersion.device == publicationDevice(destination: destination, expected: expected) {
             return try publishByRename(
-                source, to: destination, expected: expected)
+                source, to: destination, expected: expected,
+                expectedLocalSHA256: expectedLocalSHA256, hook: renameHook)
         }
 
         guard let descriptor = try openDestination(destination, expected: expected) else {
@@ -86,20 +94,13 @@ enum LocalFilePublication {
     private static func publishByRename(
         _ source: URL,
         to destination: URL,
-        expected: LocalFileVersion?
+        expected: LocalFileVersion?,
+        expectedLocalSHA256: String?,
+        hook: (@Sendable (RenameStage) throws -> Void)?
     ) throws -> Result {
-        if expected != nil {
-            guard renameatx_np(
-                AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) == 0
-            else {
-                if errno == ENOENT { return .destinationChanged }
-                throw posixError()
-            }
-            try FileManager.default.removeItem(at: source)
-            guard let published = try LocalFileVersion.read(at: destination) else {
-                throw SyncEngineError.localFilePublicationFailed(path: destination.path)
-            }
-            return .published(published)
+        if let expected {
+            return try replaceByRename(source, destination: destination, expected: expected,
+                                       expectedLocalSHA256: expectedLocalSHA256, hook: hook)
         }
 
         guard renameatx_np(
@@ -112,6 +113,74 @@ enum LocalFilePublication {
             throw SyncEngineError.localFilePublicationFailed(path: destination.path)
         }
         return .published(published)
+    }
+
+    private static func replaceByRename(
+        _ source: URL, destination: URL, expected: LocalFileVersion,
+        expectedLocalSHA256: String?, hook: (@Sendable (RenameStage) throws -> Void)?
+    ) throws -> Result {
+        let localSHA256: String
+        if let expectedLocalSHA256 {
+            localSHA256 = expectedLocalSHA256
+        } else {
+            let digest = try StableLocalFileDigest.capture(at: destination)
+            guard digest.version == expected else { return .destinationChanged }
+            localSHA256 = digest.sha256Hex
+        }
+        try hook?(.beforeSwap)
+        guard renameatx_np(
+            AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) == 0
+        else {
+            if errno == ENOENT { return .destinationChanged }
+            throw posixError()
+        }
+        let displacedSHA256: String
+        do {
+            try hook?(.afterSwap)
+            displacedSHA256 = try SyncEngine.computeFileSha256(at: source).sha256Hex
+        } catch {
+            try rollback(source, destination: destination)
+            throw error
+        }
+        guard displacedSHA256.caseInsensitiveCompare(localSHA256) == .orderedSame else {
+            try rollback(source, destination: destination)
+            return .destinationChanged
+        }
+        try FileManager.default.removeItem(at: source)
+        guard let published = try LocalFileVersion.read(at: destination) else {
+            throw SyncEngineError.localFilePublicationFailed(path: destination.path)
+        }
+        return .published(published)
+    }
+
+    /// A failed rollback remains a failed publication even if the recovery attempt succeeds.
+    /// Callers retain their existing temporary-file cleanup policy on errors.
+    private static func rollback(
+        _ source: URL, destination: URL
+    ) throws {
+        do {
+            guard renameatx_np(
+                AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) == 0
+            else { throw posixError() }
+        } catch {
+            let rollbackError = error
+            var recoveryError: (any Error)?
+            do {
+                if renameatx_np(
+                    AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_SWAP)) != 0 {
+                    // If the destination vanished, restore without overwriting a new arrival.
+                    guard errno == ENOENT else { throw posixError() }
+                    guard renameatx_np(
+                        AT_FDCWD, source.path, AT_FDCWD, destination.path, UInt32(RENAME_EXCL)) == 0
+                    else { throw posixError() }
+                }
+            } catch {
+                recoveryError = error
+            }
+            throw SyncEngineError.general(
+                "Download publication rollback failed at \(destination.path): \(rollbackError). "
+                    + (recoveryError.map { "Local restore also failed: \($0)" } ?? "Local file restored."))
+        }
     }
 
     private static func openDestination(

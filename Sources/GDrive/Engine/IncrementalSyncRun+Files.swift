@@ -420,6 +420,7 @@ extension IncrementalSyncRun {
                     destination: localFileURL,
                     expectedDestination: expectedDestination,
                     temporaryDirectory: downloadDirectory,
+                    expectedLocalSHA256: item.local?.sha256,
                     cached: cached,
                     onProgress: { delta in
                         self.engine.monitor.reportDownloadProgress(
