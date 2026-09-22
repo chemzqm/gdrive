@@ -16,21 +16,24 @@ extension SyncEngine {
         let statement = try conn.cachedStatement("""
             SELECT local_root_path, remote_root_id
             FROM roots
-            WHERE account_id = 'default'
-                AND (local_root_path = ? OR remote_root_id = ?);
+            WHERE account_id = 'default';
             """)
         defer { statement.reset() }
-        statement.bindText(localPath, at: 1)
-        statement.bindText(remoteRootID, at: 2)
+        let normalizedLocalPath = RootSyncCoordinator.normalizedPath(localPath)
 
         while try statement.step() {
             guard let existingLocalPath = statement.columnText(at: 0),
                   let existingRemoteRootID = statement.columnText(at: 1) else {
                 throw SyncEngineError.general("Stored root binding is incomplete")
             }
-            guard existingLocalPath == localPath, existingRemoteRootID == remoteRootID else {
+            let normalizedExistingPath = RootSyncCoordinator.normalizedPath(existingLocalPath)
+            let sameBinding = normalizedExistingPath == normalizedLocalPath
+                && existingRemoteRootID == remoteRootID
+            let conflicts = existingRemoteRootID == remoteRootID
+                || RootSyncCoordinator.overlaps(normalizedExistingPath, normalizedLocalPath)
+            guard sameBinding || !conflicts else {
                 throw SyncEngineError.rootBindingConflict(
-                    localPath: localPath,
+                    localPath: normalizedLocalPath,
                     remoteRootId: remoteRootID,
                     existingLocalPath: existingLocalPath,
                     existingRemoteRootId: existingRemoteRootID)

@@ -84,6 +84,32 @@ struct RootSyncCoordinatorTests {
         await RootSyncCoordinator.shared.release(retryToken)
     }
 
+    @Test("Ancestor and descendant roots cannot run concurrently through symlink aliases")
+    func rejectsConcurrentNestedRoots() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nested-root-lock-\(UUID().uuidString)")
+        let parent = directory.appendingPathComponent("parent")
+        let child = parent.appendingPathComponent("child")
+        let alias = directory.appendingPathComponent("child-alias")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: child)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let parentToken = try await RootSyncCoordinator.shared.acquire(localRootPath: parent.path)
+        let childError = await #expect(throws: SyncEngineError.self) {
+            _ = try await RootSyncCoordinator.shared.acquire(localRootPath: alias.path)
+        }
+        #expect(childError == .rootBusy(path: child.path))
+        await RootSyncCoordinator.shared.release(parentToken)
+
+        let childToken = try await RootSyncCoordinator.shared.acquire(localRootPath: alias.path)
+        let parentError = await #expect(throws: SyncEngineError.self) {
+            _ = try await RootSyncCoordinator.shared.acquire(localRootPath: parent.path)
+        }
+        #expect(parentError == .rootBusy(path: parent.path))
+        await RootSyncCoordinator.shared.release(childToken)
+    }
+
     @Test("A changed root symlink does not leak the lock after a successful run")
     func releasesOriginalKeyAfterSuccess() async throws {
         let testFixture = try await fixture()

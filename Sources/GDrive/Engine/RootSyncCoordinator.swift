@@ -12,9 +12,10 @@ actor RootSyncCoordinator {
 
     func acquire(localRootPath: String) throws -> Token {
         let key = Self.normalizedPath(localRootPath)
-        guard runningRoots.insert(key).inserted else {
+        guard !runningRoots.contains(where: { Self.overlaps($0, key) }) else {
             throw SyncEngineError.rootBusy(path: key)
         }
+        runningRoots.insert(key)
         return Token(key: key)
     }
 
@@ -43,5 +44,9 @@ actor RootSyncCoordinator {
         guard candidate != directory else { return true }
         let prefix = directory.hasSuffix("/") ? directory : directory + "/"
         return candidate.hasPrefix(prefix)
+    }
+
+    nonisolated static func overlaps(_ firstPath: String, _ secondPath: String) -> Bool {
+        contains(firstPath, in: secondPath) || contains(secondPath, in: firstPath)
     }
 }

@@ -265,6 +265,50 @@ struct RootBindingSafetyTests {
             existingRemoteRootId: "root-a"))
     }
 
+    @Test("Nested local roots cannot be bound to different remote roots")
+    private func cannotBindNestedLocalRoots() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "nested-binding-\(UUID().uuidString)")
+        let parent = directory.appendingPathComponent("parent")
+        let child = parent.appendingPathComponent("child")
+        try FileManager.default.createDirectory(at: child, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        _ = try await seedBinding(store: store, localRoot: parent, remoteRootID: "parent-root")
+
+        let childError = await #expect(throws: SyncEngineError.self) {
+            try await store.read { conn in
+                try SyncEngine.validateRootBinding(
+                    conn: conn,
+                    localPath: RootSyncCoordinator.normalizedPath(child.path),
+                    remoteRootID: "child-root")
+            }
+        }
+        #expect(childError == .rootBindingConflict(
+            localPath: child.path,
+            remoteRootId: "child-root",
+            existingLocalPath: parent.path,
+            existingRemoteRootId: "parent-root"))
+
+        let separateStore = try await StateStore(
+            path: directory.appendingPathComponent("other-state.sqlite").path)
+        _ = try await seedBinding(
+            store: separateStore, localRoot: child, remoteRootID: "child-root")
+        let parentError = await #expect(throws: SyncEngineError.self) {
+            try await separateStore.read { conn in
+                try SyncEngine.validateRootBinding(
+                    conn: conn,
+                    localPath: RootSyncCoordinator.normalizedPath(parent.path),
+                    remoteRootID: "parent-root")
+            }
+        }
+        #expect(parentError == .rootBindingConflict(
+            localPath: parent.path,
+            remoteRootId: "parent-root",
+            existingLocalPath: child.path,
+            existingRemoteRootId: "child-root"))
+    }
+
     @Test("The same root binding can resume bootstrap")
     private func sameBindingCanResume() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
