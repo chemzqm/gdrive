@@ -535,41 +535,13 @@ extension SyncEngine {
             try await resolveRemoteConflict(
                 record, localURL: localURL, storedURL: storedURL)
         case .local:
-            guard let version = try LocalFileVersion.read(at: localURL) else {
+            guard try LocalFileVersion.read(at: localURL) != nil else {
                 try await resolveLocalDeletion(record, storedURL: storedURL)
                 return
             }
             // Existing remote bodies cannot be overwritten safely yet. Keep the conflict evidence
-            // intact so this path remains gated and can be resolved after safe overwrite is available.
-            guard conflict.remoteStatus != .present else {
-                return
-            }
-            try await client.untrash(remoteId: conflict.remoteFileId)
-            let digest = try Self.computeFileSha256(at: localURL)
-            try await store.batchWrite { conn in
-                let update = try conn.cachedStatement("""
-                UPDATE items SET local_device = ?, local_inode = ?, local_mtime = ?, local_size = ?,
-                    local_sha256 = ?, base_sha256 = ?, base_size = ?, local_status = 'present',
-                    remote_status = 'present', local_generation = local_generation + 1,
-                    phase = 'ready', dirty_generation = dirty_generation + 1, updated_at = ? WHERE item_id = ?;
-                """)
-                update.bindInt64(version.device, at: 1)
-                update.bindInt64(version.inode, at: 2)
-                update.bindInt64(version.mtime, at: 3)
-                update.bindInt64(version.size, at: 4)
-                update.bindText(digest.sha256Hex, at: 5)
-                update.bindText(conflict.remoteSHA256, at: 6)
-                update.bindInt64(conflict.remoteSize, at: 7)
-                update.bindDouble(Date().timeIntervalSince1970, at: 8)
-                update.bindInt64(record.itemID, at: 9)
-                _ = try update.step()
-                update.reset()
-                let remove = try conn.cachedStatement("DELETE FROM sync_conflicts WHERE conflict_id = ?;")
-                remove.bindText(conflict.id, at: 1)
-                _ = try remove.step()
-                remove.reset()
-            }
-            if let storedURL { try? FileManager.default.removeItem(at: storedURL) }
+            // and remote state intact so the caller can still select the remote version.
+            throw DriveError.unsafeOverwrite(fileId: conflict.remoteFileId)
         }
     }
 }

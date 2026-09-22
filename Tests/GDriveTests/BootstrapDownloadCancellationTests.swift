@@ -95,7 +95,7 @@ struct BootstrapDownloadCancellationTests {
         let snapshot = engine.monitor.getSnapshot()
         #expect(snapshot.activeDownloads.isEmpty)
         #expect(snapshot.queuedDownloads.isEmpty)
-        try await RootSyncCoordinator.shared.acquire(localRootPath: local.path)
-        await RootSyncCoordinator.shared.release(localRootPath: local.path)
+        let token = try await RootSyncCoordinator.shared.acquire(localRootPath: local.path)
+        await RootSyncCoordinator.shared.release(token)
     }
 }

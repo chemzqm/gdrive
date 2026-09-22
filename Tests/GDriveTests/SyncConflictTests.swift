@@ -23,6 +23,7 @@ private struct ConflictServerState: Sendable {
     var sessionSizes: [String: Int] = [:]
     var removed: Set<String> = []
     var emitChanges = true
+    var metadataPatches = 0
 }
 private struct ConflictProtocolState: Sendable {
     let state = OSAllocatedUnfairLock(initialState: ConflictServerState())
@@ -54,6 +55,7 @@ private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
                 with: request.extractBodyData ?? Data()) as? [String: Bool])?["trashed"] else {
             return nil
         }
+        state.metadataPatches += 1
         let id = url.lastPathComponent
         guard var file = state.files[id] else {
             return Response(status: 404, data: Data(), headers: [:])
@@ -522,7 +524,9 @@ struct SyncConflictTests {
         let conflictPath = try #require(conflict.conflictPath)
         let uploadsBeforeResolution = context.value.state.withLock { $0.uploads }
 
-        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
+        await #expect(throws: DriveError.unsafeOverwrite(fileId: testFixture.remoteID)) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
+        }
 
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
         #expect(FileManager.default.fileExists(atPath: conflictPath))
@@ -620,8 +624,8 @@ struct SyncConflictTests {
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
     }
 
-    @Test("Selecting a local modification restores a remotely trashed file")
-    func chooseLocalModificationAfterRemoteDeletion() async throws {
+    @Test("Selecting a local modification keeps a remotely trashed conflict actionable")
+    func chooseLocalModificationAfterRemoteDeletionKeepsConflict() async throws {
         let testFixture = try await fixture()
         defer { try? FileManager.default.removeItem(at: testFixture.directory) }
         context.value.state.withLock { $0.files[testFixture.remoteID]!.trashed = true }
@@ -629,10 +633,21 @@ struct SyncConflictTests {
         let conflict = try #require(stats.conflicts.first)
         #expect(conflict.remoteStatus == .trashed)
         #expect(conflict.conflictPath == nil)
-        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
-        #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == false)
+        let patches = context.value.state.withLock { $0.metadataPatches }
+
+        await #expect(throws: DriveError.unsafeOverwrite(fileId: testFixture.remoteID)) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
+        }
+
+        #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == true)
+        #expect(context.value.state.withLock { $0.metadataPatches } == patches)
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+
+        let retry = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        #expect(retry.filesUploaded == 0)
+        #expect(retry.filesFailed == 0)
+        #expect(retry.conflicts == [conflict])
     }
 
 }

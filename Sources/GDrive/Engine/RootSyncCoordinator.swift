@@ -4,17 +4,22 @@ import Foundation
 actor RootSyncCoordinator {
     static let shared = RootSyncCoordinator()
 
+    struct Token: Sendable {
+        fileprivate let key: String
+    }
+
     private var runningRoots: Set<String> = []
 
-    func acquire(localRootPath: String) throws {
+    func acquire(localRootPath: String) throws -> Token {
         let key = Self.normalizedPath(localRootPath)
         guard runningRoots.insert(key).inserted else {
             throw SyncEngineError.rootBusy(path: key)
         }
+        return Token(key: key)
     }
 
-    func release(localRootPath: String) {
-        runningRoots.remove(Self.normalizedPath(localRootPath))
+    func release(_ token: Token) {
+        runningRoots.remove(token.key)
     }
 
     nonisolated static func normalizedPath(_ path: String) -> String {

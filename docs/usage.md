@@ -92,8 +92,11 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 ```swift
 let conflicts = try await engine.listConflicts(localPath: localPath)
 for conflict in conflicts {
-    // 保留本地版本；后续增量同步会尝试把它同步到远端。
-    try await engine.resolveConflict(id: conflict.id, resolution: .local)
+    do {
+        try await engine.resolveConflict(id: conflict.id, resolution: .local)
+    } catch DriveError.unsafeOverwrite {
+        // 已有远端正文受安全覆盖保护；冲突保持可操作，可改选远端版本。
+    }
 
     // 或者选择已下载并校验的远端版本：
     // try await engine.resolveConflict(id: conflict.id, resolution: .remote)

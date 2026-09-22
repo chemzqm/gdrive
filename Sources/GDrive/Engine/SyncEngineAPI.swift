@@ -290,14 +290,15 @@ public final class SyncEngine: Sendable {
     ) async throws -> T {
         try await verifyDatabaseConnection()
         let resolvedLocalPath = Self.normalizedPath(localPath)
-        try await RootSyncCoordinator.shared.acquire(localRootPath: resolvedLocalPath)
+        let token = try await RootSyncCoordinator.shared.acquire(
+            localRootPath: resolvedLocalPath)
         let result: Result<T, any Error>
         do {
             result = .success(try await operation())
         } catch {
             result = .failure(error)
         }
-        await RootSyncCoordinator.shared.release(localRootPath: resolvedLocalPath)
+        await RootSyncCoordinator.shared.release(token)
         return try result.get()
     }
 
