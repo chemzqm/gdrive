@@ -112,9 +112,12 @@ struct RetrySemanticsTests {
         let session = makeSession()
         let (auth, directory) = try makeAuth(session: session)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let credentialURL = directory.appendingPathComponent("auth.json")
+        let originalAttributes = try FileManager.default.attributesOfItem(
+            atPath: credentialURL.path)
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o644],
-            ofItemAtPath: directory.appendingPathComponent("auth.json").path)
+            ofItemAtPath: credentialURL.path)
         let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
         var request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
         request.setValue("Bearer stale-token", forHTTPHeaderField: "Authorization")
@@ -126,9 +129,17 @@ struct RetrySemanticsTests {
         #expect(result.authorizationHeaders == ["Bearer stale-token", "Bearer fresh-token"])
         #expect(await auth.authData().accessToken == "fresh-token")
         let permissions = try FileManager.default.attributesOfItem(
-            atPath: directory.appendingPathComponent("auth.json").path
+            atPath: credentialURL.path
         )[.posixPermissions] as? NSNumber
         #expect(permissions?.intValue == 0o600)
+        let updatedAttributes = try FileManager.default.attributesOfItem(
+            atPath: credentialURL.path)
+        #expect(originalAttributes[.systemFileNumber] as? NSNumber
+            != updatedAttributes[.systemFileNumber] as? NSNumber)
+        let temporaryFiles = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.lastPathComponent.hasPrefix(".auth.json.") }
+        #expect(temporaryFiles.isEmpty)
     }
 
     @Test("Cancellation during retry backoff stops before another request")

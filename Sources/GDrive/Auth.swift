@@ -213,9 +213,38 @@ public actor Auth {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         let raw = try encoder.encode(data)
-        try raw.write(to: fileURL, options: .atomic)
-        try FileManager.default.setAttributes(
-            [.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        let temporaryURL = fileURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp")
+        let descriptor = Darwin.open(
+            temporaryURL.path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+            S_IRUSR | S_IWUSR)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+
+        let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        var shouldRemoveTemporaryFile = true
+        defer {
+            if shouldRemoveTemporaryFile {
+                try? FileManager.default.removeItem(at: temporaryURL)
+            }
+        }
+        do {
+            guard fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            try handle.write(contentsOf: raw)
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+
+        guard Darwin.rename(temporaryURL.path, fileURL.path) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        shouldRemoveTemporaryFile = false
     }
 
     // MARK: - Helpers
