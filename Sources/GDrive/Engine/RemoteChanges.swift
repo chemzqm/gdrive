@@ -418,7 +418,7 @@ struct RemoteChanges: Sendable {
             } catch {
                 let destination: URL?
                 switch item.operation {
-                case .move(_, let url, _, _), .createDirectory(let url): destination = url
+                case .move(_, let url, _, _, _), .createDirectory(let url): destination = url
                 case nil: destination = nil
                 }
                 let fallbackPath = item.result.entry.change.file?.name
@@ -544,6 +544,7 @@ struct RemoteChanges: Sendable {
             return .ready(.move(
                 source: source,
                 destination: destination,
+                kind: existing.isDirectory ? .directory : .file,
                 device: existing.device,
                 inode: existing.inode))
         }

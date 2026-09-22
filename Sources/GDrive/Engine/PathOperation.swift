@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct RemotePathReceiptExpectation: Sendable {
@@ -11,8 +12,21 @@ enum RemotePathReceiptPayload: Sendable {
     case directory(device: Int64, inode: Int64)
 }
 
+enum LocalPathEntryKind: Sendable, Equatable {
+    case file
+    case directory
+}
+
 enum LocalPathOperation: Sendable, Equatable {
-    case move(source: URL, destination: URL, device: Int64?, inode: Int64?)
+    private struct Identity {
+        let device: Int64
+        let inode: Int64
+        let kind: LocalPathEntryKind?
+    }
+
+    case move(
+        source: URL, destination: URL, kind: LocalPathEntryKind,
+        device: Int64?, inode: Int64?)
     case createDirectory(URL)
 
     private static func samePath(_ lhs: URL, _ rhs: URL) -> Bool {
@@ -21,10 +35,11 @@ enum LocalPathOperation: Sendable, Equatable {
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
-        case let (.move(lhsSource, lhsDestination, lhsDevice, lhsInode),
-                  .move(rhsSource, rhsDestination, rhsDevice, rhsInode)):
+        case let (.move(lhsSource, lhsDestination, lhsKind, lhsDevice, lhsInode),
+                  .move(rhsSource, rhsDestination, rhsKind, rhsDevice, rhsInode)):
             return samePath(lhsSource, rhsSource)
                 && samePath(lhsDestination, rhsDestination)
+                && lhsKind == rhsKind
                 && lhsDevice == rhsDevice
                 && lhsInode == rhsInode
         case let (.createDirectory(lhsURL), .createDirectory(rhsURL)):
@@ -36,26 +51,45 @@ enum LocalPathOperation: Sendable, Equatable {
 
     func execute() throws -> Bool {
         switch self {
-        case .move(let source, let destination, let device, let inode):
-            if FileManager.default.fileExists(atPath: source.path) {
+        case .move(let source, let destination, let kind, let device, let inode):
+            guard let device, let inode else { return false }
+            if let sourceIdentity = try Self.identity(at: source) {
+                guard sourceIdentity.kind == kind,
+                      sourceIdentity.device == device,
+                      sourceIdentity.inode == inode else { return false }
                 try FileManager.default.createDirectory(
                     at: destination.deletingLastPathComponent(),
                     withIntermediateDirectories: true)
                 try FileManager.default.moveItem(at: source, to: destination)
-            } else if FileManager.default.fileExists(atPath: destination.path) {
+            } else if let destinationIdentity = try Self.identity(at: destination) {
                 // A previous process may have moved it before its receipt committed.
-                let attrs = try FileManager.default.attributesOfItem(atPath: destination.path)
-                guard (attrs[.systemNumber] as? NSNumber)?.int64Value == device,
-                      (attrs[.systemFileNumber] as? NSNumber)?.int64Value == inode else {
-                    return false
-                }
-            }
+                return destinationIdentity.kind == kind
+                    && destinationIdentity.device == device
+                    && destinationIdentity.inode == inode
+            } else { return false }
             return true
         case .createDirectory(let destination):
             try FileManager.default.createDirectory(
                 at: destination, withIntermediateDirectories: true)
             return true
         }
+    }
+
+    private static func identity(
+        at url: URL
+    ) throws -> Identity? {
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        let kind: LocalPathEntryKind? = switch value.st_mode & S_IFMT {
+        case S_IFREG: .file
+        case S_IFDIR: .directory
+        default: nil
+        }
+        return Identity(
+            device: Int64(value.st_dev), inode: Int64(value.st_ino), kind: kind)
     }
 }
 

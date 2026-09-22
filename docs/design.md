@@ -165,7 +165,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 | `SyncEngine+BootstrapDownload.swift` | 初始化下载：远端递归列举、暂存发布和基线建立 |
 | `NewFileUpload.swift` | 初始化与增量共用的新文件上传：准备持久 intent、执行 multipart/resumable、按预期代次提交回执 |
 | `FileDownload.swift` | 初始化与增量共用的文件下载：校验暂存、目标版本保护发布、按模式提交回执 |
-| `PathOperation.swift` | 文件与目录共用的路径操作：远端重命名/移动及条件回执，本地安全移动/建目录及中断恢复识别 |
+| `PathOperation.swift` | 文件与目录共用的路径操作：远端重命名/移动及条件回执；本地移动在 rename 前以 no-follow 方式校验源类型和 device/inode，中断重放只接受同身份目标 |
 | `TaskLifecycle.swift` | 无结构任务的活跃句柄、取消与排空边界；完成后立即释放句柄，供初始化任务 registry 复用 |
 | `SyncIssueStore.swift` | 条目级失败分类、SQLite 持久化、分页查询和增量轮次开始时的清理 |
 | `SyncEngine+ResumableUpload.swift` | 分块上传、会话恢复、确认偏移和完成状态持久化 |
