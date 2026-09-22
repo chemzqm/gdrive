@@ -1243,8 +1243,13 @@ public final class DriveClient: Sendable {
 /// Optional smooth pacing with a conservative 1.01s rolling window.
 /// Shared by ordinary requests, streaming requests, and retries for one client.
 actor RequestRateGate {
+    private struct Reservation {
+        let id: UUID
+        let start: TimeInterval
+    }
+
     private let requestsPerSecond: Int?
-    private var starts: [TimeInterval] = []
+    private var reservations: [Reservation] = []
 
     init(requestsPerSecond: Int? = 65) {
         precondition(requestsPerSecond == nil || requestsPerSecond! > 0,
@@ -1253,20 +1258,25 @@ actor RequestRateGate {
     }
 
     func wait() async throws {
-        while true {
-            try Task.checkCancellation()
-            guard let limit = requestsPerSecond else { return }
-            let now = ProcessInfo.processInfo.systemUptime
-            starts.removeAll { $0 <= now - 1.01 }
-            let windowReady = starts.count < limit ? now : starts[starts.count - limit] + 1.01
-            let pacedReady = starts.last.map { $0 + 1.0 / Double(limit) } ?? now
-            let ready = max(pacedReady, windowReady)
-            if now >= ready {
-                starts.append(now)
-                return
+        try Task.checkCancellation()
+        guard let limit = requestsPerSecond else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        reservations.removeAll { $0.start <= now - 1.01 }
+        let windowReady = reservations.count < limit
+            ? now : reservations[reservations.count - limit].start + 1.01
+        let pacedReady = reservations.last.map { $0.start + 1.0 / Double(limit) } ?? now
+        let ready = max(pacedReady, windowReady)
+        let reservation = Reservation(id: UUID(), start: ready)
+        reservations.append(reservation)
+        do {
+            let delay = ready - now
+            if delay > 0 {
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
-            let delay = max(0.0001, ready - now)
-            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try Task.checkCancellation()
+        } catch {
+            reservations.removeAll { $0.id == reservation.id }
+            throw error
         }
     }
 }
