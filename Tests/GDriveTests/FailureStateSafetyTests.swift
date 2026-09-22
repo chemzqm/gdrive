@@ -576,8 +576,8 @@ struct FailureStateSafetyTests {
             }
             if request.httpMethod == "PATCH" && path.contains("/files/\(fileRemoteId)") {
                 if control.shouldFail {
-                    let errJson = Data(#"{"error": {"code": 403, "message": "Cannot trash file"}}"#.utf8)
-                    return (HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
+                    let errJson = Data(#"{"error": {"code": 409, "message": "Trash conflict"}}"#.utf8)
+                    return (HTTPURLResponse(url: url, statusCode: 409, httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, errJson)
                 } else {
                     let json = Data("""
                     {"id": "\(fileRemoteId)", "trashed": true}

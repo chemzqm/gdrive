@@ -76,6 +76,32 @@ struct RetrySemanticsTests {
         }
     }
 
+    @Test("Special HTTP statuses require explicit caller acceptance", arguments: [308, 409])
+    func specialStatusRequiresExplicitAcceptance(status: Int) async throws {
+        let body = Data("status \(status)".utf8)
+        context.value.handler.withLock { handler in
+            handler = { request in
+                (HTTPURLResponse(
+                    url: request.url!, statusCode: status, httpVersion: nil,
+                    headerFields: nil)!, body)
+            }
+        }
+        defer { context.value.handler.withLock { $0 = nil } }
+        let session = makeSession()
+        let (auth, directory) = try makeAuth(session: session)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let client = DriveClient(auth: auth, session: session, requestsPerSecond: nil)
+        let request = URLRequest(url: URL(string: "https://www.googleapis.com/drive/v3/files")!)
+
+        await #expect(throws: DriveError.serverError(
+            statusCode: status, message: "status \(status)")) {
+            try await client.executeRequest(request, maxRetries: 0)
+        }
+        let (_, accepted) = try await client.executeRequest(
+            request, maxRetries: 0, acceptableStatusCodes: [status])
+        #expect(accepted.statusCode == status)
+    }
+
     @Test("401 forces one refresh and retries with the new token")
     func unauthorizedForcesRefresh() async throws {
         defer { context.value.requestHandler = nil }

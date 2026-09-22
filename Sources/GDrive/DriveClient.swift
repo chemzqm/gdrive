@@ -506,7 +506,7 @@ public final class DriveClient: Sendable {
                 continue
             }
 
-            if http.statusCode == 409 || http.statusCode == 308 || acceptableStatusCodes.contains(http.statusCode) {
+            if acceptableStatusCodes.contains(http.statusCode) {
                 return (data, http)
             }
 
@@ -705,7 +705,7 @@ public final class DriveClient: Sendable {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 409])
 
         // 409 Conflict: Pre-Built ID Retry or concurrency has been created, verify validation object
         if http.statusCode == 409 {
@@ -771,7 +771,7 @@ public final class DriveClient: Sendable {
 
         req.httpBody = body
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201])
+        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 409])
 
         // 409 Conflict check
         if http.statusCode == 409 {
