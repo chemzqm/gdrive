@@ -93,6 +93,11 @@ public actor DedicatedWriter {
         let continuation: CheckedContinuation<Void, Error>
     }
 
+    private enum PendingWriteOutcome {
+        case success
+        case failure(Error)
+    }
+
     private var pendingQueue: [PendingWriteTask] = []
     private var timerTask: Task<Void, Never>?
     private var stats = WriterStats()
@@ -171,27 +176,38 @@ public actor DedicatedWriter {
         let currentBatch = pendingQueue
         pendingQueue.removeAll(keepingCapacity: true)
 
+        var outcomes: [PendingWriteOutcome] = []
         do {
             try connection.transaction {
+                outcomes.reserveCapacity(currentBatch.count)
                 for task in currentBatch {
-                    try task.block(connection)
+                    try connection.execute("SAVEPOINT batch_write;")
+                    do {
+                        try task.block(connection)
+                        try connection.execute("RELEASE batch_write;")
+                        outcomes.append(.success)
+                    } catch {
+                        try connection.execute("ROLLBACK TO batch_write;")
+                        try connection.execute("RELEASE batch_write;")
+                        outcomes.append(.failure(error))
+                    }
                 }
             }
-            recordCommit(reason: reason, itemCount: currentBatch.count)
-            for task in currentBatch {
-                task.continuation.resume()
+            let committedCount = outcomes.reduce(into: 0) { count, outcome in
+                if case .success = outcome { count += 1 }
+            }
+            recordCommit(reason: reason, itemCount: committedCount)
+            for (task, outcome) in zip(currentBatch, outcomes) {
+                switch outcome {
+                case .success:
+                    task.continuation.resume()
+                case .failure(let error):
+                    task.continuation.resume(throwing: error)
+                }
             }
         } catch {
             for task in currentBatch {
-                do {
-                    try connection.transaction {
-                        try task.block(connection)
-                    }
-                    recordCommit(reason: reason, itemCount: 1)
-                    task.continuation.resume()
-                } catch {
-                    task.continuation.resume(throwing: error)
-                }
+                task.continuation.resume(throwing: error)
             }
         }
     }

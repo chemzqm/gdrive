@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Testing
 @testable import GDrive
 
@@ -278,6 +279,7 @@ struct StateStoreTests {
 
         let store = try await StateStore(
             path: tempDB, maxReaders: 1, batchCapacity: 3, batchTimeoutMs: 1_000)
+        let executionCounts = OSAllocatedUnfairLock(initialState: [String: Int]())
         try await store.write { conn in
             try conn.execute("CREATE TABLE isolated_writes (value TEXT PRIMARY KEY);")
             try conn.execute("INSERT INTO isolated_writes(value) VALUES ('duplicate');")
@@ -290,6 +292,7 @@ struct StateStoreTests {
                 group.addTask {
                     do {
                         try await store.batchWrite { conn in
+                            executionCounts.withLock { $0[value, default: 0] += 1 }
                             let statement = try conn.prepare(
                                 "INSERT INTO isolated_writes(value) VALUES (?);")
                             statement.bindText(value, at: 1)
@@ -309,6 +312,9 @@ struct StateStoreTests {
         #expect(outcomes["valid-a"] == true)
         #expect(outcomes["duplicate"] == false)
         #expect(outcomes["valid-b"] == true)
+        #expect(executionCounts.withLock { $0 } == [
+            "valid-a": 1, "duplicate": 1, "valid-b": 1
+        ])
         let storedValues = try await store.read { conn -> [String] in
             let statement = try conn.prepare(
                 "SELECT value FROM isolated_writes ORDER BY value;")
