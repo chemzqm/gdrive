@@ -795,8 +795,10 @@ public final class DriveClient: Sendable {
         if let actualSize = driveFile.sizeBytes, actualSize != Int64(content.count) {
             throw DriveError.sizeMismatch(expected: Int64(content.count), actual: actualSize)
         }
-        if let actualChecksum = driveFile.sha256Checksum,
-           actualChecksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
+        guard let actualChecksum = driveFile.sha256Checksum else {
+            throw DriveError.checksumMismatch(expected: expectedSha256, actual: nil)
+        }
+        if actualChecksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
             throw DriveError.checksumMismatch(expected: expectedSha256, actual: actualChecksum)
         }
 

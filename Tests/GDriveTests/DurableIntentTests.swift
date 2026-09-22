@@ -151,6 +151,41 @@ struct DurableIntentTests {
         }
     }
 
+    @Test("A successful multipart response requires a SHA-256 checksum")
+    func multipartSuccessRequiresChecksum() async throws {
+        defer { context.value.requestHandler = nil }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gdrive-multipart-checksum-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = try makeAuth(in: directory)
+        let configuration = URLSessionConfiguration.ephemeral
+        context.configure(configuration)
+        configuration.protocolClasses = [DurableIntentURLProtocol.self]
+        let client = DriveClient(
+            auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
+        let content = Data("content".utf8)
+        let sha = SHA256.hash(data: content).map { String(format: "%02x", $0) }.joined()
+
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let metadata: [String: Any] = [
+                "id": "reserved-id",
+                "name": "file.txt",
+                "size": String(content.count)
+            ]
+            return (HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!,
+                try JSONSerialization.data(withJSONObject: metadata))
+        }
+
+        await #expect(throws: DriveError.checksumMismatch(expected: sha, actual: nil)) {
+            _ = try await client.uploadMultipart(
+                name: "file.txt", parentId: "parent", remoteId: "reserved-id",
+                content: content, expectedSha256: sha)
+        }
+    }
+
     @Test("Marking an unknown outcome propagates its SQLite write failure")
     func markUnknownOutcomePropagatesWriteFailure() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("gdrive-unknown-outcome-write-\(UUID().uuidString)")
