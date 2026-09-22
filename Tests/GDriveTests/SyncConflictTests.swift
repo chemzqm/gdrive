@@ -235,6 +235,17 @@ struct SyncConflictTests {
         }
     }
 
+    private func conflictRevision(_ store: StateStore, id: String) async throws -> Int64 {
+        try await store.read { conn in
+            let query = try conn.prepare(
+                "SELECT revision FROM sync_conflicts WHERE conflict_id = ?;")
+            defer { query.reset() }
+            query.bindText(id, at: 1)
+            _ = try #require(try query.step())
+            return try #require(query.columnInt64(at: 0))
+        }
+    }
+
     private struct ItemTopology: Sendable {
         let name: String?
         let parentName: String?
@@ -373,6 +384,48 @@ struct SyncConflictTests {
         try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
 
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Conflict resolution rejects a revision change during its receipt")
+    func conflictResolutionRejectsStaleRevision() async throws {
+        let remote = Data(repeating: 0x56, count: 8 * 1024 * 1024 + 1)
+        let testFixture = try await fixture(remoteContent: remote)
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let originalRevision = try await conflictRevision(testFixture.store, id: conflict.id)
+        try await testFixture.store.write { conn in
+            try conn.execute("""
+            CREATE TRIGGER advance_conflict_revision AFTER UPDATE ON items
+            WHEN OLD.phase = 'blocked'
+            BEGIN
+                UPDATE sync_conflicts SET revision = revision + 1 WHERE item_id = NEW.item_id;
+            END;
+            """)
+        }
+
+        await #expect(throws: (any Error).self) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        }
+        #expect(try await conflictRevision(testFixture.store, id: conflict.id) == originalRevision)
+        let phase = try await testFixture.store.read { conn in
+            let query = try conn.prepare(
+                "SELECT phase FROM items WHERE remote_file_id = ?;")
+            defer { query.reset() }
+            query.bindText(testFixture.remoteID, at: 1)
+            _ = try #require(try query.step())
+            return query.columnText(at: 0)
+        }
+        #expect(phase == "blocked")
+        try await testFixture.store.write {
+            try $0.execute("DROP TRIGGER advance_conflict_revision;")
+        }
+
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try Data(contentsOf: testFixture.original) == remote)
+        #expect(try await testFixture.engine.listConflicts(
+            localPath: testFixture.local.path).isEmpty)
     }
 
     @Test("A recreated engine repairs a large conflict receipt after publication")
@@ -559,6 +612,7 @@ struct SyncConflictTests {
         let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         let conflict = try #require(first.conflicts.first)
         let conflictPath = try #require(conflict.conflictPath)
+        let initialRevision = try await conflictRevision(testFixture.store, id: conflict.id)
 
         try FileManager.default.removeItem(at: testFixture.original)
         let remoteCount = context.value.state.withLock { $0.files.count }
@@ -571,6 +625,8 @@ struct SyncConflictTests {
         let refreshed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(refreshed.conflicts.first?.remoteSHA256 == SyncEngine.computeSha256(of: newer))
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == newer)
+        let refreshedRevision = try await conflictRevision(testFixture.store, id: conflict.id)
+        #expect(refreshedRevision > initialRevision)
 
         context.value.state.withLock {
             $0.files.removeValue(forKey: testFixture.remoteID)
@@ -579,6 +635,7 @@ struct SyncConflictTests {
         let removed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(removed.conflicts.first?.remoteStatus == .removed)
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == newer)
+        #expect(try await conflictRevision(testFixture.store, id: conflict.id) > refreshedRevision)
     }
 
     @Test("Selecting a local deletion trashes the remote conflict file")

@@ -215,6 +215,7 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
     remote_size INTEGER NOT NULL CHECK(remote_size >= 0),
     remote_version INTEGER,
     remote_status TEXT NOT NULL CHECK(remote_status IN ('present', 'trashed', 'removed')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(root_id, remote_file_id)

@@ -5,6 +5,10 @@ enum SyncConflictStore {
         let conflict: SyncConflict
         let rootID: Int64
         let itemID: Int64
+        let revision: Int64
+        let localGeneration: Int64
+        let remoteGeneration: Int64
+        let dirtyGeneration: Int64
     }
 
     static func directory(base: URL, remoteRootID: String) throws -> URL {
@@ -56,9 +60,11 @@ enum SyncConflictStore {
     static func record(store: StateStore, id: String) async throws -> Record? {
         try await store.read { conn in
             let query = try conn.cachedStatement("""
-            SELECT conflict_id, remote_file_id, relative_path, local_path, conflict_path,
-                remote_sha256, remote_size, remote_version, remote_status, root_id, item_id
-            FROM sync_conflicts WHERE conflict_id = ?;
+            SELECT c.conflict_id, c.remote_file_id, c.relative_path, c.local_path, c.conflict_path,
+                c.remote_sha256, c.remote_size, c.remote_version, c.remote_status, c.root_id,
+                c.item_id, c.revision, i.local_generation, i.remote_generation, i.dirty_generation
+            FROM sync_conflicts c JOIN items i ON i.item_id = c.item_id
+            WHERE c.conflict_id = ? AND i.phase = 'blocked';
             """)
             defer { query.reset() }
             query.bindText(id, at: 1)
@@ -67,12 +73,18 @@ enum SyncConflictStore {
                   let sha = query.columnText(at: 5),
                   let size = query.columnInt64(at: 6), let statusText = query.columnText(at: 8),
                   let status = SyncConflict.RemoteStatus(rawValue: statusText),
-                  let rootID = query.columnInt64(at: 9), let itemID = query.columnInt64(at: 10) else { return nil }
+                  let rootID = query.columnInt64(at: 9), let itemID = query.columnInt64(at: 10),
+                  let revision = query.columnInt64(at: 11),
+                  let localGeneration = query.columnInt64(at: 12),
+                  let remoteGeneration = query.columnInt64(at: 13),
+                  let dirtyGeneration = query.columnInt64(at: 14) else { return nil }
             return Record(conflict: SyncConflict(
                 id: id, remoteFileId: remoteID, relativePath: relative, localPath: local,
                 conflictPath: query.columnText(at: 4), remoteSHA256: sha, remoteSize: size,
                 remoteVersion: query.columnInt64(at: 7), remoteStatus: status),
-                rootID: rootID, itemID: itemID)
+                rootID: rootID, itemID: itemID, revision: revision,
+                localGeneration: localGeneration, remoteGeneration: remoteGeneration,
+                dirtyGeneration: dirtyGeneration)
         }
     }
 
@@ -143,7 +155,8 @@ enum SyncConflictStore {
                 relative_path = excluded.relative_path, local_path = excluded.local_path,
                 conflict_path = excluded.conflict_path, remote_sha256 = excluded.remote_sha256,
                 remote_size = excluded.remote_size, remote_version = excluded.remote_version,
-                remote_status = 'present', updated_at = excluded.updated_at;
+                remote_status = 'present', revision = sync_conflicts.revision + 1,
+                updated_at = excluded.updated_at;
             """)
             conflict.bindText(conflictID, at: 1)
             conflict.bindInt64(rootID, at: 2)
@@ -188,7 +201,8 @@ enum SyncConflictStore {
                 relative_path = excluded.relative_path, local_path = excluded.local_path,
                 conflict_path = excluded.conflict_path, remote_sha256 = excluded.remote_sha256,
                 remote_size = excluded.remote_size, remote_version = excluded.remote_version,
-                remote_status = excluded.remote_status, updated_at = excluded.updated_at;
+                remote_status = excluded.remote_status, revision = sync_conflicts.revision + 1,
+                updated_at = excluded.updated_at;
             """)
             insert.bindText(conflictID, at: 1)
             insert.bindInt64(rootID, at: 2)
@@ -286,7 +300,8 @@ extension SyncEngine {
                     let itemStatus = status == "trashed" ? "trashed" : "absent"
                     try await store.batchWrite { conn in
                         let update = try conn.cachedStatement("""
-                        UPDATE sync_conflicts SET remote_status = ?, updated_at = ?
+                        UPDATE sync_conflicts SET remote_status = ?, revision = revision + 1,
+                            updated_at = ?
                         WHERE conflict_id = ?;
                         """)
                         update.bindText(status, at: 1)
@@ -341,7 +356,8 @@ extension SyncEngine {
                     let now = Date().timeIntervalSince1970
                     let update = try conn.cachedStatement("""
                     UPDATE sync_conflicts SET remote_sha256 = ?, remote_size = ?,
-                        remote_version = ?, remote_status = 'present', conflict_path = ?, updated_at = ?
+                        remote_version = ?, remote_status = 'present', conflict_path = ?,
+                        revision = revision + 1, updated_at = ?
                     WHERE conflict_id = ?;
                     """)
                     update.bindText(sha, at: 1)
@@ -399,20 +415,24 @@ extension SyncEngine {
     }
 
     public func resolveConflict(id: String, resolution: SyncConflictResolution) async throws {
-        guard let initial = try await SyncConflictStore.record(store: store, id: id) else {
-            throw SyncEngineError.general("Sync conflict was not found: \(id)")
-        }
         let localRoot = try await store.read { conn -> String in
-            let query = try conn.cachedStatement("SELECT local_root_path FROM roots WHERE root_id = ? AND is_active = 1;")
+            let query = try conn.cachedStatement("""
+                SELECT r.local_root_path
+                FROM sync_conflicts c JOIN roots r ON r.root_id = c.root_id
+                WHERE c.conflict_id = ? AND r.is_active = 1;
+                """)
             defer { query.reset() }
-            query.bindInt64(initial.rootID, at: 1)
+            query.bindText(id, at: 1)
             guard try query.step(), let path = query.columnText(at: 0) else {
-                throw SyncEngineError.general("Sync conflict root is unavailable: \(id)")
+                throw SyncEngineError.general("Sync conflict was not found: \(id)")
             }
             return path
         }
         try await withRootSyncLock(localPath: localRoot) {
-            try await self.resolveInitialConflict(initial, resolution: resolution)
+            guard let current = try await SyncConflictStore.record(store: self.store, id: id) else {
+                throw SyncEngineError.general("Sync conflict was not found: \(id)")
+            }
+            try await self.resolveInitialConflict(current, resolution: resolution)
         }
     }
 
@@ -420,10 +440,30 @@ extension SyncEngine {
         _ record: SyncConflictStore.Record, storedURL: URL?
     ) async throws {
         try await store.batchWrite { conn in
-            let item = try conn.cachedStatement("DELETE FROM items WHERE item_id = ?;")
+            let conflict = try conn.cachedStatement(
+                "DELETE FROM sync_conflicts WHERE conflict_id = ? AND revision = ?;")
+            conflict.bindText(record.conflict.id, at: 1)
+            conflict.bindInt64(record.revision, at: 2)
+            _ = try conflict.step()
+            conflict.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The sync conflict changed while it was being resolved: \(record.conflict.id)")
+            }
+            let item = try conn.cachedStatement("""
+                DELETE FROM items WHERE item_id = ? AND phase = 'blocked'
+                    AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                """)
             item.bindInt64(record.itemID, at: 1)
+            item.bindInt64(record.localGeneration, at: 2)
+            item.bindInt64(record.remoteGeneration, at: 3)
+            item.bindInt64(record.dirtyGeneration, at: 4)
             _ = try item.step()
             item.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The sync conflict item changed while it was being resolved: \(record.conflict.id)")
+            }
         }
         if let storedURL { try? FileManager.default.removeItem(at: storedURL) }
     }
@@ -505,7 +545,11 @@ extension SyncEngine {
             UPDATE items SET local_device = ?, local_inode = ?, local_mtime = ?, local_ctime = ?,
                 local_size = ?,
                 local_sha256 = ?, base_sha256 = ?, base_size = ?, local_status = 'present',
-                phase = ?, dirty_generation = ?, updated_at = ? WHERE item_id = ?;
+                phase = ?, dirty_generation = ?, updated_at = ?
+            WHERE item_id = ? AND phase = 'blocked'
+                AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?
+                AND EXISTS (SELECT 1 FROM sync_conflicts
+                    WHERE conflict_id = ? AND revision = ?);
             """)
             update.bindInt64(published.device, at: 1)
             update.bindInt64(published.inode, at: 2)
@@ -519,13 +563,27 @@ extension SyncEngine {
             update.bindInt64(remotePresent ? 0 : 1, at: 10)
             update.bindDouble(Date().timeIntervalSince1970, at: 11)
             update.bindInt64(record.itemID, at: 12)
+            update.bindInt64(record.localGeneration, at: 13)
+            update.bindInt64(record.remoteGeneration, at: 14)
+            update.bindInt64(record.dirtyGeneration, at: 15)
+            update.bindText(conflict.id, at: 16)
+            update.bindInt64(record.revision, at: 17)
             _ = try update.step()
             update.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The sync conflict changed while it was being resolved: \(conflict.id)")
+            }
             let remove = try conn.cachedStatement(
-                "DELETE FROM sync_conflicts WHERE conflict_id = ?;")
+                "DELETE FROM sync_conflicts WHERE conflict_id = ? AND revision = ?;")
             remove.bindText(conflict.id, at: 1)
+            remove.bindInt64(record.revision, at: 2)
             _ = try remove.step()
             remove.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The sync conflict changed while it was being resolved: \(conflict.id)")
+            }
         }
     }
 
