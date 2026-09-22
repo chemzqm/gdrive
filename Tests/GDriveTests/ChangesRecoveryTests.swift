@@ -989,9 +989,9 @@ struct ChangesRecoveryTests {
     }
 
     @Test(
-        "File and directory replacements preserve the baseline",
+        "File and directory replacements converge in one incremental sync",
         arguments: [false, true])
-    func typeReplacementPreservesBaseline(
+    func typeReplacementConverges(
         replacementIsDirectory: Bool
     ) async throws {
         let testFixture = try await fixture()
@@ -1010,25 +1010,39 @@ struct ChangesRecoveryTests {
                 $0.files[remoteID] = folder(remoteID, "root", name: name)
             }
         }
+        let baselineSHA256 = SyncEngine.computeSha256(of: Data("remote content".utf8))
         try await testFixture.store.write { conn in
-            try conn.execute("""
+            let stmt = try conn.prepare(
+                """
                 INSERT INTO items(
                     root_id,parent_id,name,entry_kind,remote_file_id,
+                    local_sha256,local_size,base_sha256,base_size,remote_sha256,remote_size,
                     local_status,remote_status,phase,dirty_generation,created_at,updated_at)
-                VALUES (
-                    \(testFixture.rootID),\(testFixture.rootItemID),'\(name)','\(originalKind)','\(remoteID)',
-                    'present','present','committed',0,1,1);
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,'present','present','committed',0,1,1);
                 """)
-        }
-        let requestsBefore = context.value.state.withLock { $0.requests.count }
-        await #expect(throws: (any Error).self) {
-            try await testFixture.engine.syncIncrementalUnlocked(
-                rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
-                localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
-                onProgress: nil)
+            stmt.bindInt64(testFixture.rootID, at: 1)
+            stmt.bindInt64(testFixture.rootItemID, at: 2)
+            stmt.bindText(name, at: 3)
+            stmt.bindText(originalKind, at: 4)
+            stmt.bindText(remoteID, at: 5)
+            if originalKind == "file" {
+                stmt.bindText(baselineSHA256, at: 6)
+                stmt.bindInt64(14, at: 7)
+                stmt.bindText(baselineSHA256, at: 8)
+                stmt.bindInt64(14, at: 9)
+                stmt.bindText(baselineSHA256, at: 10)
+                stmt.bindInt64(14, at: 11)
+            }
+            _ = try stmt.step()
         }
 
-        let baseline = try await testFixture.store.read { conn -> StoredBaseline in
+        let stats = try await testFixture.engine.syncIncrementalUnlocked(
+            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+            onProgress: nil)
+        #expect(stats.filesFailed == 0)
+
+        let stored = try await testFixture.store.read { conn -> StoredBaseline in
             let stmt = try conn.prepare(
                 "SELECT entry_kind, remote_file_id, dirty_generation FROM items WHERE root_id = \(testFixture.rootID) AND parent_id = \(testFixture.rootItemID) AND name = '\(name)';")
             defer { stmt.reset() }
@@ -1037,13 +1051,88 @@ struct ChangesRecoveryTests {
                 kind: stmt.columnText(at: 0), remoteID: stmt.columnText(at: 1),
                 dirtyGeneration: stmt.columnInt64(at: 2))
         }
-        #expect(baseline.kind == originalKind)
-        #expect(baseline.remoteID == remoteID)
-        #expect(baseline.dirtyGeneration == 0)
-        let newRequests = context.value.state.withLock {
-            Array($0.requests.dropFirst(requestsBefore))
+        #expect(stored.kind == (replacementIsDirectory ? "directory" : "file"))
+        #expect(stored.remoteID != remoteID)
+        #expect(stored.dirtyGeneration == 0)
+        let remoteState = context.value.state.withLock { state in
+            (state.files[remoteID]?.trashed, state.files.values.filter {
+                $0.id != remoteID && $0.name == name && $0.trashed != true
+            })
         }
-        #expect(!newRequests.contains { $0.hasPrefix("POST ") || $0.hasPrefix("PUT ") || $0.hasPrefix("PATCH ") })
+        #expect(remoteState.0 == true)
+        #expect(remoteState.1.count == 1)
+        #expect((remoteState.1.first?.mimeType == "application/vnd.google-apps.folder")
+            == replacementIsDirectory)
+        if replacementIsDirectory {
+            let replacementID = try #require(remoteState.1.first?.id)
+            #expect(context.value.state.withLock { state in
+                state.files.values.contains {
+                    $0.name == "child.txt" && $0.parents?.first == replacementID
+                        && $0.trashed != true
+                }
+            })
+        }
+    }
+
+    @Test("A conflicting type replacement records that another sync is required")
+    func conflictingTypeReplacementRecordsRetry() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let name = "replaced-conflict"
+        let local = testFixture.local.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        let baselineBytes = Data("baseline".utf8)
+        let remoteID = "remote-replaced-conflict"
+        _ = remoteFile(remoteID, parent: "root", content: "changed remotely", name: name)
+        let baselineSHA256 = SyncEngine.computeSha256(of: baselineBytes)
+        try await testFixture.store.write { conn in
+            let stmt = try conn.prepare(
+                """
+                INSERT INTO items(
+                    root_id,parent_id,name,entry_kind,remote_file_id,
+                    local_sha256,local_size,base_sha256,base_size,remote_sha256,remote_size,
+                    local_status,remote_status,phase,dirty_generation,created_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,'present','present','committed',0,1,1);
+                """)
+            stmt.bindInt64(testFixture.rootID, at: 1)
+            stmt.bindInt64(testFixture.rootItemID, at: 2)
+            stmt.bindText(name, at: 3)
+            stmt.bindText("file", at: 4)
+            stmt.bindText(remoteID, at: 5)
+            stmt.bindText(baselineSHA256, at: 6)
+            stmt.bindInt64(Int64(baselineBytes.count), at: 7)
+            stmt.bindText(baselineSHA256, at: 8)
+            stmt.bindInt64(Int64(baselineBytes.count), at: 9)
+            let remoteBytes = Data("changed remotely".utf8)
+            stmt.bindText(SyncEngine.computeSha256(of: remoteBytes), at: 10)
+            stmt.bindInt64(Int64(remoteBytes.count), at: 11)
+            _ = try stmt.step()
+        }
+
+        let stats = try await testFixture.engine.syncIncrementalUnlocked(
+            rootId: testFixture.rootID, rootItemId: testFixture.rootItemID,
+            localPath: testFixture.local.path, remoteRootId: "root", maxConcurrency: 1,
+            onProgress: nil)
+
+        #expect(stats.issueCount > 0)
+        let page = try await testFixture.engine.listSyncIssues(localPath: testFixture.local.path)
+        let issue = try #require(page.issues.first {
+            $0.relativePath == name && $0.stage == .localScan
+        })
+        #expect(issue.category == .staleState)
+        #expect(issue.suggestedAction == .retry)
+        #expect(issue.message.contains("run synchronization again"))
+        #expect(context.value.state.withLock { $0.files[remoteID]?.trashed } != true)
+        let storedKind = try await testFixture.store.read { conn -> String? in
+            let stmt = try conn.prepare(
+                "SELECT entry_kind FROM items WHERE root_id = ? AND parent_id = ? AND name = ?;")
+            defer { stmt.reset() }
+            stmt.bindInt64(testFixture.rootID, at: 1)
+            stmt.bindInt64(testFixture.rootItemID, at: 2)
+            stmt.bindText(name, at: 3)
+            return try stmt.step() ? stmt.columnText(at: 0) : nil
+        }
+        #expect(storedKind == "file")
     }
 
     @Test(

@@ -63,6 +63,24 @@ final class DirectoryContext: @unchecked Sendable {
         readyDirectories.insert(itemID)
     }
 
+    func removeSubtree(itemID: Int64) {
+        os_unfair_lock_lock(&lock)
+        defer { os_unfair_lock_unlock(&lock) }
+        guard let path = dirPaths[itemID] else { return }
+        let removed = dirPaths.compactMap { id, candidate in
+            candidate == path || candidate.hasPrefix(path + "/") ? id : nil
+        }
+        for id in removed {
+            if let oldPath = dirPaths.removeValue(forKey: id) {
+                dirIdByRelPath.removeValue(forKey: oldPath)
+            }
+            if let remoteID = dirRemoteIds.removeValue(forKey: id) {
+                dirIdByRemote.removeValue(forKey: remoteID)
+            }
+            readyDirectories.remove(id)
+        }
+    }
+
     func getRelPath(for itemId: Int64) -> String? {
         os_unfair_lock_lock(&lock)
         defer { os_unfair_lock_unlock(&lock) }
@@ -250,6 +268,7 @@ extension IncrementalSyncRun {
                     try await engine.cleanupRemoteDeletionToLocalUnlocked(
                         itemID: item.itemId, expected: expected, taskRegistry: itemTaskRegistry)
                 }
+                directoryContext.removeSubtree(itemID: item.itemId)
                 actionTracker.counts.withLock { $0.deleted += 1 }
             } catch {
                 await recordIssue(error, stage: .delete, subject: issueSubject(for: item))

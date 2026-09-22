@@ -1,7 +1,7 @@
 // swift-tools-version: 6.0
 import PackageDescription
 
-let excludesBenchmarkExecutables = Context.environment["GDRIVE_TESTING"] == "1"
+let isTesting = Context.environment["GDRIVE_TESTING"] == "1"
 
 var products: [Product] = [
     .library(name: "GDrive", targets: ["GDrive"]),
@@ -36,7 +36,7 @@ var targets: [Target] = [
     )
 ]
 
-if !excludesBenchmarkExecutables {
+if !isTesting {
     products += [
         .executable(name: "gdrive-bench", targets: ["GDriveBench"]),
         .executable(name: "gdrive-upload", targets: ["GDriveUploadBench"])
@@ -68,15 +68,19 @@ if !excludesBenchmarkExecutables {
     ]
 }
 
-targets += [
-    .executableTarget(
+// `make test` enables this helper; regular builds do not need it.
+if isTesting {
+    targets.append(.executableTarget(
         name: "GDriveKillProcessTestHelper",
         dependencies: ["GDrive"],
         path: "Tests/GDriveKillProcessTestHelper",
         swiftSettings: [
             .swiftLanguageMode(.v6)
         ]
-    ),
+    ))
+}
+
+targets += [
     .testTarget(
         name: "GDriveTests",
         dependencies: [

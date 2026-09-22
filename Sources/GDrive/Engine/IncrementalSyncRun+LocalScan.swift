@@ -119,15 +119,15 @@ extension IncrementalSyncRun {
 
     func scanLocal() async throws {
         let baselineCache = try await LocalBaselineCache.load(store: engine.store, rootId: rootID)
-        let baselineFilePaths = try await engine.store.read { conn -> Set<String> in
+        let baselineFilePaths = try await engine.store.read { conn -> [String: Int64] in
             let stmt = try conn.cachedStatement(
-                "SELECT parent_id, name FROM items WHERE root_id = ? AND entry_kind = 'file' AND parent_id IS NOT NULL;")
+                "SELECT item_id, parent_id, name FROM items WHERE root_id = ? AND entry_kind = 'file' AND parent_id IS NOT NULL;")
             stmt.bindInt64(self.rootID, at: 1)
             defer { stmt.reset() }
-            var paths = Set<String>()
-            while try stmt.step(), let parentID = stmt.columnInt64(at: 0),
-                  let name = stmt.columnText(at: 1) {
-                paths.insert("\(parentID):\(name)")
+            var paths: [String: Int64] = [:]
+            while try stmt.step(), let itemID = stmt.columnInt64(at: 0),
+                  let parentID = stmt.columnInt64(at: 1), let name = stmt.columnText(at: 2) {
+                paths["\(parentID):\(name)"] = itemID
             }
             return paths
         }
@@ -307,14 +307,54 @@ extension IncrementalSyncRun {
         let failedDirectorySubtrees = self.failedDirectorySubtrees
         let scanProgress = self.scanProgress
 
+        @Sendable func retireReplacedItem(
+            itemID: Int64, entryKind: String, relativePath: String
+        ) async throws -> Bool {
+            try await engine.store.write { conn in
+                let stmt = try conn.cachedStatement(
+                    """
+                    UPDATE items SET
+                        local_status = 'absent', local_generation = local_generation + 1,
+                        dirty_generation = dirty_generation + 1, phase = 'ready', updated_at = ?
+                    WHERE item_id = ? AND entry_kind = ? AND local_status <> 'absent';
+                    """)
+                stmt.bindDouble(now, at: 1)
+                stmt.bindInt64(itemID, at: 2)
+                stmt.bindText(entryKind, at: 3)
+                _ = try stmt.step()
+                stmt.reset()
+            }
+            guard let item = (try await self.loadDirtyItems([itemID])).first else { return true }
+            if entryKind == "file" {
+                try await self.scheduleFiles([item], duringScan: false)
+                await self.drainTransfers()
+                try self.actionTracker.throwIfDatabaseFailure()
+            } else {
+                try await self.reconcileDirectories([item])
+            }
+            let removed = try await engine.store.read { conn in
+                let stmt = try conn.cachedStatement("SELECT 1 FROM items WHERE item_id = ?;")
+                stmt.bindInt64(itemID, at: 1)
+                defer { stmt.reset() }
+                return try !stmt.step()
+            }
+            if !removed {
+                await self.recordIssue(
+                    LocalTypeReplacementDeferredError(
+                        description: "Local type replacement is waiting for the existing item to be resolved; run synchronization again afterward: \(relativePath)"),
+                    stage: .localScan,
+                    subject: SyncIssueSubject(
+                        itemID: item.itemId, remoteFileID: item.remoteFileId,
+                        relativePath: relativePath))
+            }
+            return removed
+        }
+
         @Sendable func directoryParentID(
             relPath: String, parentRelPath: String, name: String
         ) throws -> Int64 {
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
-            }
-            if baselineFilePaths.contains("\(parentItemID):\(name)") {
-                throw SyncEngineError.general("Local directory replaces an existing file at \(relPath); preserving the baseline")
             }
             return parentItemID
         }
@@ -325,10 +365,28 @@ extension IncrementalSyncRun {
             guard let parentItemID = directoryContext.getItemId(byRelPath: parentRelPath) else {
                 throw SyncEngineError.general("Missing local directory parent while observing \(relPath)")
             }
-            if directoryContext.getItemId(byRelPath: relPath) != nil {
-                throw SyncEngineError.general("Local file replaces an existing directory at \(relPath); preserving the baseline")
-            }
             return parentItemID
+        }
+
+        @Sendable func fileMatchesBaseline(
+            renamedOrMoved: Bool, device: Int64, inode: Int64,
+            mtime: Int64, size: Int64, parentItemID: Int64, name: String
+        ) -> Bool {
+            if renamedOrMoved {
+                return baselineCache.lookupUnchanged(
+                    device: device, inode: inode, mtime: mtime, size: size) != nil
+            }
+            return baselineCache.lookupUnchanged(
+                device: device, inode: inode, mtime: mtime, size: size,
+                parentId: parentItemID, name: name) != nil
+        }
+
+        @Sendable func remotePathIsBlocked(for existing: ExistingLocalItem?) -> Bool {
+            guard let existing else { return false }
+            let parentPath = directoryContext.getRelPath(for: existing.parentId) ?? ""
+            let oldPath = parentPath.isEmpty
+                ? existing.name : "\(parentPath)/\(existing.name)"
+            return remoteGate.blocks(oldPath)
         }
 
         @Sendable func remoteParentID(parentItemID: Int64, relPath: String) throws -> String {
@@ -540,6 +598,21 @@ extension IncrementalSyncRun {
                 relPath: relPath, parentRelPath: parentRelNormalized, name: name)
             let dev = record.dev
             let ino = record.ino
+            if let replacedItemID = baselineFilePaths["\(parentItemId):\(name)"],
+               !seenTracker.contains(parentId: parentItemId, name: name) {
+                guard try await retireReplacedItem(
+                    itemID: replacedItemID, entryKind: "file", relativePath: relPath) else { return }
+                let current = try LocalDirectoryIdentity.read(
+                    at: URL(fileURLWithPath: record.fullPath))
+                guard current == LocalDirectoryIdentity(device: dev, inode: ino) else {
+                    await self.recordIssue(
+                        SyncEngineError.localFileModified(path: record.fullPath),
+                        stage: .localScan,
+                        subject: SyncIssueSubject(
+                            itemID: nil, remoteFileID: nil, relativePath: relPath))
+                    return
+                }
+            }
 
             // Check whether the local directory has been renamed or moved (press dev + ino Find)
             let existingDir = try await findExistingDirectory(dev: dev, ino: ino)
@@ -573,6 +646,11 @@ extension IncrementalSyncRun {
             let relativePath = parentRelNormalized.isEmpty ? name : "\(parentRelNormalized)/\(name)"
             let parentItemId = try fileParentID(
                 relPath: relativePath, parentRelPath: parentRelNormalized, name: name)
+            if let replacedItemID = directoryContext.getItemId(byRelPath: relativePath) {
+                guard try await retireReplacedItem(
+                    itemID: replacedItemID, entryKind: "directory",
+                    relativePath: relativePath) else { return }
+            }
             let dev = record.dev
             let ino = record.ino
             let mtime = record.mtime
@@ -593,14 +671,7 @@ extension IncrementalSyncRun {
             let existingFile = try await existingFile(
                 device: dev, inode: ino, parentItemID: parentItemId, name: name)
 
-            if let existing = existingFile {
-                let parentPath =
-                    directoryContext.getRelPath(for: existing.parentId) ?? ""
-                let oldPath =
-                    parentPath.isEmpty
-                    ? existing.name : "\(parentPath)/\(existing.name)"
-                if remoteGate.blocks(oldPath) { return }
-            }
+            if remotePathIsBlocked(for: existingFile) { return }
             var renamedOrMoved = false
             if let existing = existingFile,
                 existing.name != name || existing.parentId != parentItemId {
@@ -646,13 +717,10 @@ extension IncrementalSyncRun {
             seenTracker.markSeen(parentId: parentItemId, name: name)
 
             // Quick change comparison (§6.2)
-            let unchanged = renamedOrMoved
-                ? baselineCache.lookupUnchanged(
-                    device: dev, inode: ino, mtime: mtime, size: fileSize)
-                : baselineCache.lookupUnchanged(
-                    device: dev, inode: ino, mtime: mtime, size: fileSize,
-                    parentId: parentItemId, name: name)
-            if unchanged != nil {
+            if fileMatchesBaseline(
+                renamedOrMoved: renamedOrMoved, device: dev, inode: ino,
+                mtime: mtime, size: fileSize, parentItemID: parentItemId, name: name
+            ) {
                 scanProgress.incSkipped()
                 return
             }

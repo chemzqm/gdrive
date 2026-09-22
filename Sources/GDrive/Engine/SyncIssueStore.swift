@@ -57,6 +57,10 @@ struct RemoteNameConflictIssueError: Error, CustomStringConvertible, Sendable {
     let description: String
 }
 
+struct LocalTypeReplacementDeferredError: Error, CustomStringConvertible, Sendable {
+    let description: String
+}
+
 enum SyncIssueStore {
     private struct Classification {
         let category: SyncIssue.Category
@@ -192,6 +196,10 @@ enum SyncIssueStore {
         if error is RemoteNameConflictIssueError {
             return Classification(category: .remoteConflict,
                 action: .renameRemote, retryDelay: nil)
+        }
+        if error is LocalTypeReplacementDeferredError {
+            return Classification(category: .staleState,
+                action: .retry, retryDelay: nil)
         }
         if error is LocalFilePublicationRecoveryError {
             return Classification(category: .localIO,

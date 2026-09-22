@@ -30,6 +30,7 @@ private struct PendingItemCleanup: Sendable {
 private struct CleanupLocalIdentity: Sendable, Equatable {
     let device: Int64
     let inode: Int64
+    let entryKind: String
 
     static func read(at url: URL) throws -> CleanupLocalIdentity? {
         var value = stat()
@@ -37,7 +38,14 @@ private struct CleanupLocalIdentity: Sendable, Equatable {
             if errno == ENOENT { return nil }
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
-        return CleanupLocalIdentity(device: Int64(value.st_dev), inode: Int64(value.st_ino))
+        let kind: String
+        switch value.st_mode & S_IFMT {
+        case S_IFREG: kind = "file"
+        case S_IFDIR: kind = "directory"
+        default: kind = "other"
+        }
+        return CleanupLocalIdentity(
+            device: Int64(value.st_dev), inode: Int64(value.st_ino), entryKind: kind)
     }
 }
 
@@ -406,11 +414,13 @@ extension SyncEngine {
     ) throws -> Bool {
         let current = try CleanupLocalIdentity.read(at: plan.localURL)
         if operationType == "trashRemote" {
-            return current == nil
+            guard let current else { return true }
+            return (plan.entryKind == "file" && current.entryKind == "directory")
+                || (plan.entryKind == "directory" && current.entryKind == "file")
         }
         guard let current else { return true }
         guard let device = payload.localDevice, let inode = payload.localInode else { return false }
-        return current == CleanupLocalIdentity(device: device, inode: inode)
+        return current.device == device && current.inode == inode
     }
 
     private func discardCleanupIntent(operationID: String) async throws {
