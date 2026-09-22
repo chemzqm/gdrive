@@ -363,9 +363,18 @@ extension SyncEngine {
                     _ = try item.step()
                     item.reset()
                     let remove = try conn.cachedStatement(
-                        "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;")
+                        """
+                        DELETE FROM remote_change_inbox
+                        WHERE root_id = ? AND remote_id = ? AND EXISTS (
+                            SELECT 1 FROM items WHERE item_id = ?
+                                AND remote_name IS ? AND remote_parent_file_id IS ?
+                        );
+                        """)
                     remove.bindInt64(rootID, at: 1)
                     remove.bindText(file.id, at: 2)
+                    remove.bindInt64(entry.itemID, at: 3)
+                    remove.bindText(file.name, at: 4)
+                    remove.bindText(file.parents?.first, at: 5)
                     _ = try remove.step()
                     remove.reset()
                 }

@@ -5,11 +5,12 @@ import os
 
 private struct ConflictRemoteFile: Sendable {
     let id: String
-    let name: String
+    var name: String
+    var parentID = "root"
     var content: Data
     var trashed = false
     var json: [String: Any] {
-        ["id": id, "name": name, "parents": ["root"], "size": String(content.count),
+        ["id": id, "name": name, "parents": [parentID], "size": String(content.count),
          "sha256Checksum": SyncEngine.computeSha256(of: content), "version": "2", "trashed": trashed]
     }
 }
@@ -21,6 +22,7 @@ private struct ConflictServerState: Sendable {
     var sessions: [String: ConflictRemoteFile] = [:]
     var sessionSizes: [String: Int] = [:]
     var removed: Set<String> = []
+    var emitChanges = true
 }
 private struct ConflictProtocolState: Sendable {
     let state = OSAllocatedUnfairLock(initialState: ConflictServerState())
@@ -106,8 +108,12 @@ private final class ConflictProtocol: URLProtocol, @unchecked Sendable {
         if url.path.hasSuffix("/changes/startPageToken") {
             json = ["startPageToken": "start"]
         } else if url.path.hasSuffix("/changes") {
-            let present = state.files.values.map { ["fileId": $0.id, "file": $0.json] as [String: Any] }
-            let removed = state.removed.map { ["fileId": $0, "removed": true] as [String: Any] }
+            let present = state.emitChanges
+                ? state.files.values.map { ["fileId": $0.id, "file": $0.json] as [String: Any] }
+                : []
+            let removed = state.emitChanges
+                ? state.removed.map { ["fileId": $0, "removed": true] as [String: Any] }
+                : []
             json = ["changes": present + removed, "newStartPageToken": "next"]
         } else if url.path.hasSuffix("/generateIds") {
             json = ["ids": (0..<1000).map { "generated-\($0)" }]
@@ -215,6 +221,69 @@ struct SyncConflictTests {
             conflictDirectory: fixture.directory.appendingPathComponent("conflicts"),
             incrementalScan: SyncEngine.defaultDirectoryScan)
     }
+
+    private func pendingChangeCount(_ store: StateStore, remoteID: String) async throws -> Int64 {
+        try await store.read { conn in
+            let query = try conn.prepare(
+                "SELECT count(*) FROM remote_change_inbox WHERE remote_id = ?;")
+            defer { query.reset() }
+            query.bindText(remoteID, at: 1)
+            _ = try query.step()
+            return query.columnInt64(at: 0) ?? 0
+        }
+    }
+
+    private struct ItemTopology: Sendable {
+        let name: String?
+        let parentName: String?
+        let remoteName: String?
+        let remoteParentID: String?
+    }
+
+    private func itemTopology(_ store: StateStore, remoteID: String) async throws -> ItemTopology {
+        try await store.read { conn in
+            let query = try conn.prepare("""
+            SELECT i.name, p.name, i.remote_name, i.remote_parent_file_id
+            FROM items i LEFT JOIN items p ON p.item_id = i.parent_id
+            WHERE i.remote_file_id = ?;
+            """)
+            defer { query.reset() }
+            query.bindText(remoteID, at: 1)
+            _ = try query.step()
+            return ItemTopology(
+                name: query.columnText(at: 0), parentName: query.columnText(at: 1),
+                remoteName: query.columnText(at: 2), remoteParentID: query.columnText(at: 3))
+        }
+    }
+
+    private func addMappedRemoteDirectory(
+        to fixture: Fixture, name: String, remoteID: String
+    ) async throws {
+        let url = fixture.local.appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        guard let identity = try LocalDirectoryIdentity.read(at: url) else {
+            throw SyncEngineError.general("Unable to read test directory identity")
+        }
+        try await fixture.store.write { conn in
+            let insert = try conn.prepare("""
+            INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                local_device, local_inode, remote_parent_file_id, remote_name,
+                local_status, remote_status, phase, created_at, updated_at)
+            SELECT root_id, item_id, ?, 'directory', ?, ?, ?, remote_file_id, ?,
+                'present', 'present', 'committed', 0, 0
+            FROM items WHERE root_id = (SELECT root_id FROM roots WHERE remote_root_id = 'root')
+                AND parent_id IS NULL;
+            """)
+            defer { insert.reset() }
+            insert.bindText(name, at: 1)
+            insert.bindText(remoteID, at: 2)
+            insert.bindInt64(identity.device, at: 3)
+            insert.bindInt64(identity.inode, at: 4)
+            insert.bindText(name, at: 5)
+            _ = try insert.step()
+        }
+    }
+
     @Test("Incremental conflict is durable until the caller selects the remote version")
     func convergence() async throws {
         let testFixture = try await fixture()
@@ -331,6 +400,66 @@ struct SyncConflictTests {
 
         #expect(try Data(contentsOf: testFixture.original) == remote)
         #expect(try await recreated.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("A one-shot remote rename is replayed after resolving a conflict")
+    func remoteRenameDuringConflictIsReplayed() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(first.conflicts.first)
+        context.value.state.withLock { $0.files[testFixture.remoteID]!.name = "renamed.txt" }
+
+        let refreshed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(refreshed.remoteWorkPending > 0)
+        #expect(try await pendingChangeCount(testFixture.store, remoteID: testFixture.remoteID) == 1)
+        context.value.state.withLock { $0.emitChanges = false }
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        let recreated = try await recreatedEngine(for: testFixture)
+
+        let replayed = try await recreated.syncIncremental(localPath: testFixture.local.path)
+
+        let renamed = testFixture.local.appendingPathComponent("renamed.txt")
+        #expect(!FileManager.default.fileExists(atPath: testFixture.original.path))
+        #expect(try Data(contentsOf: renamed) == Data("remote edited content".utf8))
+        #expect(replayed.remoteWorkPending == 0)
+        #expect(try await pendingChangeCount(testFixture.store, remoteID: testFixture.remoteID) == 0)
+        let topology = try await itemTopology(testFixture.store, remoteID: testFixture.remoteID)
+        #expect(topology.name == "renamed.txt")
+        #expect(topology.remoteName == "renamed.txt")
+        #expect(topology.remoteParentID == "root")
+    }
+
+    @Test("A one-shot remote move is replayed after resolving a conflict")
+    func remoteMoveDuringConflictIsReplayed() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(first.conflicts.first)
+        try await addMappedRemoteDirectory(to: testFixture, name: "folder", remoteID: "remote-folder")
+        context.value.state.withLock {
+            $0.files[testFixture.remoteID]!.parentID = "remote-folder"
+        }
+
+        let refreshed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        #expect(refreshed.remoteWorkPending > 0)
+        #expect(try await pendingChangeCount(testFixture.store, remoteID: testFixture.remoteID) == 1)
+        context.value.state.withLock { $0.emitChanges = false }
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        let replayed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+
+        let moved = testFixture.local.appendingPathComponent("folder/file.txt")
+        #expect(!FileManager.default.fileExists(atPath: testFixture.original.path))
+        #expect(try Data(contentsOf: moved) == Data("remote edited content".utf8))
+        #expect(replayed.remoteWorkPending == 0)
+        #expect(try await pendingChangeCount(testFixture.store, remoteID: testFixture.remoteID) == 0)
+        let topology = try await itemTopology(testFixture.store, remoteID: testFixture.remoteID)
+        #expect(topology.name == "file.txt")
+        #expect(topology.parentName == "folder")
+        #expect(topology.remoteParentID == "remote-folder")
     }
 
     @Test("A local edit during a download becomes a queryable conflict")
