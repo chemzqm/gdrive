@@ -679,6 +679,42 @@ struct ChangesRecoveryTests {
         #expect(FileManager.default.fileExists(atPath: testFixture.local.appendingPathComponent("renamed/child").path))
     }
 
+    @Test("A failed remote rename records a local path issue")
+    func failedRemoteRenameRecordsIssue() async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let original = remoteFile("renamed-file", parent: "root", name: "original.txt")
+        context.value.state.withLock {
+            $0.pages["start"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "steady",
+                changes: [DriveChange(fileId: original.id, removed: false, file: original)])
+        }
+        try await converge(testFixture)
+        let occupied = testFixture.local.appendingPathComponent("occupied.txt")
+        try Data("untracked local file".utf8).write(to: occupied)
+
+        let renamed = DriveFile(
+            id: original.id, name: occupied.lastPathComponent, parents: ["root"],
+            size: original.size, sha256Checksum: original.sha256Checksum, version: "2")
+        context.value.state.withLock {
+            $0.files[renamed.id] = renamed
+            $0.pages["steady"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "done",
+                changes: [DriveChange(fileId: renamed.id, removed: false, file: renamed)])
+        }
+
+        try await testFixture.changes.consume()
+
+        let page = try await testFixture.engine.listSyncIssues(localPath: testFixture.local.path)
+        let issue = try #require(page.issues.first { $0.remoteFileId == renamed.id })
+        #expect(issue.relativePath == occupied.lastPathComponent)
+        #expect(issue.stage == .pathUpdate)
+        #expect(issue.category == .localIO)
+        #expect(issue.suggestedAction == .inspectLocalFile)
+        #expect(try await testFixture.changes.pendingCount() > 0)
+        #expect(try String(contentsOf: occupied, encoding: .utf8) == "untracked local file")
+    }
+
     @Test("Rebuilding a lost cursor re-probes old queued payloads")
     func staleQueuedObservation() async throws {
         let testFixture = try await fixture()

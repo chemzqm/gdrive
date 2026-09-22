@@ -359,7 +359,7 @@ struct RemoteChanges: Sendable {
         // Persist the observation boundary before touching the local filesystem.
         try await retainResolvedBatch(batch, started: started)
         let prepared = try await prepareResolvedBatch(batch)
-        let completed = executeLocalPathOperations(prepared)
+        let completed = try await executeLocalPathOperations(prepared)
         try await commitResolvedBatch(completed)
     }
 
@@ -406,7 +406,9 @@ struct RemoteChanges: Sendable {
         }
     }
 
-    private func executeLocalPathOperations(_ prepared: [PreparedResult]) -> [PreparedResult] {
+    private func executeLocalPathOperations(
+        _ prepared: [PreparedResult]
+    ) async throws -> [PreparedResult] {
         var executed: [PreparedResult] = []
         executed.reserveCapacity(prepared.count)
         for item in prepared {
@@ -414,7 +416,26 @@ struct RemoteChanges: Sendable {
                 guard try item.operation?.execute() != false else { continue }
                 executed.append(item)
             } catch {
-                // The durable inbox keeps the observation available for a later retry.
+                let destination: URL?
+                switch item.operation {
+                case .move(_, let url, _, _), .createDirectory(let url): destination = url
+                case nil: destination = nil
+                }
+                let fallbackPath = item.result.entry.change.file?.name
+                    ?? item.result.entry.change.fileId
+                let rootPath = rootURL.standardizedFileURL.path
+                let relativePath = destination.map {
+                    let path = $0.standardizedFileURL.path
+                    let prefix = rootPath + "/"
+                    return path.hasPrefix(prefix)
+                        ? String(path.dropFirst(prefix.count)) : fallbackPath
+                } ?? fallbackPath
+                try await SyncIssueStore.record(
+                    store: store, rootID: rootID,
+                    subject: SyncIssueSubject(
+                        itemID: nil, remoteFileID: item.result.entry.change.fileId,
+                        relativePath: relativePath),
+                    stage: .pathUpdate, error: error)
             }
         }
         return executed
