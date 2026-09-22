@@ -616,10 +616,12 @@ extension SyncEngine {
                         let ctime = (metadata?.changeTime.seconds ?? 0) * 1_000_000_000 + Int64(metadata?.changeTime.nanoseconds ?? 0)
                         let fileSize = metadata?.fileSize ?? 0
 
-                        // Rapid change detection (§6.2):dev + inode + mtime + size Matching skips content reading and hash calculations
-                        if baselineCache.lookupUnchanged(
+                        // A shared inode does not prove this path has been uploaded.
+                        // A ready parent supplies the path identity without waiting in the scanner.
+                        if case .ready(let parentTarget) = parent,
+                           baselineCache.lookupUnchanged(
                             device: dev, inode: ino, mtime: mtime, ctime: ctime,
-                            size: fileSize) != nil {
+                            size: fileSize, parentId: parentTarget.itemID, name: name) != nil {
                             progress.recordSkipped()
                             continue
                         }

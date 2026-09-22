@@ -106,8 +106,9 @@ public final class LocalBaselineCache: @unchecked Sendable {
         return detector
     }
 
-    /// Check if the file is completely unchanged
-    /// - Returns: If it does not change to return to the existing CachedItemMetadata,Go back if changed or as a new file nil
+    /// Compare inode metadata after the caller has independently resolved path changes.
+    /// This does not prove that a particular hard-link path has a committed baseline.
+    /// Use the parentId/name overload when deciding whether a path can be skipped.
     public func lookupUnchanged(
         device: Int64, inode: Int64, mtime: Int64, ctime: Int64, size: Int64
     ) -> CachedItemMetadata? {

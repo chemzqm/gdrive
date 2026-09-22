@@ -250,33 +250,8 @@ struct BootstrapResumeSafetyTests {
         #expect(hit?.remoteFileId == "r_synced")
     }
 
-    // MARK: - Test 2: Repeated Initialization Calls Do Not Duplicate Directories or Files
-
-    @Test("Repeated initialization calls do not duplicate directories or files, remote IDs and counts remain stable")
-    func testRepeatedInitializationStable() async throws {
-        defer { context.value.requestHandler = nil }
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_repeat_\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-
-        let localRootDir = tempDir.appendingPathComponent("local_root")
-        let subDir = localRootDir.appendingPathComponent("folderA/subFolder")
-        try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
-
-        let file1 = subDir.appendingPathComponent("test1.txt")
-        let file2 = localRootDir.appendingPathComponent("test2.txt")
-        try "Content of file 1\n".write(to: file1, atomically: true, encoding: .utf8)
-        try "Content of file 2\n".write(to: file2, atomically: true, encoding: .utf8)
-
-        let dbPath = tempDir.appendingPathComponent("state.sqlite").path
-        let store = try await StateStore(path: dbPath)
-
-        let auth = try createMockAuth(tempDir: tempDir)
-        let client = createMockClient(auth: auth)
-
-        let recorder = RequestEventRecorder()
+    private func installBootstrapHandler(recorder: RequestEventRecorder) {
         let idCounter = SafeCounter(100)
-
         @Sendable func handleRequest(_ request: URLRequest) throws -> (HTTPURLResponse, Data) {
             guard let url = request.url else {
                 return (HTTPURLResponse(url: URL(string: "https://invalid")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
@@ -343,6 +318,99 @@ struct BootstrapResumeSafetyTests {
             return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!, Data("{}".utf8))
         }
         context.value.setHandler(handleRequest)
+    }
+
+    @Test("Bootstrap resume uploads each hard-link path", arguments: ["b.txt", "nested/a.txt", "pending/a.txt"])
+    func hardLinkResumeRequiresExactPath(targetPath: String) async throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let localRoot = tempDir.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: localRoot.appendingPathComponent("nested"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let original = localRoot.appendingPathComponent("a.txt")
+        let target = localRoot.appendingPathComponent(targetPath)
+        try FileManager.default.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("Content of file 1\n".utf8).write(to: original)
+        try FileManager.default.linkItem(at: original, to: target)
+
+        let store = try await StateStore(path: tempDir.appendingPathComponent("state.sqlite").path)
+        let auth = try createMockAuth(tempDir: tempDir)
+        let recorder = RequestEventRecorder()
+        installBootstrapHandler(recorder: recorder)
+        let engine = try await SyncEngine(auth: auth, store: store, client: createMockClient(auth: auth))
+        let initial = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "mock_remote_root")
+        #expect(initial.filesUploaded == 2)
+        #expect(initial.filesFailed == 0)
+
+        // Keep only a.txt's committed baseline to model an interrupted bootstrap.
+        // Both links already exist, so ctime stays identical to the saved baseline.
+        let targetName = target.lastPathComponent
+        let targetParent = target.deletingLastPathComponent().lastPathComponent
+        try await store.write { conn in
+            let statement = try conn.cachedStatement("""
+            DELETE FROM items WHERE entry_kind = 'file' AND name = ?
+                AND parent_id IN (SELECT item_id FROM items WHERE entry_kind = 'directory' AND name = ?);
+            """)
+            statement.bindText(targetName, at: 1)
+            statement.bindText(targetParent, at: 2)
+            defer { statement.reset() }
+            _ = try statement.step()
+            if targetParent == "pending" {
+                _ = try conn.execute("DELETE FROM items WHERE entry_kind = 'directory' AND name = 'pending';")
+            }
+            _ = try conn.execute("UPDATE roots SET bootstrap_state = 'freshCreated';")
+        }
+        let resumed = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "mock_remote_root")
+        #expect(resumed.filesUploaded == 1)
+        #expect(resumed.filesSkipped == 1)
+        #expect(resumed.filesFailed == 0)
+        #expect(resumed.directoriesCreated == (targetParent == "pending" ? 1 : 0))
+        #expect(recorder.fileCreateCount == 3)
+        let committedPaths: [String] = try await store.read { conn in
+            let statement = try conn.cachedStatement("""
+            SELECT parent.name || '/' || file.name FROM items file JOIN items parent ON file.parent_id = parent.item_id
+            WHERE file.entry_kind = 'file' AND file.phase = 'committed' AND file.remote_status = 'present'
+                AND file.remote_file_id IS NOT NULL AND file.base_sha256 IS NOT NULL AND file.dirty_generation = 0;
+            """)
+            defer { statement.reset() }
+            var paths: [String] = []
+            while try statement.step() {
+                if let path = statement.columnText(at: 0) { paths.append(path) }
+            }
+            return paths
+        }
+        #expect(Set(committedPaths) == Set(["local/a.txt", "\(targetParent)/\(targetName)"]))
+        let repeated = try await engine.syncLocalToRemoteEmpty(localPath: localRoot.path, remoteRootId: "mock_remote_root")
+        #expect(repeated.filesUploaded == 0)
+        #expect(repeated.filesSkipped == 2)
+        #expect(recorder.fileCreateCount == 3)
+    }
+
+    // MARK: - Test 2: Repeated Initialization Calls Do Not Duplicate Directories or Files
+
+    @Test("Repeated initialization calls do not duplicate directories or files, remote IDs and counts remain stable")
+    func testRepeatedInitializationStable() async throws {
+        defer { context.value.requestHandler = nil }
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("a08_repeat_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let localRootDir = tempDir.appendingPathComponent("local_root")
+        let subDir = localRootDir.appendingPathComponent("folderA/subFolder")
+        try FileManager.default.createDirectory(at: subDir, withIntermediateDirectories: true)
+
+        let file1 = subDir.appendingPathComponent("test1.txt")
+        let file2 = localRootDir.appendingPathComponent("test2.txt")
+        try "Content of file 1\n".write(to: file1, atomically: true, encoding: .utf8)
+        try "Content of file 2\n".write(to: file2, atomically: true, encoding: .utf8)
+
+        let dbPath = tempDir.appendingPathComponent("state.sqlite").path
+        let store = try await StateStore(path: dbPath)
+
+        let auth = try createMockAuth(tempDir: tempDir)
+        let client = createMockClient(auth: auth)
+
+        let recorder = RequestEventRecorder()
+        installBootstrapHandler(recorder: recorder)
 
         let engine = try await SyncEngine(auth: auth, store: store, client: client)
 
