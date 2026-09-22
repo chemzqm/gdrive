@@ -49,6 +49,7 @@ public final class ProgressNotifier: @unchecked Sendable {
 
     private var lastNotifiedCompleted: Int = -1
     private var lastNotifiedDiscovered: Int = -1
+    private var lastNotifiedCompletedBytes: Int64 = -1
     private var tickerTask: Task<Void, Never>?
 
     public init(interval: TimeInterval = 0.5, onProgress: (@Sendable (SyncProgress) -> Void)?) {
@@ -121,12 +122,15 @@ public final class ProgressNotifier: @unchecked Sendable {
         guard !stopped else { return }
         guard let onProgress = self.onProgress else { return }
         os_unfair_lock_lock(&lock)
-        guard totalDiscoveredFiles != lastNotifiedDiscovered || completedFiles != lastNotifiedCompleted else {
+        guard totalDiscoveredFiles != lastNotifiedDiscovered
+            || completedFiles != lastNotifiedCompleted
+            || completedBytes != lastNotifiedCompletedBytes else {
             os_unfair_lock_unlock(&lock)
             return
         }
         lastNotifiedDiscovered = totalDiscoveredFiles
         lastNotifiedCompleted = completedFiles
+        lastNotifiedCompletedBytes = completedBytes
         let progress = SyncProgress(
             completedFiles: completedFiles,
             totalDiscoveredFiles: totalDiscoveredFiles,
@@ -155,6 +159,7 @@ public final class ProgressNotifier: @unchecked Sendable {
         )
         lastNotifiedDiscovered = totalDiscoveredFiles
         lastNotifiedCompleted = completedFiles
+        lastNotifiedCompletedBytes = completedBytes
         os_unfair_lock_unlock(&lock)
 
         onProgress(progress)

@@ -140,4 +140,22 @@ struct ProgressNotifierTests {
         #expect(finalSnapshot.totalDiscoveredBytes == 100 * 1024)
         #expect(finalSnapshot.percentage == 1.0)
     }
+
+    @Test("Byte-only completion changes publish progress")
+    func byteOnlyProgressIsPublished() {
+        let deliveries = OSAllocatedUnfairLock(initialState: [SyncProgress]())
+        let notifier = ProgressNotifier(interval: 1, startsTicker: false) { progress in
+            deliveries.withLock { $0.append(progress) }
+        }
+        notifier.addDiscovered(files: 1, bytes: 100)
+        notifier.notifyIfChanged()
+        notifier.addCompleted(files: 0, bytes: 25)
+        notifier.notifyIfChanged()
+
+        let snapshots = deliveries.withLock { $0 }
+        #expect(snapshots.count == 2)
+        #expect(snapshots.last?.completedFiles == 0)
+        #expect(snapshots.last?.completedBytes == 25)
+        notifier.stop()
+    }
 }
