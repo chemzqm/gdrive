@@ -12,7 +12,7 @@ struct ProgressNotifierTests {
     }
 
     @Test("Ticker releases its owner without finish", .timeLimit(.minutes(1)))
-    func tickerDoesNotRetainNotifier() async {
+    func tickerDoesNotRetainNotifier() async throws {
         let tick = AsyncSemaphore(count: 0)
         let released = AsyncSemaphore(count: 0)
         var notifier: ProgressNotifier? = ProgressNotifier(interval: 0.001) { [lifetime = LifetimeSignal(released)] _ in
@@ -20,13 +20,13 @@ struct ProgressNotifierTests {
             tick.signal()
         }
         notifier?.addDiscovered()
-        await tick.wait()
+        try await tick.wait()
         notifier = nil
-        await released.wait()
+        try await released.wait()
     }
 
     @Test("Finish serializes with an in-flight callback and prevents later delivery", .timeLimit(.minutes(1)))
-    func finishSerializesCallbacks() async {
+    func finishSerializesCallbacks() async throws {
         let entered = AsyncSemaphore(count: 0)
         let release = DispatchSemaphore(value: 0)
         let finishing = AsyncSemaphore(count: 0)
@@ -44,17 +44,17 @@ struct ProgressNotifierTests {
             notifier.notifyIfChanged()
             done.signal()
         }
-        await entered.wait()
+        try await entered.wait()
         notifier.addCompleted()
         DispatchQueue.global().async {
             finishing.signal()
             notifier.finish()
             done.signal()
         }
-        await finishing.wait()
+        try await finishing.wait()
         release.signal()
-        await done.wait()
-        await done.wait()
+        try await done.wait()
+        try await done.wait()
         notifier.addCompleted()
         notifier.notifyIfChanged()
         notifier.finish()

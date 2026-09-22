@@ -9,7 +9,7 @@ struct BootstrapTaskRegistryTests {
         let registry = BootstrapTaskRegistry(root: .init(remoteID: "root", itemID: 1))
         let gate = AsyncSemaphore(count: 0)
         registry.startDirectoryTask(for: "parent") {
-            await gate.wait()
+            try await gate.wait()
             return .init(remoteID: "parent", itemID: 42)
         }
         let dependency = try registry.dependency(for: "parent")

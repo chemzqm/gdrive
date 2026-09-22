@@ -358,7 +358,7 @@ extension SyncEngine {
                 let remoteParentId = parentTarget.remoteID
                 parentItemID = parentTarget.itemID
 
-                await uploadSemaphore.wait()
+                try await uploadSemaphore.wait()
                 didAcquireSemaphore = true
                 try Task.checkCancellation()
                 if let error = databaseError.withLock({ $0 }) { throw error }
@@ -499,7 +499,7 @@ extension SyncEngine {
                 try Task.checkCancellation()
                 let parentTarget = try await parent.value()
                 try Task.checkCancellation()
-                await directorySemaphore.wait()
+                try await directorySemaphore.wait()
                 defer { directorySemaphore.signal() }
                 try Task.checkCancellation()
                 if let error = databaseError.withLock({ $0 }) { throw error }

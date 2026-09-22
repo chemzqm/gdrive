@@ -136,7 +136,7 @@ extension IncrementalSyncRun {
 
     private func acquireTransfer() async throws {
         try Task.checkCancellation()
-        await syncSemaphore.wait()
+        try await syncSemaphore.wait()
         if Task.isCancelled {
             syncSemaphore.signal()
             throw CancellationError()

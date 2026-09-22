@@ -1456,8 +1456,8 @@ struct ChangesRecoveryTests {
             try await testFixture.engine.syncIncremental(
                 localPath: testFixture.local.path, maxConcurrency: 2)
         }
-        await context.value.uploadStarted.wait()
-        await context.value.uploadStarted.wait()
+        try await context.value.uploadStarted.wait()
+        try await context.value.uploadStarted.wait()
         testFixture.engine.monitor.refreshSnapshot()
         let snapshot = testFixture.engine.transferStatus
 

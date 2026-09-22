@@ -15,13 +15,13 @@ struct ItemTaskRegistryTests {
         _ = try await registry.start(itemIDs: [1]) {
             await withTaskCancellationHandler {
                 started.signal()
-                await release.wait()
+                try? await Task.detached { try await release.wait() }.value
                 finished.withLock { $0 = true }
             } onCancel: { cancelled.signal() }
         }
-        await started.wait()
+        try await started.wait()
         let cancellation = Task { await registry.cancelAll() }
-        await cancelled.wait()
+        try await cancelled.wait()
         await #expect(throws: CancellationError.self) {
             _ = try await registry.start(itemIDs: [2]) {}
         }

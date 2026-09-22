@@ -85,8 +85,8 @@ struct BootstrapDownloadCancellationTests {
             try await engine.syncRemoteToLocalEmpty(localPath: local.path,
                 remoteRootId: "root", maxDownloadConcurrency: 1)
         }
-        await context.value.started.wait()
-        await context.value.secondObserved.wait()
+        try await context.value.started.wait()
+        try await context.value.secondObserved.wait()
         sync.cancel()
         await #expect(throws: CancellationError.self) { _ = try await sync.value }
         #expect(context.value.stopped.withLock { $0 })

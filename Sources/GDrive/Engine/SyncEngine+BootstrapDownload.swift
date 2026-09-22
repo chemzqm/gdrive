@@ -219,7 +219,12 @@ extension SyncEngine {
             let downloadBytes = item.sizeBytes ?? 0
             notifier.addDiscovered(files: 1, bytes: downloadBytes)
             self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
-            await downloadSemaphore.wait()
+            do {
+                try await downloadSemaphore.wait()
+            } catch {
+                self.monitor.finishDownload(id: item.id)
+                throw error
+            }
             if Task.isCancelled {
                 self.monitor.finishDownload(id: item.id)
                 downloadSemaphore.signal()
