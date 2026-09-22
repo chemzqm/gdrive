@@ -20,7 +20,7 @@ struct DeletionSafetyTests {
         try Data("modified".utf8).write(to: file, options: .atomic)
         let modifiedWasDeleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
-            expectedMtime: expected.mtime, expectedSize: expected.size, expectedSHA256: sha)
+            expectedSize: expected.size, expectedSHA256: sha)
         #expect(!modifiedWasDeleted)
         #expect(try String(contentsOf: file, encoding: .utf8) == "modified")
     }
@@ -40,7 +40,7 @@ struct DeletionSafetyTests {
         var trashedURL: URL?
         let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
-            expectedMtime: expected.mtime, expectedSize: expected.size, expectedSHA256: sha,
+            expectedSize: expected.size, expectedSHA256: sha,
             trash: { url, _ in trashedURL = url })
 
         #expect(deleted)
@@ -63,10 +63,35 @@ struct DeletionSafetyTests {
         #expect(throws: TrashFailure.self) {
             try LocalDeletionSafety.trashFileIfUnchanged(
                 at: file, expectedDevice: expected.device, expectedInode: expected.inode,
-                expectedMtime: expected.mtime, expectedSize: expected.size,
-                expectedSHA256: sha, trash: { _, _ in throw TrashFailure.denied })
+                expectedSize: expected.size, expectedSHA256: sha,
+                trash: { _, _ in throw TrashFailure.denied })
         }
         #expect(try String(contentsOf: file, encoding: .utf8) == "baseline")
+    }
+
+    @Test("A timestamp-only change does not block local deletion")
+    func localDeletionIgnoresMtimeChange() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-mtime-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        try Data("baseline".utf8).write(to: file)
+        let expected = try #require(try LocalFileVersion.read(at: file))
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSinceNow: 60)], ofItemAtPath: file.path)
+        let changed = try #require(try LocalFileVersion.read(at: file))
+        #expect(changed.mtime != expected.mtime)
+
+        var trashedURL: URL?
+        let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
+            at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+            expectedSize: expected.size, expectedSHA256: sha,
+            trash: { url, _ in trashedURL = url })
+
+        #expect(deleted)
+        #expect(trashedURL == file)
     }
 
     @Test("change.removed == true does NOT trash or delete local file, sets phase to blocked")

@@ -243,7 +243,6 @@ extension SyncEngine {
                             at: plan.localURL,
                             expectedDevice: plan.localDevice,
                             expectedInode: plan.localInode,
-                            expectedMtime: plan.localMtime,
                             expectedSize: plan.localSize,
                             expectedSHA256: plan.localSHA256)
                         guard removed else {
