@@ -121,7 +121,6 @@ extension IncrementalSyncRun {
         onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> IncrementalSyncRun {
         let startTime = DispatchTime.now()
-        let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
         let now = Date().timeIntervalSince1970
@@ -174,6 +173,7 @@ extension IncrementalSyncRun {
         let directoryContext = try await loadDirectoryContext(
             engine: engine, rootID: rootID, rootItemID: rootItemID, remoteRootID: remoteRootID)
         let effectiveSyncConcurrency = max(1, min(64, maxConcurrency))
+        let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
         let run = IncrementalSyncRun(
             engine: engine, rootID: rootID, rootItemID: rootItemID,
             localPath: resolvedLocalPath, rootURL: rootURL, remoteRootID: remoteRootID,
@@ -196,6 +196,7 @@ extension IncrementalSyncRun {
 
     func execute() async throws -> SyncStats {
         defer {
+            notifier.stop()
             downloadCache.clear()
             engine.cleanupDownloadStagingDirectory(downloadDirectory)
         }

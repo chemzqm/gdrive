@@ -41,6 +41,7 @@ extension SyncEngine {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
         let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
+        defer { notifier.stop() }
 
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)
@@ -220,6 +221,7 @@ extension SyncEngine {
             self.monitor.enqueueDownload(id: item.id, name: item.name, totalBytes: downloadBytes)
             await downloadSemaphore.wait()
             if Task.isCancelled {
+                self.monitor.finishDownload(id: item.id)
                 downloadSemaphore.signal()
                 throw CancellationError()
             }
@@ -389,12 +391,11 @@ extension SyncEngine {
 
         // Start recursive enumeration and downloading
         var traversalError: Error?
-        do {
-            try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
-        } catch { traversalError = error }
-
-        // Wait for all admitted downloads. Cancellation reaches every active task.
+        // Cancellation must reach downloads while traversal waits for a transfer slot too.
         await withTaskCancellationHandler {
+            do {
+                try await traverseRemote(parentRemoteId: remoteRootId, currentLocalURL: rootURL, parentItemId: rootItemId)
+            } catch { traversalError = error }
             await downloadTasks.waitForAll()
         } onCancel: {
             downloadTasks.cancelAll()

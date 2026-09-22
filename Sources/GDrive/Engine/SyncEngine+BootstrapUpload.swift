@@ -18,6 +18,7 @@ extension SyncEngine {
         let startTime = DispatchTime.now()
         var stats = SyncStats()
         let notifier = ProgressNotifier(interval: 0.5, onProgress: onProgress)
+        defer { notifier.stop() }
 
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
         let rootURL = URL(fileURLWithPath: resolvedLocalPath)

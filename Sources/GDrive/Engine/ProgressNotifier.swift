@@ -38,6 +38,9 @@ public final class ProgressNotifier: @unchecked Sendable {
     private let onProgress: (@Sendable (SyncProgress) -> Void)?
     private let interval: TimeInterval
     private var lock = os_unfair_lock()
+    // Separate from counters: callbacks may reenter finish/stop or update progress.
+    private let deliveryLock = NSRecursiveLock()
+    private var stopped = false
 
     private var completedFiles: Int = 0
     private var totalDiscoveredFiles: Int = 0
@@ -68,15 +71,27 @@ public final class ProgressNotifier: @unchecked Sendable {
         guard onProgress != nil else { return }
 
         // Launch Exclusive Independent Background Sampling Ticker,External callbacks and scans/Network pipeline is completely physically isolated
+        let nanoseconds = UInt64(interval * 1_000_000_000)
         self.tickerTask = Task { [weak self] in
-            guard let self = self else { return }
-            let nanoseconds = UInt64(interval * 1_000_000_000)
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: nanoseconds)
-                guard !Task.isCancelled else { break }
+                do { try await Task.sleep(nanoseconds: nanoseconds) } catch { break }
+                guard let self else { break }
                 self.notifyIfChanged()
             }
         }
+    }
+
+    deinit {
+        tickerTask?.cancel()
+    }
+
+    /// Stop without publishing a success/final snapshot on an error path.
+    func stop() {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        stopped = true
+        tickerTask?.cancel()
+        tickerTask = nil
     }
 
     /// Accumulate newly discovered files to be transferred (pure memory lightweight operation, zero system calls, time-consuming ~2ns,Non-blocking scanning threads)
@@ -101,6 +116,9 @@ public final class ProgressNotifier: @unchecked Sendable {
 
     /// Review and distribute changes (back office only Ticker triggered, the worker thread never executes an external closure)
     func notifyIfChanged() {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !stopped else { return }
         guard let onProgress = self.onProgress else { return }
         os_unfair_lock_lock(&lock)
         guard totalDiscoveredFiles != lastNotifiedDiscovered || completedFiles != lastNotifiedCompleted else {
@@ -122,9 +140,11 @@ public final class ProgressNotifier: @unchecked Sendable {
 
     /// Synchronize All, Stop Background Polling and Force Brush Final 100% Progress
     public func finish() {
+        deliveryLock.lock()
+        defer { deliveryLock.unlock() }
+        guard !stopped else { return }
+        stop()
         guard let onProgress = self.onProgress else { return }
-        tickerTask?.cancel()
-        tickerTask = nil
 
         os_unfair_lock_lock(&lock)
         let progress = SyncProgress(

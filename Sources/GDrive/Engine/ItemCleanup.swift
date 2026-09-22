@@ -65,16 +65,18 @@ actor ItemTaskRegistry {
 
     private var entries: [UUID: Entry] = [:]
     private var blocked = Set<Int64>()
+    private var cancelled = false
 
     func start(
         itemIDs: Set<Int64>, operation: @escaping @Sendable () async -> Void
     ) async throws -> UUID {
-        guard blocked.isDisjoint(with: itemIDs) else { throw CancellationError() }
+        guard !cancelled, blocked.isDisjoint(with: itemIDs) else { throw CancellationError() }
         let id = UUID()
         let gate = StartGate()
         let task = Task {
             await gate.wait()
-            if !Task.isCancelled { await operation() }
+            // Admitted operations own resources whose defer must run even when cancelled.
+            await operation()
             self.finished(id)
         }
         entries[id] = Entry(itemIDs: itemIDs, task: task)
@@ -106,10 +108,10 @@ actor ItemTaskRegistry {
     }
 
     func cancelAll() async {
+        cancelled = true
         let tasks = entries.values.map(\.task)
         tasks.forEach { $0.cancel() }
         for task in tasks { await task.value }
-        entries.removeAll()
     }
 }
 

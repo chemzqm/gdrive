@@ -1,9 +1,83 @@
 import Foundation
+import os
 import Testing
 @testable import GDrive
 
 @Suite("ProgressNotifier Tests")
 struct ProgressNotifierTests {
+    private final class LifetimeSignal: Sendable {
+        let released: AsyncSemaphore
+        init(_ released: AsyncSemaphore) { self.released = released }
+        deinit { released.signal() }
+    }
+
+    @Test("Ticker releases its owner without finish", .timeLimit(.minutes(1)))
+    func tickerDoesNotRetainNotifier() async {
+        let tick = AsyncSemaphore(count: 0)
+        let released = AsyncSemaphore(count: 0)
+        var notifier: ProgressNotifier? = ProgressNotifier(interval: 0.001) { [lifetime = LifetimeSignal(released)] _ in
+            _ = lifetime
+            tick.signal()
+        }
+        notifier?.addDiscovered()
+        await tick.wait()
+        notifier = nil
+        await released.wait()
+    }
+
+    @Test("Finish serializes with an in-flight callback and prevents later delivery", .timeLimit(.minutes(1)))
+    func finishSerializesCallbacks() async {
+        let entered = AsyncSemaphore(count: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finishing = AsyncSemaphore(count: 0)
+        let done = AsyncSemaphore(count: 0)
+        let deliveries = OSAllocatedUnfairLock(initialState: [Int]())
+        let notifier = ProgressNotifier(interval: 1, startsTicker: false) { progress in
+            if progress.completedFiles == 0 {
+                entered.signal()
+                release.wait()
+            }
+            deliveries.withLock { $0.append(progress.completedFiles) }
+        }
+        notifier.addDiscovered()
+        DispatchQueue.global().async {
+            notifier.notifyIfChanged()
+            done.signal()
+        }
+        await entered.wait()
+        notifier.addCompleted()
+        DispatchQueue.global().async {
+            finishing.signal()
+            notifier.finish()
+            done.signal()
+        }
+        await finishing.wait()
+        release.signal()
+        await done.wait()
+        await done.wait()
+        notifier.addCompleted()
+        notifier.notifyIfChanged()
+        notifier.finish()
+        #expect(deliveries.withLock { $0 } == [0, 1])
+    }
+
+    @Test("Stop suppresses delivery and callbacks can reenter stop")
+    func stopIsReentrant() {
+        let holder = OSAllocatedUnfairLock<ProgressNotifier?>(initialState: nil)
+        let calls = OSAllocatedUnfairLock(initialState: 0)
+        let notifier = ProgressNotifier(interval: 1, startsTicker: false) { _ in
+            calls.withLock { $0 += 1 }
+            holder.withLock { $0 }?.stop()
+        }
+        holder.withLock { $0 = notifier }
+        notifier.notifyIfChanged()
+        notifier.addCompleted()
+        notifier.notifyIfChanged()
+        notifier.finish()
+        #expect(calls.withLock { $0 } == 1)
+        holder.withLock { $0 = nil }
+    }
+
     @Test("ProgressNotifier aggregates discovery and completion before final progress")
     func testProgressNotifierAggregation() {
         final class CallbackRecord: @unchecked Sendable {

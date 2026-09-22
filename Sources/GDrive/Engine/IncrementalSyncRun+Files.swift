@@ -273,6 +273,7 @@ extension IncrementalSyncRun {
             }
 
             do {
+                try Task.checkCancellation()
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
                 let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
                 let localFileURL = rootURL.appendingPathComponent(relPath)
@@ -391,6 +392,7 @@ extension IncrementalSyncRun {
             }
 
             do {
+                try Task.checkCancellation()
                 guard let remoteFileId = item.remoteFileId else { return }
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
                 let relPath = parentRel.isEmpty ? item.name : "\(parentRel)/\(item.name)"
@@ -506,6 +508,7 @@ extension IncrementalSyncRun {
                 syncSemaphore.signal()
             }
             do {
+                try Task.checkCancellation()
                 guard let remoteID = item.remoteFileId else {
                     throw SyncEngineError.general(
                         "The conflict lacks valid evidence of the content of both parties")
