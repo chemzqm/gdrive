@@ -176,6 +176,10 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 | `IncrementalSyncRun+LocalScan.swift` | 本地扫描、路径与缓存识别、观察哈希/提交、已见集合和扫描统计 |
 | `IncrementalSyncRun+Directories.swift` | 目录映射、创建恢复、后代屏障及自底向上处理 |
 
+预分配 ID 的创建请求收到 409 时，只能把它解释为上次请求已经成功：重新读取的对象必须未进入
+回收站，并完整匹配类型、名称和父目录；文件还必须返回并匹配 size 与 SHA-256。缺失任何证据都
+保留 intent/dirty 状态并报告失败，不能提交 `remote_status='present'`。
+
 `IncrementalSyncRun` 每轮独立创建，持有不可变依赖和受现有锁保护的本轮状态；
 引擎不保存运行对象。执行顺序为根校验与删除 intent 恢复、Changes 消费、冲突刷新、流式扫描与提前传输、
 缺失登记、目录创建恢复、最终文件调度、目录处理、远端补列和持久化收尾。

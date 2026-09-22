@@ -717,14 +717,19 @@ public final class DriveClient: Sendable {
 
     private func verifyExistingFolder(remoteId: String, expectedName: String, expectedParentId: String) async throws -> DriveFile {
         let existing = try await getFile(remoteId: remoteId)
+        guard existing.trashed == false else {
+            throw DriveError.conflict(fileId: remoteId, message: "Existing directory is trashed or its trash state is unavailable")
+        }
         guard existing.isDirectory else {
             throw DriveError.conflict(fileId: remoteId, message: "Existing object is not a directory")
         }
         guard existing.name == expectedName else {
             throw DriveError.conflict(fileId: remoteId, message: "Existing directory names are inconsistent: \(existing.name) != \(expectedName)")
         }
-        if let parents = existing.parents, !parents.contains(expectedParentId) {
-            throw DriveError.conflict(fileId: remoteId, message: "Existing directory parent mismatch: \(parents)")
+        guard let parents = existing.parents, parents.contains(expectedParentId) else {
+            throw DriveError.conflict(
+                fileId: remoteId,
+                message: "Existing directory parent is missing or mismatched: \(existing.parents ?? [])")
         }
         return existing
     }
@@ -806,16 +811,28 @@ public final class DriveClient: Sendable {
         expectedSha256: String
     ) async throws -> DriveFile {
         let existing = try await getFile(remoteId: remoteId)
+        guard existing.trashed == false else {
+            throw DriveError.conflict(fileId: remoteId, message: "Existing file is trashed or its trash state is unavailable")
+        }
+        guard !existing.isDirectory else {
+            throw DriveError.conflict(fileId: remoteId, message: "Existing object is not a file")
+        }
         guard existing.name == expectedName else {
             throw DriveError.conflict(fileId: remoteId, message: "File name mismatch")
         }
-        if let parents = existing.parents, !parents.contains(expectedParentId) {
-            throw DriveError.conflict(fileId: remoteId, message: "Parent directory mismatch")
+        guard let parents = existing.parents, parents.contains(expectedParentId) else {
+            throw DriveError.conflict(fileId: remoteId, message: "Parent directory is missing or mismatched")
         }
-        if let size = existing.sizeBytes, size != expectedSize {
+        guard let size = existing.sizeBytes else {
+            throw DriveError.sizeMismatch(expected: expectedSize, actual: nil)
+        }
+        if size != expectedSize {
             throw DriveError.sizeMismatch(expected: expectedSize, actual: size)
         }
-        if let checksum = existing.sha256Checksum, checksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
+        guard let checksum = existing.sha256Checksum else {
+            throw DriveError.checksumMismatch(expected: expectedSha256, actual: nil)
+        }
+        if checksum.caseInsensitiveCompare(expectedSha256) != .orderedSame {
             throw DriveError.checksumMismatch(expected: expectedSha256, actual: checksum)
         }
         return existing

@@ -29,6 +29,15 @@ final class DurableIntentURLProtocol: URLProtocol, @unchecked Sendable {
 struct DurableIntentTests {
     private let context = TestHTTPContext(TestRequestHandler())
 
+    private enum InvalidRecoveryMetadata: CaseIterable {
+        case folderTrashed
+        case folderMissingParent
+        case fileTrashed
+        case fileMissingParent
+        case fileMissingSize
+        case fileMissingChecksum
+    }
+
     private func makeAuth(in directory: URL) throws -> Auth {
         let path = directory.appendingPathComponent("auth.json")
         let authData = AuthData(
@@ -73,6 +82,73 @@ struct DurableIntentTests {
         try await setStoredRootIdentity(
             store: store, rootID: ids.0, localURL: URL(fileURLWithPath: localPath))
         return ids
+    }
+
+    @Test("A 409 create recovery requires complete live remote metadata")
+    func createRecoveryRejectsIncompleteOrTrashedMetadata() async throws {
+        defer { context.value.requestHandler = nil }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "gdrive-create-recovery-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let auth = try makeAuth(in: directory)
+        let configuration = URLSessionConfiguration.ephemeral
+        context.configure(configuration)
+        configuration.protocolClasses = [DurableIntentURLProtocol.self]
+        let client = DriveClient(
+            auth: auth, session: URLSession(configuration: configuration), requestsPerSecond: nil)
+        let content = Data("content".utf8)
+        let sha = SHA256.hash(data: content).map { String(format: "%02x", $0) }.joined()
+
+        for invalid in InvalidRecoveryMetadata.allCases {
+            let isFolder = invalid == .folderTrashed || invalid == .folderMissingParent
+            context.value.requestHandler = { request in
+                let url = try #require(request.url)
+                if request.httpMethod == "POST" {
+                    return (HTTPURLResponse(
+                        url: url, statusCode: 409, httpVersion: nil,
+                        headerFields: nil)!, Data())
+                }
+                var metadata: [String: Any] = [
+                    "id": "reserved-id",
+                    "name": isFolder ? "folder" : "file.txt",
+                    "mimeType": isFolder
+                        ? "application/vnd.google-apps.folder"
+                        : "application/octet-stream",
+                    "parents": ["parent"],
+                    "trashed": false
+                ]
+                if !isFolder {
+                    metadata["size"] = String(content.count)
+                    metadata["sha256Checksum"] = sha
+                }
+                switch invalid {
+                case .folderTrashed, .fileTrashed:
+                    metadata["trashed"] = true
+                case .folderMissingParent, .fileMissingParent:
+                    metadata.removeValue(forKey: "parents")
+                case .fileMissingSize:
+                    metadata.removeValue(forKey: "size")
+                case .fileMissingChecksum:
+                    metadata.removeValue(forKey: "sha256Checksum")
+                }
+                return (HTTPURLResponse(
+                    url: url, statusCode: 200, httpVersion: nil,
+                    headerFields: nil)!,
+                    try JSONSerialization.data(withJSONObject: metadata))
+            }
+
+            await #expect(throws: DriveError.self) {
+                if isFolder {
+                    _ = try await client.createDirectory(
+                        name: "folder", parentId: "parent", remoteId: "reserved-id")
+                } else {
+                    _ = try await client.uploadMultipart(
+                        name: "file.txt", parentId: "parent", remoteId: "reserved-id",
+                        content: content, expectedSha256: sha)
+                }
+            }
+        }
     }
 
     @Test("Marking an unknown outcome propagates its SQLite write failure")
