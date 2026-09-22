@@ -436,7 +436,7 @@ extension IncrementalSyncRun {
                     }
                 )
                 switch execution {
-                case .published(let published):
+                case .published(let published, _):
                     let receipt = try await engine.store.commitFileDownloadReceipt(
                         expectation: .incremental(
                             itemID: item.itemId,

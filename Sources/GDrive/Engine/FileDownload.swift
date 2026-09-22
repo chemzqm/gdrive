@@ -2,7 +2,7 @@ import Foundation
 import os
 
 enum FileDownloadExecutionResult: Sendable {
-    case published(LocalFileVersion)
+    case published(LocalFileVersion, verifiedSHA256: String)
     case destinationChanged(DriveClient.VerifiedDownload)
 }
 
@@ -62,7 +62,7 @@ extension SyncEngine {
                 download.url, destination, expectedDestination, download.sha256, expectedLocalSHA256) {
             case .published(let version):
                 try? FileManager.default.removeItem(at: download.url)
-                return .published(version)
+                return .published(version, verifiedSHA256: download.sha256)
             case .destinationChanged:
                 return .destinationChanged(download)
             case .failedAfterWriteStarted(let failure):
@@ -87,6 +87,7 @@ extension StateStore {
         expectation: FileDownloadReceiptExpectation,
         localURL: URL,
         published: LocalFileVersion,
+        verifiedSHA256: String? = nil,
         now: Double = Date().timeIntervalSince1970
     ) async throws -> SyncReceiptResult {
         let applied = OSAllocatedUnfairLock(initialState: false)
@@ -94,6 +95,7 @@ extension StateStore {
             guard (try? LocalFileVersion.read(at: localURL)) == published else { return }
             switch expectation {
             case .bootstrap(let rootID, let parentItemID, let file):
+                guard let sha256 = verifiedSHA256 ?? file.sha256Checksum else { return }
                 let statement = try conn.cachedStatement("""
                 INSERT INTO items (
                     root_id, parent_id, name, entry_kind, remote_file_id,
@@ -132,10 +134,10 @@ extension StateStore {
                 statement.bindInt64(published.mtime, at: 5)
                 statement.bindInt64(published.ctime, at: 6)
                 statement.bindInt64(published.size, at: 7)
-                statement.bindText(file.sha256Checksum, at: 8)
-                statement.bindText(file.sha256Checksum, at: 9)
+                statement.bindText(sha256, at: 8)
+                statement.bindText(sha256, at: 9)
                 statement.bindInt64(published.size, at: 10)
-                statement.bindText(file.sha256Checksum, at: 11)
+                statement.bindText(sha256, at: 11)
                 statement.bindInt64(published.size, at: 12)
                 statement.bindInt64(published.device, at: 13)
                 statement.bindInt64(published.inode, at: 14)

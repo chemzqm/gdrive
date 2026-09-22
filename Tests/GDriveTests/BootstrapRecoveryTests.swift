@@ -70,6 +70,13 @@ extension URLRequest {
 struct BootstrapRecoveryTests {
     private let context = TestHTTPContext(TestRequestHandler())
 
+    private struct StoredDownloadBaseline {
+        let phase: String?
+        let localSHA256: String?
+        let baseSHA256: String?
+        let remoteSHA256: String?
+    }
+
     private static func bootstrapFailureResponse(
         request: URLRequest, failure: String, failing: OSAllocatedUnfairLock<Bool>,
         body: Data, digest: String
@@ -179,6 +186,67 @@ struct BootstrapRecoveryTests {
 
         #expect(stats.filesDownloaded == fileCount)
         #expect(stats.bytesDownloaded == contents.values.reduce(0) { $0 + Int64($1.count) })
+    }
+
+    @Test("Bootstrap persists the computed SHA when Drive metadata omits it")
+    func bootstrapPersistsComputedSHAWithoutRemoteMetadata() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "bootstrap-missing-sha-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let body = Data("download without checksum metadata".utf8)
+        let digest = SyncEngine.computeSha256(of: body)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"initial"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/file") { return (response, body) }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [[
+                    "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                    "size": String(body.count), "parents": ["root"]
+                ]]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
+
+        let stats = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+
+        #expect(stats.filesDownloaded == 1)
+        #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == body)
+        let baseline = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT phase, local_sha256, base_sha256, remote_sha256
+                FROM items WHERE remote_file_id = 'file';
+                """)
+            _ = try #require(try query.step())
+            return StoredDownloadBaseline(
+                phase: query.columnText(at: 0),
+                localSHA256: query.columnText(at: 1),
+                baseSHA256: query.columnText(at: 2),
+                remoteSHA256: query.columnText(at: 3))
+        }
+        #expect(baseline.phase == "committed")
+        #expect(baseline.localSHA256 == digest)
+        #expect(baseline.baseSHA256 == digest)
+        #expect(baseline.remoteSHA256 == digest)
     }
 
     @Test("Bootstrap-downloaded directories are ready parents for later uploads")

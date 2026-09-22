@@ -262,9 +262,11 @@ extension SyncEngine {
                     )
 
                     let published: LocalFileVersion
+                    let verifiedSHA256: String
                     switch execution {
-                    case .published(let version):
+                    case .published(let version, let sha256):
                         published = version
+                        verifiedSHA256 = sha256
                     case .destinationChanged(let download):
                         try? FileManager.default.removeItem(at: download.url)
                         let fileSize = try await stageConflict(
@@ -278,7 +280,8 @@ extension SyncEngine {
                         expectation: .bootstrap(
                             rootID: rootId, parentItemID: parentItemId, file: item),
                         localURL: localURL,
-                        published: published
+                        published: published,
+                        verifiedSHA256: verifiedSHA256
                     )
                     guard receipt == .applied else {
                         throw SyncEngineError.general(
