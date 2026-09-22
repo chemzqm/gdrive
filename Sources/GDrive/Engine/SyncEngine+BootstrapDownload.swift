@@ -174,14 +174,31 @@ extension SyncEngine {
         func recoverPublishedFile(
             _ item: DriveFile, parentItemId: Int64, localURL: URL
         ) async throws -> Bool {
-            guard let snapshot = try? self.stableFileDigestCapture(localURL),
-                  snapshot.sha256Hex == item.sha256Checksum,
+            guard let snapshot = try? self.stableFileDigestCapture(localURL) else { return false }
+            let expectedSHA: String
+            if let remoteSHA = item.sha256Checksum?.lowercased() {
+                expectedSHA = remoteSHA
+            } else {
+                guard let storedSHA = try await self.store.read({ conn in
+                    let query = try conn.cachedStatement("""
+                        SELECT remote_sha256 FROM items
+                        WHERE root_id = ? AND remote_file_id = ?;
+                        """)
+                    defer { query.reset() }
+                    query.bindInt64(rootId, at: 1)
+                    query.bindText(item.id, at: 2)
+                    return try query.step() ? query.columnText(at: 0) : nil
+                }) else { return false }
+                expectedSHA = storedSHA.lowercased()
+            }
+            guard snapshot.sha256Hex.caseInsensitiveCompare(expectedSHA) == .orderedSame,
                   snapshot.fileSize == item.sizeBytes else { return false }
             let receipt = try await self.store.commitFileDownloadReceipt(
                 expectation: .bootstrap(
                     rootID: rootId, parentItemID: parentItemId, file: item),
                 localURL: localURL,
-                published: snapshot.version
+                published: snapshot.version,
+                verifiedSHA256: expectedSHA
             )
             return receipt == .applied
         }
@@ -196,14 +213,15 @@ extension SyncEngine {
             try FileManager.default.createDirectory(
                 at: conflictURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             let expected = try LocalFileVersion.read(at: conflictURL)
-            let stored = try await self.client.downloadFileSafely(
+            let stored = try await self.client.downloadFileSafelyWithDigest(
                 remoteId: item.id, destinationURL: conflictURL,
                 expectedSha256: item.sha256Checksum, expectedDestination: expected,
                 temporaryDirectory: conflictRoot)
             try await SyncConflictStore.commitBootstrap(
                 store: self.store, rootID: rootId, parentItemID: parentItemId, file: item,
-                relativePath: relativePath, localURL: localURL, conflictURL: conflictURL)
-            return stored.size
+                relativePath: relativePath, localURL: localURL, conflictURL: conflictURL,
+                verifiedRemoteSHA: stored.sha256)
+            return stored.version.size
         }
 
         func enqueueFileDownload(

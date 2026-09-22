@@ -1058,6 +1058,31 @@ public final class DriveClient: Sendable {
         beforePublish: (@Sendable () async throws -> Void)? = nil,
         onProgress: (@Sendable (Int64) -> Void)? = nil
     ) async throws -> LocalFileVersion {
+        try await downloadFileSafelyWithDigest(
+            remoteId: remoteId,
+            destinationURL: destinationURL,
+            expectedSha256: expectedSha256,
+            expectedDestination: expectedDestination,
+            temporaryDirectory: temporaryDirectory,
+            beforePublish: beforePublish,
+            onProgress: onProgress
+        ).version
+    }
+
+    struct PublishedDownload: Sendable {
+        let version: LocalFileVersion
+        let sha256: String
+    }
+
+    func downloadFileSafelyWithDigest(
+        remoteId: String,
+        destinationURL: URL,
+        expectedSha256: String?,
+        expectedDestination: LocalFileVersion?,
+        temporaryDirectory: URL = DriveClient.defaultDownloadTemporaryDirectory,
+        beforePublish: (@Sendable () async throws -> Void)? = nil,
+        onProgress: (@Sendable (Int64) -> Void)? = nil
+    ) async throws -> PublishedDownload {
         guard try LocalFileVersion.read(at: destinationURL) == expectedDestination else {
             throw SyncEngineError.localFileModified(path: destinationURL.path)
         }
@@ -1072,7 +1097,8 @@ public final class DriveClient: Sendable {
         switch try LocalFilePublication.publish(
             download.url, to: destinationURL, expected: expectedDestination,
             expectedSHA256: download.sha256) {
-        case .published(let version): return version
+        case .published(let version):
+            return PublishedDownload(version: version, sha256: download.sha256)
         case .destinationChanged:
             throw SyncEngineError.localFileModified(path: destinationURL.path)
         case .failedAfterWriteStarted(let failure):

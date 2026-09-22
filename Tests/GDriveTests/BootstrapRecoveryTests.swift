@@ -249,6 +249,145 @@ struct BootstrapRecoveryTests {
         #expect(baseline.remoteSHA256 == digest)
     }
 
+    @Test("Bootstrap retry recovers a completed file whose Drive metadata omits SHA")
+    func bootstrapRetryRecoversCompletedFileWithoutRemoteSHA() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "bootstrap-retry-missing-sha-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let noSHA = Data("completed without checksum metadata".utf8)
+        let other = Data("fails during the first run".utf8)
+        let failOther = OSAllocatedUnfairLock(initialState: true)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"C0"}"#.utf8))
+            }
+            if url.path.hasSuffix("/changes") {
+                return (response, Data(#"{"changes":[],"newStartPageToken":"C1"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/no-sha") { return (response, noSHA) }
+            if url.path.hasSuffix("/files/other") {
+                if failOther.withLock({ $0 }) {
+                    let failed = try #require(HTTPURLResponse(
+                        url: url, statusCode: 400, httpVersion: nil,
+                        headerFields: ["Content-Type": "application/json"]))
+                    return (failed, Data(#"{"error":{"code":400}}"#.utf8))
+                }
+                return (response, other)
+            }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [
+                    [
+                        "id": "no-sha", "name": "no-sha.txt", "mimeType": "text/plain",
+                        "size": String(noSHA.count), "parents": ["root"]
+                    ],
+                    [
+                        "id": "other", "name": "other.txt", "mimeType": "text/plain",
+                        "size": String(other.count),
+                        "sha256Checksum": SyncEngine.computeSha256(of: other),
+                        "parents": ["root"]
+                    ]
+                ]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: directory.appendingPathComponent("conflicts"))
+
+        let first = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+        #expect(first.filesDownloaded == 1)
+        #expect(first.filesFailed == 1)
+        failOther.withLock { $0 = false }
+
+        let second = try await engine.sync(localPath: local.path, remoteFolderId: "root")
+
+        #expect(second.filesDownloaded == 1)
+        #expect(second.filesFailed == 0)
+        #expect(try Data(contentsOf: local.appendingPathComponent("no-sha.txt")) == noSHA)
+        #expect(try Data(contentsOf: local.appendingPathComponent("other.txt")) == other)
+        let state = try await store.read { conn in
+            let query = try conn.prepare("""
+                SELECT bootstrap_state,
+                    (SELECT COUNT(*) FROM remote_change_inbox),
+                    (SELECT COUNT(*) FROM sync_conflicts)
+                FROM roots WHERE remote_root_id = 'root';
+                """)
+            _ = try #require(try query.step())
+            return (query.columnText(at: 0), query.columnInt64(at: 1), query.columnInt64(at: 2))
+        }
+        #expect(state.0 == "existingKnown")
+        #expect(state.1 == 0)
+        #expect(state.2 == 0)
+    }
+
+    @Test("Bootstrap conflict persists the downloaded SHA when metadata omits it")
+    func bootstrapConflictPersistsComputedRemoteSHA() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "bootstrap-conflict-missing-sha-\(UUID().uuidString)")
+        let local = directory.appendingPathComponent("local")
+        try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let localBody = Data("local body".utf8)
+        let remoteBody = Data("remote body".utf8)
+        try localBody.write(to: local.appendingPathComponent("file.txt"))
+        let remoteSHA = SyncEngine.computeSha256(of: remoteBody)
+        let auth = try createMockAuth(tempDir: directory)
+        let store = try await StateStore(path: directory.appendingPathComponent("state.sqlite").path)
+        context.value.requestHandler = { request in
+            let url = try #require(request.url)
+            let response = try #require(HTTPURLResponse(
+                url: url, statusCode: 200, httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]))
+            if url.path.hasSuffix("/changes/startPageToken") {
+                return (response, Data(#"{"startPageToken":"C0"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/root") {
+                return (response, Data(
+                    #"{"id":"root","name":"root","mimeType":"application/vnd.google-apps.folder"}"#.utf8))
+            }
+            if url.path.hasSuffix("/files/file") { return (response, remoteBody) }
+            if url.path.hasSuffix("/files") {
+                return (response, try JSONSerialization.data(withJSONObject: ["files": [[
+                    "id": "file", "name": "file.txt", "mimeType": "text/plain",
+                    "size": String(remoteBody.count), "parents": ["root"]
+                ]]]))
+            }
+            throw URLError(.badURL)
+        }
+        defer { context.value.requestHandler = nil }
+        let conflicts = directory.appendingPathComponent("conflicts")
+        let engine = try await SyncEngine(
+            auth: auth, store: store, client: createMockClient(auth: auth),
+            downloadTemporaryDirectory: directory.appendingPathComponent("downloads"),
+            conflictDirectory: conflicts)
+
+        let stats = try await engine.syncRemoteToLocalEmpty(
+            localPath: local.path, remoteRootId: "root")
+
+        #expect(stats.filesFailed == 0)
+        #expect(stats.conflicts.count == 1)
+        #expect(try Data(contentsOf: local.appendingPathComponent("file.txt")) == localBody)
+        let conflict = try #require(stats.conflicts.first)
+        #expect(conflict.remoteSHA256 == remoteSHA)
+        let conflictPath = try #require(conflict.conflictPath)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == remoteBody)
+    }
+
     @Test("Bootstrap-downloaded directories are ready parents for later uploads")
     func bootstrapDownloadThenCreateNestedFileUploads() async throws {
         final class UploadRequests: @unchecked Sendable {

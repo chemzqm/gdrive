@@ -90,9 +90,11 @@ enum SyncConflictStore {
 
     static func commitBootstrap(
         store: StateStore, rootID: Int64, parentItemID: Int64, file: DriveFile,
-        relativePath: String, localURL: URL, conflictURL: URL
+        relativePath: String, localURL: URL, conflictURL: URL,
+        verifiedRemoteSHA: String? = nil
     ) async throws {
-        guard let remoteSHA = file.sha256Checksum?.lowercased(), let remoteSize = file.sizeBytes,
+        guard let remoteSHA = (verifiedRemoteSHA ?? file.sha256Checksum)?.lowercased(),
+              let remoteSize = file.sizeBytes,
               let localVersion = try LocalFileVersion.read(at: localURL) else {
             throw SyncEngineError.general("Incomplete sync conflict evidence: \(relativePath)")
         }
