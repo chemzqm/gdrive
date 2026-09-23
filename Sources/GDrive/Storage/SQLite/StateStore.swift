@@ -21,6 +21,9 @@ public final class StateStore: Sendable {
         batchCapacity: Int = 256,
         batchTimeoutMs: Int = 5
     ) async throws {
+        guard maxReaders > 0 else {
+            throw ReaderPool.ConfigurationError.invalidMaxConnections(maxReaders)
+        }
         let resolvedPath = (path as NSString).expandingTildeInPath
         self.path = resolvedPath
 
@@ -34,7 +37,7 @@ public final class StateStore: Sendable {
         self.writer = writer
 
         // 2. Initialize concurrent read-only connection pools
-        self.readerPool = ReaderPool(path: resolvedPath, maxConnections: maxReaders)
+        self.readerPool = try ReaderPool(path: resolvedPath, maxConnections: maxReaders)
     }
 
     /// Get the underlying writer statistic metrics

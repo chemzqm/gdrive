@@ -61,10 +61,10 @@ struct StateStoreTests {
     }
 
     @Test("Reader pool reports connection creation failures")
-    func testReaderPoolConnectionFailureThrows() async {
+    func testReaderPoolConnectionFailureThrows() async throws {
         let missingParent = FileManager.default.temporaryDirectory
             .appendingPathComponent("missing-reader-parent-\(UUID().uuidString)")
-        let pool = ReaderPool(path: missingParent.appendingPathComponent("state.sqlite").path)
+        let pool = try ReaderPool(path: missingParent.appendingPathComponent("state.sqlite").path)
 
         await #expect(throws: (any Error).self) {
             try await pool.withReader { _ in () }

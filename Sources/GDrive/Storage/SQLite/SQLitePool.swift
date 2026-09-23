@@ -2,6 +2,10 @@ import Foundation
 
 /// Concurrent read-only connection pools, multi-threaded lockless concurrent reads
 public actor ReaderPool {
+    public enum ConfigurationError: Error, Equatable, Sendable {
+        case invalidMaxConnections(Int)
+    }
+
     private let path: String
     private let maxConnections: Int
     private nonisolated let executionQueue = DispatchQueue(
@@ -13,7 +17,10 @@ public actor ReaderPool {
     private var totalCreated: Int = 0
     private var waiters: [CheckedContinuation<SQLiteConnection, Never>] = []
 
-    public init(path: String, maxConnections: Int = max(4, ProcessInfo.processInfo.activeProcessorCount)) {
+    public init(path: String, maxConnections: Int = max(4, ProcessInfo.processInfo.activeProcessorCount)) throws {
+        guard maxConnections > 0 else {
+            throw ConfigurationError.invalidMaxConnections(maxConnections)
+        }
         self.path = path
         self.maxConnections = maxConnections
     }
