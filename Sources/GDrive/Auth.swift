@@ -1,8 +1,40 @@
 import CryptoKit
 import Foundation
+import os
 #if canImport(Darwin)
 import Darwin
 #endif
+
+private final class OAuthCallbackCancellation: Sendable {
+    private struct State: Sendable {
+        var writeFD: Int32
+        var cancelled = false
+    }
+
+    private let state: OSAllocatedUnfairLock<State>
+
+    init(writeFD: Int32) {
+        state = OSAllocatedUnfairLock(initialState: State(writeFD: writeFD))
+    }
+
+    var isCancelled: Bool { state.withLock { $0.cancelled } }
+
+    func cancel() {
+        state.withLock { state in
+            state.cancelled = true
+            guard state.writeFD >= 0 else { return }
+            var byte: UInt8 = 1
+            _ = Darwin.write(state.writeFD, &byte, 1)
+        }
+    }
+
+    func finish() {
+        state.withLock { state in
+            if state.writeFD >= 0 { close(state.writeFD) }
+            state.writeFD = -1
+        }
+    }
+}
 
 /// Data stored in ~/.gdrive/auth.json.
 public struct AuthData: Codable, Sendable {
@@ -95,7 +127,11 @@ public actor Auth {
         let state = UUID().uuidString
 
         // Start a local loopback server to receive the callback.
-        let (serverFD, port) = try bindLoopback()
+        let (serverFD, port) = try Self.bindLoopback()
+        let seconds = UInt64(max(0, timeoutSeconds))
+        let (duration, durationOverflow) = seconds.multipliedReportingOverflow(by: 1_000_000_000)
+        let (end, deadlineOverflow) = DispatchTime.now().uptimeNanoseconds.addingReportingOverflow(duration)
+        let deadline = durationOverflow || deadlineOverflow ? UInt64.max : end
         let redirectURI = "http://127.0.0.1:\(port)/oauth2callback"
 
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
@@ -128,7 +164,7 @@ public actor Auth {
         try? openProcess.run()
 
         // Receive the authorization code.
-        let code = try await waitForCode(serverFD: serverFD, expectedState: state, timeout: timeoutSeconds)
+        let code = try await Self.waitForCode(serverFD: serverFD, expectedState: state, deadline: deadline)
 
         // Exchange the authorization code for tokens.
         var params = [
@@ -268,9 +304,10 @@ public actor Auth {
         string.addingPercentEncoding(withAllowedCharacters: .alphanumerics.union(CharacterSet(charactersIn: "-._~"))) ?? string
     }
 
-    private func bindLoopback() throws -> (serverFD: Int32, port: UInt16) {
+    static func bindLoopback() throws -> (serverFD: Int32, port: UInt16) {
         let socketFD = socket(AF_INET, SOCK_STREAM, 0)
         guard socketFD >= 0 else { throw NSError(domain: "GDriveAuth", code: 5, userInfo: [NSLocalizedDescriptionKey: "Failed to create socket"]) }
+        _ = fcntl(socketFD, F_SETFD, FD_CLOEXEC)
 
         var reuse: Int32 = 1
         setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
@@ -288,7 +325,7 @@ public actor Auth {
             throw NSError(domain: "GDriveAuth", code: 6, userInfo: [NSLocalizedDescriptionKey: "Failed to bind port"])
         }
 
-        guard listen(socketFD, 1) == 0 else {
+        guard listen(socketFD, 32) == 0 else {
             close(socketFD)
             throw NSError(domain: "GDriveAuth", code: 7, userInfo: [NSLocalizedDescriptionKey: "Failed to listen on port"])
         }
@@ -301,58 +338,271 @@ public actor Auth {
         return (socketFD, UInt16(bigEndian: addr.sin_port))
     }
 
-    private func waitForCode(serverFD: Int32, expectedState: String, timeout: Int) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
-            DispatchQueue.global().async {
-                defer { close(serverFD) }
-
-                var pfd = pollfd(fd: serverFD, events: Int16(POLLIN), revents: 0)
-                let pollRet = poll(&pfd, 1, Int32(timeout * 1000))
-                guard pollRet > 0 else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 8, userInfo: [NSLocalizedDescriptionKey: "Timed out waiting for authorization"]))
-                    return
+    static func waitForCode(serverFD: Int32, expectedState: String, deadline: UInt64) async throws -> String {
+        _ = fcntl(serverFD, F_SETFD, FD_CLOEXEC)
+        var wake = [Int32](repeating: -1, count: 2)
+        guard pipe(&wake) == 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            close(serverFD)
+            throw error
+        }
+        _ = fcntl(wake[0], F_SETFD, FD_CLOEXEC)
+        _ = fcntl(wake[1], F_SETFD, FD_CLOEXEC)
+        guard fcntl(wake[1], F_SETFL, O_NONBLOCK) >= 0 else {
+            let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            close(wake[0])
+            close(wake[1])
+            close(serverFD)
+            throw error
+        }
+        let cancellation = OAuthCallbackCancellation(writeFD: wake[1])
+        let wakeReadFD = wake[0]
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let result: Result<String, Error>
+                    do {
+                        result = .success(try receiveCode(
+                            serverFD: serverFD, wakeFD: wakeReadFD, expectedState: expectedState,
+                            deadline: deadline, cancellation: cancellation))
+                    } catch {
+                        result = .failure(error)
+                    }
+                    closeQueuedCallbacks(serverFD: serverFD)
+                    cancellation.finish()
+                    close(wakeReadFD)
+                    close(serverFD)
+                    continuation.resume(with: result)
                 }
+            }
+        } onCancel: {
+            cancellation.cancel()
+        }
+    }
 
-                let clientFD = accept(serverFD, nil, nil)
-                guard clientFD >= 0 else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 9, userInfo: [NSLocalizedDescriptionKey: "Failed to receive callback"]))
-                    return
+    private static func closeQueuedCallbacks(serverFD: Int32) {
+        guard fcntl(serverFD, F_SETFL, O_NONBLOCK) >= 0 else { return }
+        for _ in 0..<32 {
+            let clientFD = accept(serverFD, nil, nil)
+            if clientFD < 0 { break }
+            var drainBuffer = [UInt8](repeating: 0, count: 1024)
+            var drained = 0
+            while drained < 16384 && read(clientFD, &drainBuffer, drainBuffer.count) > 0 {
+                drained += 1024
+            }
+            close(clientFD)
+        }
+    }
+
+    private static func closeClient(
+        _ clientFD: Int32, clients: inout [Int32: [UInt8]], order: inout [Int32]
+    ) {
+        clients.removeValue(forKey: clientFD)
+        order.removeAll { $0 == clientFD }
+        var drainBuffer = [UInt8](repeating: 0, count: 1024)
+        var drained = 0
+        while drained < 16384 && read(clientFD, &drainBuffer, drainBuffer.count) > 0 {
+            drained += 1024
+        }
+        close(clientFD)
+    }
+
+    private static func acceptReadyConnections(
+        serverFD: Int32, clients: inout [Int32: [UInt8]], order: inout [Int32]
+    ) throws {
+        for _ in 0..<32 {
+            let clientFD = accept(serverFD, nil, nil)
+            if clientFD < 0 {
+                if errno == EAGAIN || errno == EWOULDBLOCK || errno == EMFILE || errno == ENFILE { break }
+                if errno == EINTR || errno == ECONNABORTED { continue }
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard fcntl(clientFD, F_SETFL, O_NONBLOCK) >= 0 else { close(clientFD); continue }
+            _ = fcntl(clientFD, F_SETFD, FD_CLOEXEC)
+            var noSignal: Int32 = 1
+            guard setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE,
+                             &noSignal, socklen_t(MemoryLayout<Int32>.size)) == 0 else {
+                close(clientFD)
+                continue
+            }
+            if order.count == 32 {
+                let oldest = order[0]
+                closeClient(oldest, clients: &clients, order: &order)
+            }
+            clients[clientFD] = []
+            order.append(clientFD)
+        }
+    }
+
+    private static func readReadyConnections(
+        _ descriptors: ArraySlice<pollfd>, expectedState: String,
+        clients: inout [Int32: [UInt8]], order: inout [Int32]
+    ) throws -> String? {
+        for descriptor in descriptors where descriptor.revents != 0 {
+            let clientFD = descriptor.fd
+            guard var received = clients[clientFD] else { continue }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let count = read(clientFD, &buffer, buffer.count)
+            if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) { continue }
+            guard count > 0 else {
+                closeClient(clientFD, clients: &clients, order: &order)
+                continue
+            }
+            received.append(contentsOf: buffer[0..<count])
+            while let first = received.first, first == 10 || first == 13 || first == 32 {
+                received.removeFirst()
+            }
+            if let newline = received.firstIndex(of: 10) {
+                let result = callbackResult(in: received[0...newline], expectedState: expectedState)
+                switch result {
+                case .code(let code):
+                    sendCallbackResponse(
+                        clientFD: clientFD, status: "200 OK",
+                        body: "Google Drive authorization succeeded. You can close this window and return to the terminal.")
+                    closeClient(clientFD, clients: &clients, order: &order)
+                    return code
+                case .error(let err):
+                    sendCallbackResponse(
+                        clientFD: clientFD, status: "400 Bad Request",
+                        body: "Google Drive authorization failed: \(err). You can close this window and return to the terminal.")
+                    closeClient(clientFD, clients: &clients, order: &order)
+                    throw NSError(domain: "GDriveAuth", code: 13, userInfo: [
+                        NSLocalizedDescriptionKey: "Authorization failed: \(err)"])
+                case .invalid:
+                    sendCallbackResponse(
+                        clientFD: clientFD, status: "400 Bad Request",
+                        body: "Invalid authorization callback. Please retry.")
+                    closeClient(clientFD, clients: &clients, order: &order)
                 }
-                defer { close(clientFD) }
-
-                var buffer = [UInt8](repeating: 0, count: 4096)
-                let bytesRead = read(clientFD, &buffer, buffer.count)
-                guard bytesRead > 0, let reqText = String(bytes: buffer[0..<bytesRead], encoding: .utf8) else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 10, userInfo: [NSLocalizedDescriptionKey: "Failed to read callback data"]))
-                    return
-                }
-
-                guard let line = reqText.split(separator: "\r\n").first,
-                      let urlPart = line.split(separator: " ").dropFirst().first,
-                      let components = URLComponents(string: "http://127.0.0.1" + urlPart),
-                      let queryItems = components.queryItems else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 11, userInfo: [NSLocalizedDescriptionKey: "Failed to parse callback link"]))
-                    return
-                }
-
-                let query = Dictionary(queryItems.compactMap { item in item.value.map { (item.name, $0) } }, uniquingKeysWith: { first, _ in first })
-                guard query["state"] == expectedState else {
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 12, userInfo: [NSLocalizedDescriptionKey: "OAuth state validation failed"]))
-                    return
-                }
-
-                guard let code = query["code"], !code.isEmpty else {
-                    let err = query["error"] ?? "unknown"
-                    continuation.resume(throwing: NSError(domain: "GDriveAuth", code: 13, userInfo: [NSLocalizedDescriptionKey: "Authorization failed: \(err)"]))
-                    return
-                }
-
-                let body = "Google Drive authorization succeeded. You can close this window and return to the terminal."
-                let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n\(body)"
-                _ = resp.withCString { Darwin.write(clientFD, $0, strlen($0)) }
-
-                continuation.resume(returning: code)
+            } else if received.count > 8192 {
+                closeClient(clientFD, clients: &clients, order: &order)
+            } else {
+                clients[clientFD] = received
             }
         }
+        return nil
+    }
+
+    private static func pollCallbacks(
+        serverFD: Int32, wakeFD: Int32, order: [Int32],
+        deadline: UInt64, cancellation: OAuthCallbackCancellation
+    ) throws -> [pollfd] {
+        if cancellation.isCancelled { throw CancellationError() }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadline else {
+            throw NSError(domain: "GDriveAuth", code: 8, userInfo: [
+                NSLocalizedDescriptionKey: "Timed out waiting for authorization"])
+        }
+        let remainingMilliseconds = (deadline - now) / 1_000_000 + 1
+        let waitMilliseconds = Int32(min(remainingMilliseconds, UInt64(Int32.max)))
+        var descriptors = [
+            pollfd(fd: serverFD, events: Int16(POLLIN), revents: 0),
+            pollfd(fd: wakeFD, events: Int16(POLLIN), revents: 0)
+        ]
+        descriptors += order.map { pollfd(fd: $0, events: Int16(POLLIN), revents: 0) }
+        let ready = poll(&descriptors, nfds_t(descriptors.count), waitMilliseconds)
+        if ready < 0 {
+            if errno == EINTR {
+                if cancellation.isCancelled { throw CancellationError() }
+                return []
+            }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        if cancellation.isCancelled { throw CancellationError() }
+        return ready == 0 ? [] : descriptors
+    }
+
+    private static func receiveCode(
+        serverFD: Int32, wakeFD: Int32, expectedState: String,
+        deadline: UInt64, cancellation: OAuthCallbackCancellation
+    ) throws -> String {
+        guard fcntl(serverFD, F_SETFL, O_NONBLOCK) >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        var clients: [Int32: [UInt8]] = [:]
+        var order: [Int32] = []
+        defer {
+            for clientFD in order {
+                var drainBuffer = [UInt8](repeating: 0, count: 1024)
+                var drained = 0
+                while drained < 16384 && read(clientFD, &drainBuffer, drainBuffer.count) > 0 {
+                    drained += 1024
+                }
+                close(clientFD)
+            }
+        }
+
+        while true {
+            let descriptors = try pollCallbacks(
+                serverFD: serverFD, wakeFD: wakeFD, order: order,
+                deadline: deadline, cancellation: cancellation)
+            if descriptors.isEmpty { continue }
+            if descriptors[1].revents != 0 { throw CancellationError() }
+
+            if let code = try readReadyConnections(
+                descriptors.dropFirst(2), expectedState: expectedState,
+                clients: &clients, order: &order
+            ) {
+                return code
+            }
+
+            if descriptors[0].revents & Int16(POLLIN) != 0 {
+                try acceptReadyConnections(serverFD: serverFD, clients: &clients, order: &order)
+            } else if descriptors[0].revents != 0 {
+                throw NSError(domain: "GDriveAuth", code: 9, userInfo: [
+                    NSLocalizedDescriptionKey: "Failed to receive callback"])
+            }
+        }
+    }
+
+    private enum CallbackResult {
+        case code(String)
+        case error(String)
+        case invalid
+    }
+
+    private static func callbackResult(in lineBytes: ArraySlice<UInt8>, expectedState: String) -> CallbackResult {
+        guard let line = String(bytes: lineBytes, encoding: .utf8) else { return .invalid }
+        let parts = line.split(separator: " ")
+        guard parts.count == 3, parts[0] == "GET", parts[2].hasPrefix("HTTP/1.") else { return .invalid }
+        let urlString = parts[1].hasPrefix("/") ? "http://127.0.0.1" + parts[1] : String(parts[1])
+        guard let components = URLComponents(string: urlString),
+              components.path == "/oauth2callback" || components.path == "/oauth2callback/",
+              let queryItems = components.queryItems,
+              queryItems.first(where: { $0.name == "state" })?.value == expectedState else { return .invalid }
+        if let code = queryItems.first(where: { $0.name == "code" })?.value, !code.isEmpty {
+            return .code(code)
+        }
+        let err = queryItems.first(where: { $0.name == "error" })?.value?.replacingOccurrences(of: "+", with: " ") ?? "unknown"
+        if let desc = queryItems.first(where: { $0.name == "error_description" })?.value, !desc.isEmpty {
+            let cleanDesc = desc.replacingOccurrences(of: "+", with: " ")
+            return .error("\(err): \(cleanDesc)")
+        }
+        return .error(err)
+    }
+
+    private static func sendCallbackResponse(clientFD: Int32, status: String, body: String) {
+        let response = "HTTP/1.1 \(status)\r\nContent-Type: text/plain; charset=utf-8\r\n"
+            + "Content-Length: \(body.utf8.count)\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n\(body)"
+        let bytes = [UInt8](response.utf8)
+        bytes.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            var offset = 0
+            while offset < buffer.count {
+                let sent = Darwin.write(clientFD, base + offset, buffer.count - offset)
+                if sent > 0 {
+                    offset += sent
+                } else if sent < 0 && errno == EINTR {
+                    continue
+                } else if sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    var pfd = pollfd(fd: clientFD, events: Int16(POLLOUT), revents: 0)
+                    if poll(&pfd, 1, 500) <= 0 { break }
+                    continue
+                } else {
+                    break
+                }
+            }
+        }
+        _ = shutdown(clientFD, SHUT_WR)
     }
 }

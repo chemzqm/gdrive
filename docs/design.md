@@ -87,6 +87,8 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
 * **`Auth.swift`**：
   * 实现 OAuth 2.0 PKCE 授权码流，本地启动 Loopback Server 接收回调；凭证持久化
     至 `~/.gdrive/auth.json` 并自动刷新。
+  * 回调服务在同一截止时间内处理多个本机连接；无效或静默连接不能阻断后续回调。
+    有效授权码、明确拒绝（如 access_denied）、超时或任务取消都会关闭监听和全部已接受连接。
 * **`DriveClient.swift`**：
   * 底层定制 `URLSessionConfiguration`：开启 `httpShouldUsePipelining = true`，
     并将 `httpMaximumConnectionsPerHost` 提升至 **128**，支持海量请求的高速并发
