@@ -254,24 +254,17 @@ CREATE TABLE IF NOT EXISTS sync_issues (
 CREATE INDEX IF NOT EXISTS idx_sync_issues_root_seen
     ON sync_issues(root_id, last_seen_at DESC, issue_id);
 
--- Local files whose content differed from the SQLite baseline when an enclosing
--- directory was trashed because the remote directory had been deleted.
--- These rows intentionally do not reference roots/items: cleanup removes those rows.
-CREATE TABLE IF NOT EXISTS trashed_local_changes (
-    change_id TEXT PRIMARY KEY NOT NULL,
-    batch_id TEXT NOT NULL,
-    local_root_path TEXT NOT NULL,
-    relative_path TEXT NOT NULL,
+-- Local files preserved outside the sync root when their remote parent is deleted.
+-- These records outlive the item subtree and root binding.
+CREATE TABLE IF NOT EXISTS local_conflicts (
+    conflict_id TEXT PRIMARY KEY NOT NULL,
+    root_id INTEGER NOT NULL,
     original_path TEXT NOT NULL,
-    trash_path TEXT,
-    baseline_sha256 TEXT NOT NULL CHECK(length(baseline_sha256) = 64),
-    observed_sha256 TEXT NOT NULL CHECK(length(observed_sha256) = 64),
-    state TEXT NOT NULL CHECK(state IN ('pending', 'committed')),
-    trashed_at REAL NOT NULL,
-    UNIQUE(batch_id, relative_path)
+    stored_path TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_trashed_local_changes_root
-    ON trashed_local_changes(local_root_path, trashed_at);
+CREATE INDEX IF NOT EXISTS idx_local_conflicts_root
+    ON local_conflicts(root_id, created_at);
 
 
 -- Nonunique to retain distinct item identities when local names are equivalent.

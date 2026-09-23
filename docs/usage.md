@@ -107,8 +107,10 @@ for conflict in conflicts {
 删除操作，其他路径继续正常同步。
 
 一侧删除而另一侧仍为已同步基线内容时会产生删除意图。本地删除扩散到远端时直接移入 Google Drive
-垃圾桶；远端删除扩散到本地时直接移入 macOS 废纸篓。远端目录删除前会记录其中相对 SQLite 基线
-已修改的文件，可通过 `listTrashedLocalChanges(localPath:)` 查询原路径、实际垃圾桶路径和 SHA-256。
+垃圾桶；远端删除扩散到本地时，新增或相对 SQLite 基线已修改的文件先移入与 conflicts 同级的
+`parent_removed`，剩余目录再移入 macOS 废纸篓。原路径和保管路径保存在
+`local_conflicts` 表中，供后续恢复功能使用；无法计算 SHA-256 或移动失败的文件仍随目录进入废纸篓。
+若进程在文件移动后、数据库提交前终止，文件仍在 `parent_removed`，需要手动查找。
 若远端目录在同步删除期间包含协作者刚修改或新增的内容，需要从 Google Drive 垃圾桶恢复。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
 初始化下载、增量下载及冲突内容刷新都使用此设置；目录按需创建。

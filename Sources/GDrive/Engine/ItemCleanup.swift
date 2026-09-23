@@ -7,6 +7,12 @@ struct ItemCleanupGenerations: Sendable, Equatable {
     let dirty: Int64
 }
 
+private struct PreservedLocalFile: Sendable {
+    let id: String
+    let originalPath: String
+    let storedPath: String
+}
+
 private struct ItemCleanupIntentPayload: Codable, Sendable, Equatable {
     let localGeneration: Int64
     let remoteGeneration: Int64
@@ -158,15 +164,6 @@ private enum CleanupPrimaryResult {
     case restoreFailed
 }
 
-private struct PendingTrashedLocalChange: Sendable {
-    let id: String
-    let relativePath: String
-    let trashRelativePath: String
-    let originalPath: String
-    let baselineSHA256: String
-    let observedSHA256: String
-}
-
 extension SyncEngine {
     @discardableResult
     func cleanupLocalDeletionToRemote(
@@ -249,24 +246,14 @@ extension SyncEngine {
         try await executeCleanup(
             initial: initial, expected: expected, operationType: "deleteLocal",
             taskRegistry: taskRegistry,
-            removePrimary: { plan, operationID in
+            removePrimary: { plan, _ in
                     if plan.entryKind == "directory" {
-                        if FileManager.default.fileExists(atPath: plan.localURL.path) {
-                            let changes = try self.modifiedFilesBeforeDirectoryTrash(plan)
-                            let batchID = operationID
-                            try await self.insertPendingTrashedLocalChanges(
-                                changes, batchID: batchID, plan: plan)
-                            var trashURL: NSURL?
-                            do {
-                                try FileManager.default.trashItem(
-                                    at: plan.localURL, resultingItemURL: &trashURL)
-                            } catch {
-                                try? await self.removePendingTrashedLocalChanges(batchID: batchID)
-                                throw error
-                            }
-                            try await self.commitTrashedLocalChanges(
-                                changes, batchID: batchID,
-                                trashDirectory: trashURL.map { $0 as URL })
+                        if try CleanupLocalIdentity.read(at: plan.localURL) != nil {
+                            try self.validateCleanupDirectoryIdentity(plan)
+                            try await self.preserveDirectoryChanges(plan: plan)
+                            try self.validateCleanupDirectoryIdentity(plan)
+                            try FileManager.default.trashItem(
+                                at: plan.localURL, resultingItemURL: nil)
                         }
                         return .completed
                     } else {
@@ -332,7 +319,7 @@ extension SyncEngine {
                 return false
             }
             try removeCleanupArtifacts(plan)
-            try await deleteCleanupRows(plan, operationID: intent.operationID)
+            try await deleteCleanupRows(plan)
             await taskRegistry.unblock(itemIDs: ids)
             return true
         } catch {
@@ -430,7 +417,8 @@ extension SyncEngine {
                let storedPayload = existing.columnText(at: 2) {
                 let decoded = try JSONDecoder().decode(
                     ItemCleanupIntentPayload.self, from: Data(storedPayload.utf8))
-                guard storedType == operationType, decoded == payload else {
+                guard storedType == operationType,
+                      decoded == payload else {
                     throw SyncEngineError.general(
                         "Existing cleanup intent does not match item: \(plan.itemID)")
                 }
@@ -471,6 +459,15 @@ extension SyncEngine {
         guard let current else { return true }
         guard let device = payload.localDevice, let inode = payload.localInode else { return false }
         return current.device == device && current.inode == inode
+    }
+
+    private func validateCleanupDirectoryIdentity(_ plan: ItemCleanupPlan) throws {
+        guard let current = try CleanupLocalIdentity.read(at: plan.localURL),
+              current.entryKind == "directory",
+              current.device == plan.localDevice,
+              current.inode == plan.localInode else {
+            throw SyncEngineError.localFileModified(path: plan.localURL.path)
+        }
     }
 
     private func discardCleanupIntent(operationID: String) async throws {
@@ -698,100 +695,81 @@ extension SyncEngine {
         return conflictPaths
     }
 
-    private func modifiedFilesBeforeDirectoryTrash(
-        _ plan: ItemCleanupPlan
-    ) throws -> [PendingTrashedLocalChange] {
-        let rootURL = URL(fileURLWithPath: plan.localRootPath).standardizedFileURL
-        let rootPrefix = rootURL.path.hasSuffix("/") ? rootURL.path : rootURL.path + "/"
-        var changes: [PendingTrashedLocalChange] = []
-        for node in plan.nodes where node.entryKind == "file" {
-            guard let baseline = node.baseSHA256 else { continue }
-            let fileURL = node.relativePath.isEmpty ? plan.localURL :
-                plan.localURL.appendingPathComponent(node.relativePath)
-            guard FileManager.default.fileExists(atPath: fileURL.path) else { continue }
-            let observed: String
-            do {
-                observed = try Self.computeFileSha256(at: fileURL).sha256Hex
-            } catch {
-                logger.warning(
-                    "Unable to inspect file before trashing its directory [\(fileURL.path)]: \(error)")
-                continue
-            }
-            guard observed.caseInsensitiveCompare(baseline) != .orderedSame else { continue }
-            let resolved = fileURL.standardizedFileURL.path
-            guard resolved.hasPrefix(rootPrefix) else {
-                throw SyncEngineError.general(
-                    "Trashed local change is outside its sync root: \(fileURL.path)")
-            }
-            changes.append(PendingTrashedLocalChange(
-                id: UUID().uuidString,
-                relativePath: String(resolved.dropFirst(rootPrefix.count)),
-                trashRelativePath: node.relativePath,
-                originalPath: resolved, baselineSHA256: baseline,
-                observedSHA256: observed))
+    private func preserveDirectoryChanges(plan: ItemCleanupPlan) async throws {
+        let parentRemoved = conflictDirectory.deletingLastPathComponent()
+            .appendingPathComponent("parent_removed", isDirectory: true)
+            .appendingPathComponent(String(plan.rootID), isDirectory: true)
+        guard !RootSyncCoordinator.contains(parentRemoved.path, in: plan.localRootPath) else {
+            throw SyncEngineError.general("Parent-removed storage overlaps the sync root")
         }
-        return changes
+        let baselines = Dictionary(uniqueKeysWithValues: plan.nodes.compactMap { node in
+            node.entryKind == "file" ? node.baseSHA256.map { (node.relativePath, $0) } : nil
+        })
+        let candidates = try await DirectoryDeletionInventory.inspect(
+            directory: plan.localURL, baselines: baselines)
+        guard !candidates.isEmpty else { return }
+        try validateCleanupDirectoryIdentity(plan)
+        try FileManager.default.createDirectory(at: parentRemoved, withIntermediateDirectories: true)
+        let files = candidates.map { candidate in
+            let id = UUID().uuidString
+            return PreservedLocalFile(
+                id: id, originalPath: candidate.url.path,
+                storedPath: parentRemoved.appendingPathComponent(
+                    "\(id)-\(candidate.url.lastPathComponent)").path)
+        }
+        let (moved, failures) = await moveLocalConflicts(files)
+        for failure in failures {
+            logger.warning("Unable to preserve local file; leaving it for Trash: \(failure)")
+        }
+        try await insertLocalConflicts(moved, rootID: plan.rootID)
+        try Task.checkCancellation()
     }
 
-    private func insertPendingTrashedLocalChanges(
-        _ changes: [PendingTrashedLocalChange], batchID: String, plan: ItemCleanupPlan
-    ) async throws {
-        guard !changes.isEmpty else { return }
-        let now = Date().timeIntervalSince1970
+    private func moveLocalConflicts(
+        _ files: [PreservedLocalFile]
+    ) async -> (moved: [PreservedLocalFile], failures: [String]) {
+        await withTaskGroup(of: (PreservedLocalFile, String?).self) { group in
+            var moved: [PreservedLocalFile] = []
+            var failures: [String] = []
+            for (index, file) in files.enumerated() {
+                if index >= 64, let result = await group.next() {
+                    if let error = result.1 { failures.append(error) } else { moved.append(result.0) }
+                }
+                group.addTask {
+                    do {
+                        try FileManager.default.moveItem(
+                            at: URL(fileURLWithPath: file.originalPath),
+                            to: URL(fileURLWithPath: file.storedPath))
+                        return (file, nil)
+                    } catch {
+                        return (file, "\(file.originalPath): \(error)")
+                    }
+                }
+            }
+            for await result in group {
+                if let error = result.1 { failures.append(error) } else { moved.append(result.0) }
+            }
+            return (moved, failures)
+        }
+    }
+
+    private func insertLocalConflicts(_ files: [PreservedLocalFile], rootID: Int64) async throws {
+        guard !files.isEmpty else { return }
         try await store.write { conn in
-            let stmt = try conn.prepare(
-                """
-                INSERT INTO trashed_local_changes(change_id, batch_id, local_root_path,
-                    relative_path, original_path, baseline_sha256, observed_sha256,
-                    state, trashed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?);
+            let insert = try conn.prepare("""
+                INSERT INTO local_conflicts(conflict_id, root_id, original_path,
+                    stored_path, created_at) VALUES (?, ?, ?, ?, ?);
                 """)
-            defer { stmt.reset() }
-            for change in changes {
-                stmt.bindText(change.id, at: 1)
-                stmt.bindText(batchID, at: 2)
-                stmt.bindText(plan.localRootPath, at: 3)
-                stmt.bindText(change.relativePath, at: 4)
-                stmt.bindText(change.originalPath, at: 5)
-                stmt.bindText(change.baselineSHA256, at: 6)
-                stmt.bindText(change.observedSHA256, at: 7)
-                stmt.bindDouble(now, at: 8)
-                _ = try stmt.step()
-                stmt.reset()
-            }
-        }
-    }
-
-    private func removePendingTrashedLocalChanges(batchID: String) async throws {
-        try await store.write { conn in
-            let stmt = try conn.prepare(
-                "DELETE FROM trashed_local_changes WHERE batch_id = ? AND state = 'pending';")
-            defer { stmt.reset() }
-            stmt.bindText(batchID, at: 1)
-            _ = try stmt.step()
-        }
-    }
-
-    private func commitTrashedLocalChanges(
-        _ changes: [PendingTrashedLocalChange], batchID: String, trashDirectory: URL?
-    ) async throws {
-        guard !changes.isEmpty else { return }
-        try await store.write { conn in
-            let stmt = try conn.prepare(
-                """
-                UPDATE trashed_local_changes SET trash_path = ?, state = 'committed',
-                    trashed_at = ? WHERE change_id = ? AND batch_id = ? AND state = 'pending';
-                """)
-            defer { stmt.reset() }
-            for change in changes {
-                let trashPath = trashDirectory?
-                    .appendingPathComponent(change.trashRelativePath).path
-                stmt.bindText(trashPath, at: 1)
-                stmt.bindDouble(Date().timeIntervalSince1970, at: 2)
-                stmt.bindText(change.id, at: 3)
-                stmt.bindText(batchID, at: 4)
-                _ = try stmt.step()
-                stmt.reset()
+            defer { insert.reset() }
+            let createdAt = Date().timeIntervalSince1970
+            for file in files {
+                insert.bindText(file.id, at: 1)
+                insert.bindInt64(rootID, at: 2)
+                insert.bindText(file.originalPath, at: 3)
+                insert.bindText(file.storedPath, at: 4)
+                insert.bindDouble(createdAt, at: 5)
+                _ = try insert.step()
+                insert.reset()
             }
         }
     }
@@ -816,7 +794,7 @@ extension SyncEngine {
         }
     }
 
-    private func deleteCleanupRows(_ plan: ItemCleanupPlan, operationID: String) async throws {
+    private func deleteCleanupRows(_ plan: ItemCleanupPlan) async throws {
         try await store.batchWrite { conn in
             for remoteID in Set(plan.nodes.compactMap(\.remoteID)) {
                 for table in ["remote_change_inbox", "remote_directory_scans"] {
@@ -835,46 +813,7 @@ extension SyncEngine {
                 _ = try stmt.step()
                 stmt.reset()
             }
-            let pendingTrash = try conn.prepare(
-                """
-                UPDATE trashed_local_changes SET state = 'committed', trashed_at = ?
-                WHERE batch_id = ? AND state = 'pending';
-                """)
-            pendingTrash.bindDouble(Date().timeIntervalSince1970, at: 1)
-            pendingTrash.bindText(operationID, at: 2)
-            _ = try pendingTrash.step()
-            pendingTrash.reset()
         }
     }
 
-    public func listTrashedLocalChanges(localPath: String) async throws -> [TrashedLocalChange] {
-        let normalized = Self.normalizedPath(localPath)
-        return try await store.read { conn in
-            let stmt = try conn.prepare(
-                """
-                SELECT change_id, local_root_path, relative_path, original_path, trash_path,
-                    baseline_sha256, observed_sha256, trashed_at
-                FROM trashed_local_changes
-                WHERE local_root_path = ? AND state = 'committed'
-                ORDER BY trashed_at DESC, relative_path;
-                """)
-            defer { stmt.reset() }
-            stmt.bindText(normalized, at: 1)
-            var result: [TrashedLocalChange] = []
-            while try stmt.step(), let id = stmt.columnText(at: 0),
-                  let root = stmt.columnText(at: 1),
-                  let relative = stmt.columnText(at: 2),
-                  let original = stmt.columnText(at: 3),
-                  let baseline = stmt.columnText(at: 5),
-                  let observed = stmt.columnText(at: 6),
-                  let timestamp = stmt.columnDouble(at: 7) {
-                result.append(TrashedLocalChange(
-                    id: id, localRootPath: root, relativePath: relative,
-                    originalPath: original, trashPath: stmt.columnText(at: 4),
-                    baselineSHA256: baseline, observedSHA256: observed,
-                    trashedAt: Date(timeIntervalSince1970: timestamp)))
-            }
-            return result
-        }
-    }
 }

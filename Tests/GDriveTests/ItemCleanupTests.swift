@@ -50,6 +50,30 @@ struct ItemCleanupTests {
         let rootItemID: Int64
     }
 
+    private struct StoredLocalConflict {
+        let rootID: Int64
+        let originalPath: String
+        let storedPath: String
+    }
+
+    private func storedLocalConflicts(_ store: StateStore) async throws -> [StoredLocalConflict] {
+        try await store.read { conn in
+            let stmt = try conn.prepare("""
+                SELECT root_id, original_path, stored_path
+                FROM local_conflicts ORDER BY original_path;
+                """)
+            defer { stmt.reset() }
+            var result: [StoredLocalConflict] = []
+            while try stmt.step(), let rootID = stmt.columnInt64(at: 0),
+                  let original = stmt.columnText(at: 1),
+                  let stored = stmt.columnText(at: 2) {
+                result.append(.init(
+                    rootID: rootID, originalPath: original, storedPath: stored))
+            }
+            return result
+        }
+    }
+
     private func fixture() async throws -> Fixture {
         context.value.withLock { $0 = CleanupRequestState() }
         let directory = FileManager.default.temporaryDirectory
@@ -317,17 +341,14 @@ struct ItemCleanupTests {
         #expect(try await fixture.engine.listConflicts(localPath: fixture.localRoot.path).isEmpty)
     }
 
-    @Test("Remote directory deletion records modified files at their Trash paths")
-    func remoteToLocalDirectoryRecordsModifiedFiles() async throws {
+    @Test("Remote directory deletion preserves changed and new local files")
+    func remoteToLocalDirectoryPreservesLocalFiles() async throws {
         let fixture = try await fixture()
-        var trashedDirectory: URL?
-        defer {
-            if let trashedDirectory { try? FileManager.default.removeItem(at: trashedDirectory) }
-            try? FileManager.default.removeItem(at: fixture.directory)
-        }
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let directory = fixture.localRoot.appendingPathComponent("removed")
         let modified = directory.appendingPathComponent("modified.txt")
         let unchanged = directory.appendingPathComponent("unchanged.txt")
+        let newFile = directory.appendingPathComponent("new.txt")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let directoryIdentity = try #require(try LocalDirectoryIdentity.read(at: directory))
         let baselineModified = Data("old".utf8)
@@ -335,6 +356,7 @@ struct ItemCleanupTests {
         let baselineUnchanged = Data("same".utf8)
         try observedModified.write(to: modified)
         try baselineUnchanged.write(to: unchanged)
+        try Data("new local file".utf8).write(to: newFile)
         let directoryID = try await fixture.store.write { conn in
             let directoryStmt = try conn.prepare(
                 """
@@ -379,17 +401,125 @@ struct ItemCleanupTests {
             taskRegistry: ItemTaskRegistry())
 
         #expect(!FileManager.default.fileExists(atPath: directory.path))
-        let changes = try await fixture.engine.listTrashedLocalChanges(
-            localPath: fixture.localRoot.path)
-        let change = try #require(changes.first)
-        #expect(changes.count == 1)
-        #expect(change.relativePath == "removed/modified.txt")
-        #expect(change.originalPath == modified.path)
-        #expect(change.baselineSHA256 == SyncEngine.computeSha256(of: baselineModified))
-        #expect(change.observedSHA256 == SyncEngine.computeSha256(of: observedModified))
-        let trashPath = try #require(change.trashPath)
-        #expect(try Data(contentsOf: URL(fileURLWithPath: trashPath)) == observedModified)
-        trashedDirectory = URL(fileURLWithPath: trashPath).deletingLastPathComponent()
+        let changes = try await storedLocalConflicts(fixture.store)
+        #expect(changes.count == 2)
+        let byPath = Dictionary(uniqueKeysWithValues: changes.map { ($0.originalPath, $0) })
+        let modifiedCopy = try #require(byPath[modified.path])
+        let newCopy = try #require(byPath[newFile.path])
+        #expect(modifiedCopy.rootID == fixture.rootID)
+        #expect(URL(fileURLWithPath: modifiedCopy.storedPath)
+            .lastPathComponent.hasSuffix("-modified.txt"))
+        #expect(try Data(contentsOf: URL(fileURLWithPath: modifiedCopy.storedPath)) == observedModified)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: newCopy.storedPath)) == Data("new local file".utf8))
+        #expect(byPath[unchanged.path] == nil)
+    }
+
+    @Test("A failed file move does not block directory cleanup")
+    func failedLocalConflictMoveIsSkipped() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let directory = fixture.localRoot.appendingPathComponent("removed")
+        let movable = directory.appendingPathComponent("movable.txt")
+        let locked = directory.appendingPathComponent("locked")
+        let blocked = locked.appendingPathComponent("blocked.txt")
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try Data("movable".utf8).write(to: movable)
+        try Data("blocked".utf8).write(to: blocked)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o555], ofItemAtPath: locked.path)
+        defer { try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: locked.path) }
+        let identity = try #require(try LocalDirectoryIdentity.read(at: directory))
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status, phase,
+                    dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'removed', 'directory', 'remote-removed', ?, ?, 'present',
+                    'trashed', 'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            stmt.bindInt64(identity.device, at: 3)
+            stmt.bindInt64(identity.inode, at: 4)
+            _ = try stmt.step()
+            return conn.lastInsertRowId
+        }
+
+        try await fixture.engine.cleanupRemoteDeletionToLocal(
+            itemID: itemID,
+            expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+            taskRegistry: ItemTaskRegistry())
+
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        let saved = try await storedLocalConflicts(fixture.store)
+        #expect(saved.count == 1)
+        #expect(saved.first?.originalPath == movable.path)
+        #expect(try Data(contentsOf: URL(fileURLWithPath: saved[0].storedPath)) == Data("movable".utf8))
+    }
+
+    @Test("A failed conflict batch leaves moved files available for manual recovery")
+    func localConflictBatchFailure() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let directory = fixture.localRoot.appendingPathComponent("removed")
+        let first = directory.appendingPathComponent("first.txt")
+        let second = directory.appendingPathComponent("second.txt")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Data("first".utf8).write(to: first)
+        try Data("second".utf8).write(to: second)
+        let identity = try #require(try LocalDirectoryIdentity.read(at: directory))
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_status, remote_status, phase,
+                    dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'removed', 'directory', 'remote-removed', ?, ?, 'present',
+                    'trashed', 'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            stmt.bindInt64(identity.device, at: 3)
+            stmt.bindInt64(identity.inode, at: 4)
+            _ = try stmt.step()
+            let id = conn.lastInsertRowId
+            try conn.execute("""
+                CREATE TRIGGER fail_conflict_commit BEFORE INSERT ON local_conflicts
+                WHEN (SELECT COUNT(*) FROM local_conflicts) > 0
+                BEGIN SELECT RAISE(ABORT, 'injected conflict commit failure'); END;
+                """)
+            return id
+        }
+
+        await #expect(throws: Error.self) {
+            try await fixture.engine.cleanupRemoteDeletionToLocal(
+                itemID: itemID,
+                expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+                taskRegistry: ItemTaskRegistry())
+        }
+        #expect(FileManager.default.fileExists(atPath: directory.path))
+        #expect(!FileManager.default.fileExists(atPath: first.path))
+        #expect(!FileManager.default.fileExists(atPath: second.path))
+        #expect(try await storedLocalConflicts(fixture.store).isEmpty)
+        let parentRemoved = fixture.directory.appendingPathComponent("parent_removed")
+            .appendingPathComponent(String(fixture.rootID))
+        let storedFiles = try FileManager.default.contentsOfDirectory(
+            at: parentRemoved, includingPropertiesForKeys: nil)
+        #expect(storedFiles.count == 2)
+        for (name, expected) in [("first.txt", "first"), ("second.txt", "second")] {
+            let stored = try #require(storedFiles.first {
+                $0.lastPathComponent.hasSuffix("-\(name)")
+            })
+            #expect(try Data(contentsOf: stored) == Data(expected.utf8))
+        }
+        try await fixture.store.write { try $0.execute("DROP TRIGGER fail_conflict_commit;") }
+
+        #expect(try await fixture.engine.recoverPendingItemCleanups(
+            rootID: fixture.rootID, taskRegistry: ItemTaskRegistry()) == 1)
+        #expect(!FileManager.default.fileExists(atPath: directory.path))
+        #expect(try await storedLocalConflicts(fixture.store).isEmpty)
+        #expect(try FileManager.default.contentsOfDirectory(
+            at: parentRemoved, includingPropertiesForKeys: nil).count == 2)
     }
 
     @Test("A child named like the sync root does not trash the sync root")

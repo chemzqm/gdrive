@@ -62,7 +62,7 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
   * `remote_directory_scans`：目录补列任务、扫描身份和分页进度。
   * `sync_conflicts`：等待调用方明确选择版本的内容冲突。
   * `sync_issues`：条目级失败的结构化记录；同一根、条目和阶段重复失败时更新诊断并累计次数。
-  * `trashed_local_changes`：远端目录删除时随目录移入废纸篓的本地修改记录。
+  * `local_conflicts`：远端目录删除时保管的本地新增或已修改文件及其恢复路径。
 * **`SQLiteConnection.swift`**：
   * 封装底层的 SQLite3 C-API，全生命周期管理编译语句缓存（Prepared Statements），
     杜绝重复解析 SQL 语法开销。
@@ -277,18 +277,22 @@ Reconciler 和持久化 cleanup 语义清理旧远端对象；旧行删除后才
     若移走的是替换文件，则以独占 rename 恢复原路径，再执行同一冲突回执。原路径被其他文件占用时，
     记录错误日志、保留废纸篓中的文件并阻断该 item 的删除，不覆盖新文件。
     废纸篓中文件的 SHA-256 读取失败时也记录错误日志并阻断该 item 的删除。
-    远端目录删除扩散到本地时，即使目录非空也直接将整个目录移入废纸篓。
-    移入前按 SHA-256 找出相对 SQLite 基线已修改的文件，并把原相对路径、基线 SHA-256、删除前
-    SHA-256 和删除时间写入独立的 `trashed_local_changes`。调用方通过
-    `listTrashedLocalChanges(localPath:)` 查询这些记录；记录不依赖随后删除的 `items` 行。
-    `FileManager.trashItem(at:resultingItemURL:)` 成功后，以返回的实际废纸篓目录路径和文件在原目录内的
-    相对路径生成每个文件的 `trash_path` 并回填。记录先以 pending 状态写入，trash 成功并回填路径后
-    改为 committed，避免文件已经移走却完全没有数据库记录。两种删除扩散都先在 `operations` 提交
+    远端目录删除扩散到本地时，先写删除 intent，并保持本地目录在原路径。
+    使用 DirectoryScanner 重新遍历该目录；无基线的新文件以及 SHA-256 相对基线已变化的文件，
+    并发移到与配置的 conflicts 目录同级的 `parent_removed/<root_id>/`，文件名加 UUID。
+    全部移动任务结束后，用同一 SQLite 事务将成功移动的文件写入 `local_conflicts`；
+    若部分移动失败，只记录日志；成功移动的文件入库，失败的文件随剩余目录进入废纸篓。
+    记录独立于随后删除的 items 子树，
+    只保存 `root_id`、原文件全路径、保管文件全路径和记录时间；后续恢复成功时删除对应行。
+    无法读取或计算 SHA-256 的文件按约定跳过，
+    随剩余目录进入废纸篓。移动成功后、数据库提交前若进程终止，文件仍在 `parent_removed`，
+    但没有恢复记录，需要用户手动查找。
+    完成文件保管后将剩余目录移入系统废纸篓。两种删除扩散都先在 `operations` 提交
     `trashRemote` 或 `deleteLocal` intent，再执行外部 trash，最后在一个 SQLite 事务中删除 item 子树
     和全部关联行；intent 随 item 级联删除。外部操作后数据库提交失败时，下轮同步在 Changes、扫描和
-    冲突刷新之前重放 intent。远端 trash 可幂等重试；本地原路径不存在视为已经完成，若同路径出现不同
-    inode、元数据或 SHA-256 的新文件则停止恢复。Trash 路径回填失败时，最终事务仍保留 committed、
-    `trash_path` 为空的修改记录。本地删除扩散到远端时直接调用 Google Drive trash，不等待条件元数据
+    冲突刷新之前重放 intent。远端 trash 可幂等重试；本地目录暂存路径存在时继续保管文件并完成清理，
+    原路径与暂存路径都不存在才视为已移走。暂存路径不存在而原路径出现不同 inode 的新目录时停止恢复。
+    本地删除扩散到远端时直接调用 Google Drive trash，不等待条件元数据
     PATCH 契约；若并发远端修改或新增内容随目录一起被移入垃圾桶，用户从 Google Drive 垃圾桶恢复。
   * 新增大文件的扫描哈希与稳定输入哈希均使用 1 MiB 固定缓冲，正文通过 8 MiB resumable 分块上传；不会构造与文件大小相等的 `Data`。初始化与增量的内存边界见 [A17 验收记录](a17-validation.md)。
   * 单个已枚举文件在哈希前消失或读取失败时，只将该项计入失败并保留既有数据库状态；
