@@ -36,7 +36,12 @@ enum LocalDeletionSafety {
         try trash(url, &trashURL)
         guard let trashURL else { return .trashedWithoutURL }
         let movedURL = trashURL as URL
-        let moved = try StableLocalFileDigest.capture(at: movedURL)
+        let moved: StableLocalFileDigest
+        do {
+            moved = try StableLocalFileDigest.capture(at: movedURL)
+        } catch {
+            return .restoreFailed(trashURL: movedURL, reason: "Unable to hash trashed file: \(error)")
+        }
         if moved.sha256Hex.caseInsensitiveCompare(expectedSHA256) == .orderedSame {
             return .trashed
         }

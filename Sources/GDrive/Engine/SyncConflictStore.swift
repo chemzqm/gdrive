@@ -482,7 +482,7 @@ extension SyncEngine {
         return true
     }
 
-    private func resolveLocalDeletion(
+    private func resolveLocalConflict(
         _ record: SyncConflictStore.Record, storedURL: URL?
     ) async throws {
         if record.conflict.remoteStatus == .present {
@@ -599,13 +599,8 @@ extension SyncEngine {
             try await resolveRemoteConflict(
                 record, localURL: localURL, storedURL: storedURL)
         case .local:
-            guard try LocalFileVersion.read(at: localURL) != nil else {
-                try await resolveLocalDeletion(record, storedURL: storedURL)
-                return
-            }
-            // Existing remote bodies cannot be overwritten safely yet. Keep the conflict evidence
-            // and remote state intact so the caller can still select the remote version.
-            throw DriveError.unsafeOverwrite(fileId: conflict.remoteFileId)
+            _ = try LocalFileVersion.read(at: localURL)
+            try await resolveLocalConflict(record, storedURL: storedURL)
         }
     }
 }

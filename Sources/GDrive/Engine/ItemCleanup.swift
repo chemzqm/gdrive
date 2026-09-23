@@ -288,7 +288,7 @@ extension SyncEngine {
                             return .localConflict(observed)
                         case .restoreFailed(let trashURL, let reason):
                             self.logger.error(
-                                "Unable to restore changed local file from \(trashURL.path) to \(plan.localURL.path): \(reason)")
+                                "Unable to verify or restore trashed local file from \(trashURL.path) to \(plan.localURL.path): \(reason)")
                             return .restoreFailed
                         case .missingEvidence:
                             throw SyncEngineError.general(
