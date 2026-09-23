@@ -138,8 +138,10 @@ private struct ItemCleanupPlan: Sendable {
     let remoteRootID: String
     let localRootPath: String
     let localURL: URL
+    let relativePath: String
     let entryKind: String
     let remoteID: String?
+    let remoteStatus: String
     let localDevice: Int64?
     let localInode: Int64?
     let localMtime: Int64?
@@ -148,6 +150,12 @@ private struct ItemCleanupPlan: Sendable {
     let generations: ItemCleanupGenerations
     let nodes: [Node]
     let conflictPaths: [URL]
+}
+
+private enum CleanupPrimaryResult {
+    case completed
+    case localConflict(StableLocalFileDigest)
+    case restoreFailed
 }
 
 private struct PendingTrashedLocalChange: Sendable {
@@ -160,25 +168,27 @@ private struct PendingTrashedLocalChange: Sendable {
 }
 
 extension SyncEngine {
+    @discardableResult
     func cleanupLocalDeletionToRemote(
         itemID: Int64,
         expected: ItemCleanupGenerations,
         taskRegistry: ItemTaskRegistry
-    ) async throws {
+    ) async throws -> Bool {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
-        try await withRootSyncLock(localPath: initial.localRootPath) {
+        return try await withRootSyncLock(localPath: initial.localRootPath) {
             try await self.cleanupLocalDeletionToRemoteUnlocked(
                 initial: initial, expected: expected, taskRegistry: taskRegistry)
         }
     }
 
+    @discardableResult
     func cleanupLocalDeletionToRemoteUnlocked(
         itemID: Int64,
         expected: ItemCleanupGenerations,
         taskRegistry: ItemTaskRegistry
-    ) async throws {
+    ) async throws -> Bool {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
-        try await cleanupLocalDeletionToRemoteUnlocked(
+        return try await cleanupLocalDeletionToRemoteUnlocked(
             initial: initial, expected: expected, taskRegistry: taskRegistry)
     }
 
@@ -186,7 +196,7 @@ extension SyncEngine {
         initial: ItemCleanupPlan,
         expected: ItemCleanupGenerations,
         taskRegistry: ItemTaskRegistry
-    ) async throws {
+    ) async throws -> Bool {
         try await executeCleanup(
             initial: initial, expected: expected, operationType: "trashRemote",
             taskRegistry: taskRegistry,
@@ -194,36 +204,48 @@ extension SyncEngine {
                 if let remoteID = plan.remoteID {
                     try await self.client.trash(remoteId: remoteID)
                 }
+                return .completed
             })
     }
 
+    @discardableResult
     func cleanupRemoteDeletionToLocal(
         itemID: Int64,
         expected: ItemCleanupGenerations,
-        taskRegistry: ItemTaskRegistry
-    ) async throws {
+        taskRegistry: ItemTaskRegistry,
+        trash: @escaping @Sendable (URL, AutoreleasingUnsafeMutablePointer<NSURL?>?) throws -> Void = {
+            try FileManager.default.trashItem(at: $0, resultingItemURL: $1)
+        }
+    ) async throws -> Bool {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
-        try await withRootSyncLock(localPath: initial.localRootPath) {
+        return try await withRootSyncLock(localPath: initial.localRootPath) {
             try await self.cleanupRemoteDeletionToLocalUnlocked(
-                initial: initial, expected: expected, taskRegistry: taskRegistry)
+                initial: initial, expected: expected, taskRegistry: taskRegistry, trash: trash)
         }
     }
 
+    @discardableResult
     func cleanupRemoteDeletionToLocalUnlocked(
         itemID: Int64,
         expected: ItemCleanupGenerations,
-        taskRegistry: ItemTaskRegistry
-    ) async throws {
+        taskRegistry: ItemTaskRegistry,
+        trash: @escaping @Sendable (URL, AutoreleasingUnsafeMutablePointer<NSURL?>?) throws -> Void = {
+            try FileManager.default.trashItem(at: $0, resultingItemURL: $1)
+        }
+    ) async throws -> Bool {
         let initial = try await makeCleanupPlan(itemID: itemID, expected: expected)
-        try await cleanupRemoteDeletionToLocalUnlocked(
-            initial: initial, expected: expected, taskRegistry: taskRegistry)
+        return try await cleanupRemoteDeletionToLocalUnlocked(
+            initial: initial, expected: expected, taskRegistry: taskRegistry, trash: trash)
     }
 
     private func cleanupRemoteDeletionToLocalUnlocked(
         initial: ItemCleanupPlan,
         expected: ItemCleanupGenerations,
-        taskRegistry: ItemTaskRegistry
-    ) async throws {
+        taskRegistry: ItemTaskRegistry,
+        trash: @escaping @Sendable (URL, AutoreleasingUnsafeMutablePointer<NSURL?>?) throws -> Void = {
+            try FileManager.default.trashItem(at: $0, resultingItemURL: $1)
+        }
+    ) async throws -> Bool {
         try await executeCleanup(
             initial: initial, expected: expected, operationType: "deleteLocal",
             taskRegistry: taskRegistry,
@@ -246,16 +268,31 @@ extension SyncEngine {
                                 changes, batchID: batchID,
                                 trashDirectory: trashURL.map { $0 as URL })
                         }
+                        return .completed
                     } else {
-                        let removed = try LocalDeletionSafety.trashFileIfUnchanged(
+                        let result = try LocalDeletionSafety.trashFileIfUnchanged(
                             at: plan.localURL,
                             expectedDevice: plan.localDevice,
                             expectedInode: plan.localInode,
                             expectedSize: plan.localSize,
-                            expectedSHA256: plan.localSHA256)
-                        guard removed else {
+                            expectedSHA256: plan.localSHA256,
+                            trash: trash)
+                        switch result {
+                        case .missing, .trashed:
+                            return .completed
+                        case .trashedWithoutURL:
+                            self.logger.error(
+                                "Trash did not return the moved file path [\(plan.localURL.path)]; SHA-256 cannot be checked")
+                            return .completed
+                        case .changed(let observed):
+                            return .localConflict(observed)
+                        case .restoreFailed(let trashURL, let reason):
+                            self.logger.error(
+                                "Unable to restore changed local file from \(trashURL.path) to \(plan.localURL.path): \(reason)")
+                            return .restoreFailed
+                        case .missingEvidence:
                             throw SyncEngineError.general(
-                                "The local item changed before cleanup: \(plan.localURL.path)")
+                                "The local item lacks deletion evidence: \(plan.localURL.path)")
                         }
                     }
                 })
@@ -266,8 +303,8 @@ extension SyncEngine {
         expected: ItemCleanupGenerations,
         operationType: String,
         taskRegistry: ItemTaskRegistry,
-        removePrimary: @Sendable (ItemCleanupPlan, String) async throws -> Void
-    ) async throws {
+        removePrimary: @Sendable (ItemCleanupPlan, String) async throws -> CleanupPrimaryResult
+    ) async throws -> Bool {
         let ids = Set(initial.nodes.map(\.id))
         await taskRegistry.blockCancelAndDrain(itemIDs: ids)
         do {
@@ -279,12 +316,25 @@ extension SyncEngine {
             ) else {
                 try await discardCleanupIntent(operationID: intent.operationID)
                 await taskRegistry.unblock(itemIDs: ids)
-                return
+                return false
             }
-            try await removePrimary(plan, intent.operationID)
+            let result = try await removePrimary(plan, intent.operationID)
+            if case .localConflict(let observed) = result {
+                try await commitChangedLocalConflict(
+                    plan: plan, operationID: intent.operationID, observed: observed)
+                await taskRegistry.unblock(itemIDs: ids)
+                return false
+            }
+            if case .restoreFailed = result {
+                try await blockCleanupAfterFailedRestore(
+                    plan: plan, operationID: intent.operationID)
+                await taskRegistry.unblock(itemIDs: ids)
+                return false
+            }
             try removeCleanupArtifacts(plan)
             try await deleteCleanupRows(plan, operationID: intent.operationID)
             await taskRegistry.unblock(itemIDs: ids)
+            return true
         } catch {
             await taskRegistry.unblock(itemIDs: ids)
             throw error
@@ -432,6 +482,117 @@ extension SyncEngine {
         }
     }
 
+    private func commitChangedLocalConflict(
+        plan: ItemCleanupPlan, operationID: String, observed: StableLocalFileDigest
+    ) async throws {
+        guard let remoteID = plan.remoteID, let oldSHA = plan.localSHA256,
+              let oldSize = plan.localSize else {
+            throw SyncEngineError.general(
+                "The changed file lacks remote deletion evidence: \(plan.localURL.path)")
+        }
+        try observed.version.validate(at: plan.localURL)
+        try await store.batchWrite { conn in
+            let now = Date().timeIntervalSince1970
+            let update = try conn.cachedStatement("""
+                UPDATE items SET local_device = ?, local_inode = ?, local_mtime = ?,
+                    local_ctime = ?, local_size = ?, local_sha256 = ?,
+                    local_generation = local_generation + 1, local_status = 'present',
+                    phase = 'blocked', dirty_generation = 0, updated_at = ?
+                WHERE item_id = ? AND root_id = ? AND remote_file_id = ?
+                    AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                """)
+            update.bindInt64(observed.version.device, at: 1)
+            update.bindInt64(observed.version.inode, at: 2)
+            update.bindInt64(observed.version.mtime, at: 3)
+            update.bindInt64(observed.version.ctime, at: 4)
+            update.bindInt64(observed.fileSize, at: 5)
+            update.bindText(observed.sha256Hex, at: 6)
+            update.bindDouble(now, at: 7)
+            update.bindInt64(plan.itemID, at: 8)
+            update.bindInt64(plan.rootID, at: 9)
+            update.bindText(remoteID, at: 10)
+            update.bindInt64(plan.generations.local, at: 11)
+            update.bindInt64(plan.generations.remote, at: 12)
+            update.bindInt64(plan.generations.dirty, at: 13)
+            _ = try update.step()
+            update.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The changed file cleanup plan is stale: \(plan.relativePath)")
+            }
+
+            let conflict = try conn.cachedStatement("""
+                INSERT INTO sync_conflicts(conflict_id, root_id, item_id, remote_file_id,
+                    relative_path, local_path, conflict_path, remote_sha256, remote_size,
+                    remote_version, remote_status, created_at, updated_at)
+                SELECT ?, root_id, item_id, remote_file_id, ?, ?, NULL, ?, ?,
+                    remote_version, ?, ?, ? FROM items WHERE item_id = ?
+                ON CONFLICT(root_id, remote_file_id) DO UPDATE SET
+                    relative_path = excluded.relative_path, local_path = excluded.local_path,
+                    conflict_path = NULL, remote_sha256 = excluded.remote_sha256,
+                    remote_size = excluded.remote_size, remote_version = excluded.remote_version,
+                    remote_status = excluded.remote_status,
+                    revision = sync_conflicts.revision + 1, updated_at = excluded.updated_at;
+                """)
+            conflict.bindText("sync-\(plan.rootID)-\(plan.itemID)", at: 1)
+            conflict.bindText(plan.relativePath, at: 2)
+            conflict.bindText(plan.localURL.path, at: 3)
+            conflict.bindText(oldSHA, at: 4)
+            conflict.bindInt64(oldSize, at: 5)
+            conflict.bindText(plan.remoteStatus == "trashed" ? "trashed" : "removed", at: 6)
+            conflict.bindDouble(now, at: 7)
+            conflict.bindDouble(now, at: 8)
+            conflict.bindInt64(plan.itemID, at: 9)
+            _ = try conflict.step()
+            conflict.reset()
+
+            let intent = try conn.cachedStatement(
+                "DELETE FROM operations WHERE operation_id = ? AND item_id = ?;")
+            intent.bindText(operationID, at: 1)
+            intent.bindInt64(plan.itemID, at: 2)
+            _ = try intent.step()
+            intent.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The changed file cleanup intent changed: \(plan.relativePath)")
+            }
+        }
+    }
+
+    private func blockCleanupAfterFailedRestore(
+        plan: ItemCleanupPlan, operationID: String
+    ) async throws {
+        try await store.batchWrite { conn in
+            let update = try conn.cachedStatement("""
+                UPDATE items SET phase = 'blocked', dirty_generation = 0, updated_at = ?
+                WHERE item_id = ? AND root_id = ?
+                    AND local_generation = ? AND remote_generation = ? AND dirty_generation = ?;
+                """)
+            update.bindDouble(Date().timeIntervalSince1970, at: 1)
+            update.bindInt64(plan.itemID, at: 2)
+            update.bindInt64(plan.rootID, at: 3)
+            update.bindInt64(plan.generations.local, at: 4)
+            update.bindInt64(plan.generations.remote, at: 5)
+            update.bindInt64(plan.generations.dirty, at: 6)
+            _ = try update.step()
+            update.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The failed local restore cleanup plan is stale: \(plan.relativePath)")
+            }
+            let intent = try conn.cachedStatement(
+                "DELETE FROM operations WHERE operation_id = ? AND item_id = ?;")
+            intent.bindText(operationID, at: 1)
+            intent.bindInt64(plan.itemID, at: 2)
+            _ = try intent.step()
+            intent.reset()
+            guard conn.changes == 1 else {
+                throw SyncEngineError.general(
+                    "The failed local restore cleanup intent changed: \(plan.relativePath)")
+            }
+        }
+    }
+
     private func makeCleanupPlan(
         itemID: Int64, expected: ItemCleanupGenerations
     ) async throws -> ItemCleanupPlan {
@@ -441,7 +602,7 @@ extension SyncEngine {
                 SELECT i.root_id, r.remote_root_id, r.local_root_path, i.entry_kind,
                     i.remote_file_id, i.local_device, i.local_inode, i.local_mtime,
                     i.local_size, i.local_sha256, i.local_generation,
-                    i.remote_generation, i.dirty_generation
+                    i.remote_generation, i.dirty_generation, i.remote_status
                 FROM items i JOIN roots r ON r.root_id = i.root_id
                 WHERE i.item_id = ? AND r.is_active = 1;
                 """)
@@ -496,7 +657,9 @@ extension SyncEngine {
             return ItemCleanupPlan(
                 rootID: rootID, itemID: itemID, remoteRootID: remoteRootID,
                 localRootPath: localRootPath,
-                localURL: localURL, entryKind: entryKind, remoteID: item.columnText(at: 4),
+                localURL: localURL, relativePath: relativePath,
+                entryKind: entryKind, remoteID: item.columnText(at: 4),
+                remoteStatus: item.columnText(at: 13) ?? "unknown",
                 localDevice: item.columnInt64(at: 5), localInode: item.columnInt64(at: 6),
                 localMtime: item.columnInt64(at: 7), localSize: item.columnInt64(at: 8),
                 localSHA256: item.columnText(at: 9), generations: actual, nodes: nodes,

@@ -234,6 +234,89 @@ struct ItemCleanupTests {
         #expect(remaining == 0)
     }
 
+    @Test("A file replaced during local trash becomes a resolvable remote deletion conflict")
+    func remoteToLocalReplacementBecomesConflict() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let local = fixture.localRoot.appendingPathComponent("file.txt")
+        let replacement = fixture.localRoot.appendingPathComponent("replacement.txt")
+        let trashed = fixture.directory.appendingPathComponent("trashed.txt")
+        let baseline = Data("baseline".utf8)
+        let newData = Data("replacement".utf8)
+        try baseline.write(to: local)
+        let version = try #require(try LocalFileVersion.read(at: local))
+        let oldSHA = SyncEngine.computeSha256(of: baseline)
+        let newSHA = SyncEngine.computeSha256(of: newData)
+        let itemID = try await fixture.store.write { conn in
+            let stmt = try conn.prepare("""
+                INSERT INTO items(root_id, parent_id, name, entry_kind, remote_file_id,
+                    local_device, local_inode, local_mtime, local_size, local_sha256,
+                    base_sha256, base_size, local_status, remote_status, phase,
+                    dirty_generation, created_at, updated_at)
+                VALUES (?, ?, 'file.txt', 'file', 'remote-file', ?, ?, ?, ?, ?, ?, ?,
+                    'present', 'trashed', 'ready', 1, 1, 1);
+                """)
+            stmt.bindInt64(fixture.rootID, at: 1)
+            stmt.bindInt64(fixture.rootItemID, at: 2)
+            stmt.bindInt64(version.device, at: 3)
+            stmt.bindInt64(version.inode, at: 4)
+            stmt.bindInt64(version.mtime, at: 5)
+            stmt.bindInt64(version.size, at: 6)
+            stmt.bindText(oldSHA, at: 7)
+            stmt.bindText(oldSHA, at: 8)
+            stmt.bindInt64(version.size, at: 9)
+            _ = try stmt.step()
+            return conn.lastInsertRowId
+        }
+
+        let deleted = try await fixture.engine.cleanupRemoteDeletionToLocal(
+            itemID: itemID,
+            expected: ItemCleanupGenerations(local: 0, remote: 0, dirty: 1),
+            taskRegistry: ItemTaskRegistry(),
+            trash: { url, result in
+                try newData.write(to: replacement)
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: replacement)
+                try FileManager.default.moveItem(at: url, to: trashed)
+                result?.pointee = trashed as NSURL
+            })
+
+        #expect(!deleted)
+        #expect(try Data(contentsOf: local) == newData)
+        #expect(!FileManager.default.fileExists(atPath: trashed.path))
+        let restoredVersion = try #require(try LocalFileVersion.read(at: local))
+        let conflicts = try await fixture.engine.listConflicts(localPath: fixture.localRoot.path)
+        let conflict = try #require(conflicts.first)
+        #expect(conflicts.count == 1)
+        #expect(conflict.localPath == local.path)
+        #expect(conflict.conflictPath == nil)
+        #expect(conflict.remoteSHA256 == oldSHA)
+        #expect(conflict.remoteStatus == .trashed)
+        try await fixture.store.read { conn in
+            let stmt = try conn.prepare("""
+                SELECT local_device, local_inode, local_size, local_sha256,
+                    base_sha256, phase, local_status, dirty_generation,
+                    (SELECT COUNT(*) FROM operations WHERE item_id = ?)
+                FROM items WHERE item_id = ?;
+                """)
+            stmt.bindInt64(itemID, at: 1)
+            stmt.bindInt64(itemID, at: 2)
+            #expect(try stmt.step())
+            #expect(stmt.columnInt64(at: 0) == restoredVersion.device)
+            #expect(stmt.columnInt64(at: 1) == restoredVersion.inode)
+            #expect(stmt.columnInt64(at: 2) == Int64(newData.count))
+            #expect(stmt.columnText(at: 3) == newSHA)
+            #expect(stmt.columnText(at: 4) == oldSHA)
+            #expect(stmt.columnText(at: 5) == "blocked")
+            #expect(stmt.columnText(at: 6) == "present")
+            #expect(stmt.columnInt64(at: 7) == 0)
+            #expect(stmt.columnInt64(at: 8) == 0)
+        }
+
+        try await fixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        #expect(!FileManager.default.fileExists(atPath: local.path))
+        #expect(try await fixture.engine.listConflicts(localPath: fixture.localRoot.path).isEmpty)
+    }
+
     @Test("Remote directory deletion records modified files at their Trash paths")
     func remoteToLocalDirectoryRecordsModifiedFiles() async throws {
         let fixture = try await fixture()

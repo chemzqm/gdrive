@@ -484,23 +484,23 @@ extension IncrementalSyncRun {
     }
 
     private func scheduleRemoteDeletion(_ item: DirtyRecord) async throws {
-        try await engine.cleanupLocalDeletionToRemoteUnlocked(
+        let deleted = try await engine.cleanupLocalDeletionToRemoteUnlocked(
             itemID: item.itemId,
             expected: ItemCleanupGenerations(
                 local: item.localGeneration, remote: item.remoteGeneration,
                 dirty: item.dirtyGeneration),
             taskRegistry: itemTaskRegistry)
-        actionTracker.counts.withLock { $0.deleted += 1 }
+        if deleted { actionTracker.counts.withLock { $0.deleted += 1 } }
     }
 
     private func deleteLocalFile(_ item: DirtyRecord) async throws {
-        try await engine.cleanupRemoteDeletionToLocalUnlocked(
+        let deleted = try await engine.cleanupRemoteDeletionToLocalUnlocked(
             itemID: item.itemId,
             expected: ItemCleanupGenerations(
                 local: item.localGeneration, remote: item.remoteGeneration,
                 dirty: item.dirtyGeneration),
             taskRegistry: itemTaskRegistry)
-        actionTracker.counts.withLock { $0.deleted += 1 }
+        if deleted { actionTracker.counts.withLock { $0.deleted += 1 } }
     }
 
     private func scheduleConflict(_ item: DirtyRecord) async throws {

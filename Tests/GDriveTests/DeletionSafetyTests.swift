@@ -21,8 +21,75 @@ struct DeletionSafetyTests {
         let modifiedWasDeleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
             expectedSize: expected.size, expectedSHA256: sha)
-        #expect(!modifiedWasDeleted)
+        guard case .changed = modifiedWasDeleted else {
+            Issue.record("Expected the changed file to remain in place")
+            return
+        }
         #expect(try String(contentsOf: file, encoding: .utf8) == "modified")
+    }
+
+    @Test("A replacement inserted after hashing is restored from Trash")
+    func localDeletionRestoresReplacementAfterHash() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-after-hash-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        let replacement = directory.appendingPathComponent("replacement.txt")
+        let trashed = directory.appendingPathComponent("trashed.txt")
+        try Data("baseline".utf8).write(to: file)
+        let expected = try #require(try LocalFileVersion.read(at: file))
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+
+        let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
+            at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+            expectedSize: expected.size, expectedSHA256: sha,
+            trash: { url, result in
+                try Data("replacement".utf8).write(to: replacement)
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: replacement)
+                try FileManager.default.moveItem(at: url, to: trashed)
+                result?.pointee = trashed as NSURL
+            })
+
+        guard case .changed(let observed) = deleted else {
+            Issue.record("Expected the replacement to be restored")
+            return
+        }
+        #expect(observed.sha256Hex == SyncEngine.computeSha256(of: Data("replacement".utf8)))
+        #expect(try Data(contentsOf: file) == Data("replacement".utf8))
+        #expect(!FileManager.default.fileExists(atPath: trashed.path))
+    }
+
+    @Test("Restoring a trashed replacement never overwrites a newer file")
+    func localDeletionKeepsNewArrivalWhenRestoreIsBlocked() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-delete-restore-blocked-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("document.txt")
+        let replacement = directory.appendingPathComponent("replacement.txt")
+        let trashed = directory.appendingPathComponent("trashed.txt")
+        try Data("baseline".utf8).write(to: file)
+        let expected = try #require(try LocalFileVersion.read(at: file))
+        let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
+
+        let result = try LocalDeletionSafety.trashFileIfUnchanged(
+            at: file, expectedDevice: expected.device, expectedInode: expected.inode,
+            expectedSize: expected.size, expectedSHA256: sha,
+            trash: { url, result in
+                try Data("replacement".utf8).write(to: replacement)
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: replacement)
+                try FileManager.default.moveItem(at: url, to: trashed)
+                try Data("new arrival".utf8).write(to: url)
+                result?.pointee = trashed as NSURL
+            })
+        guard case .restoreFailed(let trashURL, _) = result else {
+            Issue.record("Expected restoration to be blocked")
+            return
+        }
+        #expect(trashURL == trashed)
+        #expect(try Data(contentsOf: file) == Data("new arrival".utf8))
+        #expect(try Data(contentsOf: trashed) == Data("replacement".utf8))
     }
 
     @Test("A matching file is moved to Trash using its original path")
@@ -38,12 +105,17 @@ struct DeletionSafetyTests {
         let sha = try SyncEngine.computeFileSha256(at: file).sha256Hex
 
         var trashedURL: URL?
+        let moved = directory.appendingPathComponent("trashed.txt")
         let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
             expectedSize: expected.size, expectedSHA256: sha,
-            trash: { url, _ in trashedURL = url })
+            trash: { url, result in
+                trashedURL = url
+                try FileManager.default.moveItem(at: url, to: moved)
+                result?.pointee = moved as NSURL
+            })
 
-        #expect(deleted)
+        guard case .trashed = deleted else { Issue.record("Expected the file to be trashed"); return }
         #expect(trashedURL == file)
     }
 
@@ -85,12 +157,17 @@ struct DeletionSafetyTests {
         #expect(changed.mtime != expected.mtime)
 
         var trashedURL: URL?
+        let moved = directory.appendingPathComponent("trashed.txt")
         let deleted = try LocalDeletionSafety.trashFileIfUnchanged(
             at: file, expectedDevice: expected.device, expectedInode: expected.inode,
             expectedSize: expected.size, expectedSHA256: sha,
-            trash: { url, _ in trashedURL = url })
+            trash: { url, result in
+                trashedURL = url
+                try FileManager.default.moveItem(at: url, to: moved)
+                result?.pointee = moved as NSURL
+            })
 
-        #expect(deleted)
+        guard case .trashed = deleted else { Issue.record("Expected the file to be trashed"); return }
         #expect(trashedURL == file)
     }
 
