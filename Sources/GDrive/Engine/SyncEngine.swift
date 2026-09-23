@@ -74,7 +74,7 @@ extension SyncEngine {
         logger.info("[Sync] No baseline exists; checking local and remote directory state...")
 
         // Detect remote directories: verify existence, whether it is a directory, and whether it contains non-recycle bin subkeys
-        let remoteFile = try await validateRemoteRoot(remoteRootId: remoteFolderId)
+        _ = try await validateRemoteRoot(remoteRootId: remoteFolderId)
         // Probe only the top level; hidden entries are included, only .git directories are pruned.
         let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
         // Capture before listing so a concurrent remote creation cannot fall before the cursor.

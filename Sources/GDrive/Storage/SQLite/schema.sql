@@ -256,6 +256,8 @@ CREATE INDEX IF NOT EXISTS idx_sync_issues_root_seen
 
 -- Local files preserved outside the sync root when their remote parent is deleted.
 -- These records outlive the item subtree and root binding.
+-- conflict_id typically uses the 'parent-<UUID>' format (SyncConflictStore.parentRemovedConflictPrefix),
+-- but also accepts raw UUIDs for compatibility.
 CREATE TABLE IF NOT EXISTS local_conflicts (
     conflict_id TEXT PRIMARY KEY NOT NULL,
     root_id INTEGER NOT NULL,
@@ -265,6 +267,8 @@ CREATE TABLE IF NOT EXISTS local_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_local_conflicts_root
     ON local_conflicts(root_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_local_conflicts_original_path
+    ON local_conflicts(original_path, conflict_id);
 
 
 -- Nonunique to retain distinct item identities when local names are equivalent.

@@ -39,6 +39,33 @@ public struct SyncConflict: Sendable, Equatable {
     public let remoteStatus: RemoteStatus
 }
 
+public struct SyncConflictEntry: Sendable, Equatable {
+    public enum Kind: Sendable, Equatable {
+        case sync
+        case parentRemoved
+    }
+
+    public let id: String
+    public let kind: Kind
+    public let localFilePath: String
+    public let remoteFilePath: String?
+    public let localStagedPath: String?
+
+    public init(
+        id: String,
+        kind: Kind,
+        localFilePath: String,
+        remoteFilePath: String? = nil,
+        localStagedPath: String? = nil
+    ) {
+        self.id = id
+        self.kind = kind
+        self.localFilePath = localFilePath
+        self.remoteFilePath = remoteFilePath
+        self.localStagedPath = localStagedPath
+    }
+}
+
 public enum SyncConflictResolution: Sendable {
     case local
     case remote

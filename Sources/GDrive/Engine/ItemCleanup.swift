@@ -711,7 +711,7 @@ extension SyncEngine {
         try validateCleanupDirectoryIdentity(plan)
         try FileManager.default.createDirectory(at: parentRemoved, withIntermediateDirectories: true)
         let files = candidates.map { candidate in
-            let id = UUID().uuidString
+            let id = SyncConflictStore.newParentRemovedID()
             return PreservedLocalFile(
                 id: id, originalPath: candidate.url.path,
                 storedPath: parentRemoved.appendingPathComponent(

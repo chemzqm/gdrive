@@ -857,7 +857,7 @@ struct BootstrapRecoveryTests {
                 conflictDirectory: directory.appendingPathComponent("conflicts"))
             if failure == "publication" {
                 let conflicts = try await reopened.listConflicts(localPath: local.path)
-                #expect(conflicts == failed.conflicts)
+                #expect(conflicts.map(\.id) == failed.conflicts.map(\.id))
                 try await reopened.resolveConflict(id: conflicts[0].id, resolution: .remote)
             } else {
                 let recovered = try await reopened.sync(localPath: local.path, remoteFolderId: "root")

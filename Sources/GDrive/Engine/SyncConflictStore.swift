@@ -1,6 +1,20 @@
+import Darwin
 import Foundation
 
 enum SyncConflictStore {
+    static let parentRemovedConflictPrefix = "parent-"
+
+    static func newParentRemovedID() -> String {
+        "\(parentRemovedConflictPrefix)\(UUID().uuidString)"
+    }
+
+    struct LocalRecord: Sendable, Equatable {
+        let id: String
+        let originalPath: String
+        let storedPath: String
+        let rootPath: String?
+    }
+
     struct Record: Sendable {
         let conflict: SyncConflict
         let rootID: Int64
@@ -85,6 +99,47 @@ enum SyncConflictStore {
                 rootID: rootID, itemID: itemID, revision: revision,
                 localGeneration: localGeneration, remoteGeneration: remoteGeneration,
                 dirtyGeneration: dirtyGeneration)
+        }
+    }
+
+    static func localRecords(store: StateStore, localPath: String) async throws -> [LocalRecord] {
+        try await store.read { conn in
+            let query = try conn.cachedStatement("""
+                SELECT c.conflict_id, c.original_path, c.stored_path, r.local_root_path
+                FROM local_conflicts c LEFT JOIN roots r ON r.root_id = c.root_id
+                WHERE c.original_path >= ? AND c.original_path < ?
+                ORDER BY c.original_path, c.conflict_id;
+                """)
+            defer { query.reset() }
+            let prefix = localPath.hasSuffix("/") ? localPath : localPath + "/"
+            query.bindText(prefix, at: 1)
+            query.bindText(prefix + "\u{10FFFF}", at: 2)
+            var records: [LocalRecord] = []
+            while try query.step() {
+                guard let id = query.columnText(at: 0),
+                      let original = query.columnText(at: 1),
+                      let stored = query.columnText(at: 2) else { continue }
+                records.append(LocalRecord(
+                    id: id, originalPath: original, storedPath: stored,
+                    rootPath: query.columnText(at: 3)))
+            }
+            return records
+        }
+    }
+
+    static func localRecord(store: StateStore, id: String) async throws -> LocalRecord? {
+        try await store.read { conn in
+            let query = try conn.cachedStatement("""
+                SELECT c.original_path, c.stored_path, r.local_root_path
+                FROM local_conflicts c LEFT JOIN roots r ON r.root_id = c.root_id
+                WHERE c.conflict_id = ?;
+                """)
+            defer { query.reset() }
+            query.bindText(id, at: 1)
+            guard try query.step(), let original = query.columnText(at: 0),
+                  let stored = query.columnText(at: 1) else { return nil }
+            return LocalRecord(id: id, originalPath: original, storedPath: stored,
+                               rootPath: query.columnText(at: 2))
         }
     }
 
@@ -412,11 +467,55 @@ extension SyncEngine {
         }
     }
 
-    public func listConflicts(localPath: String) async throws -> [SyncConflict] {
-        try await SyncConflictStore.list(store: store, localPath: Self.normalizedPath(localPath))
+    private static func stagedRegularFilePath(at path: String) -> String? {
+        let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+        guard descriptor >= 0 else { return nil }
+        defer { _ = close(descriptor) }
+        var value = stat()
+        guard fstat(descriptor, &value) == 0, (value.st_mode & S_IFMT) == S_IFREG else {
+            return nil
+        }
+        return path
+    }
+
+    public func listConflicts(localPath: String) async throws -> [SyncConflictEntry] {
+        let path = Self.normalizedPath(localPath)
+        let syncConflicts = try await SyncConflictStore.list(store: store, localPath: path)
+        let localConflicts = try await SyncConflictStore.localRecords(store: store, localPath: path)
+        var result: [SyncConflictEntry] = []
+        for conflict in syncConflicts {
+            let localFile = Self.stagedRegularFilePath(at: conflict.localPath)
+            let remoteFile: String? = conflict.remoteStatus == .present ? conflict.conflictPath : nil
+            result.append(SyncConflictEntry(
+                id: conflict.id, kind: .sync, localFilePath: conflict.localPath,
+                remoteFilePath: remoteFile,
+                localStagedPath: localFile))
+        }
+        for conflict in localConflicts {
+            guard let localFile = Self.stagedRegularFilePath(at: conflict.storedPath) else {
+                try await removeLocalStoredConflict(conflict, allowMissing: true)
+                continue
+            }
+            result.append(SyncConflictEntry(
+                id: conflict.id, kind: .parentRemoved, localFilePath: conflict.originalPath,
+                localStagedPath: localFile))
+        }
+        return result.sorted {
+            ($0.localFilePath, $0.id) < ($1.localFilePath, $1.id)
+        }
     }
 
     public func resolveConflict(id: String, resolution: SyncConflictResolution) async throws {
+        if let local = try await SyncConflictStore.localRecord(store: store, id: id) {
+            try await withRootSyncLock(localPath: local.rootPath ?? local.originalPath) {
+                guard let current = try await SyncConflictStore.localRecord(store: self.store, id: id),
+                      current == local else {
+                    throw SyncEngineError.general("Local conflict was not found: \(id)")
+                }
+                try await self.resolveLocalStoredConflict(current, resolution: resolution)
+            }
+            return
+        }
         let localRoot = try await store.read { conn -> String in
             let query = try conn.cachedStatement("""
                 SELECT r.local_root_path
@@ -435,6 +534,78 @@ extension SyncEngine {
                 throw SyncEngineError.general("Sync conflict was not found: \(id)")
             }
             try await self.resolveInitialConflict(current, resolution: resolution)
+        }
+    }
+
+    private func resolveLocalStoredConflict(
+        _ record: SyncConflictStore.LocalRecord, resolution: SyncConflictResolution
+    ) async throws {
+        let storedURL = URL(fileURLWithPath: record.storedPath)
+        let localURL = URL(fileURLWithPath: record.originalPath)
+        switch resolution {
+        case .local:
+            if let rootPath = record.rootPath,
+               !RootSyncCoordinator.contains(localURL.path, in: rootPath) {
+                throw SyncEngineError.general(
+                    "The local conflict path is outside its sync root: \(localURL.path)")
+            }
+            let stored = try StableLocalFileDigest.capture(at: storedURL)
+            try FileManager.default.createDirectory(
+                at: localURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let existing: LocalFileVersion?
+            do {
+                existing = try LocalFileVersion.read(at: localURL)
+            } catch let error as CocoaError where error.code == .fileReadUnsupportedScheme {
+                throw SyncEngineError.localFileModified(path: localURL.path)
+            }
+            if existing == nil {
+                do {
+                    try FileManager.default.copyItem(at: storedURL, to: localURL)
+                } catch let error as CocoaError where error.code == .fileWriteFileExists {
+                    throw SyncEngineError.localFileModified(path: localURL.path)
+                }
+            }
+            let restored: StableLocalFileDigest
+            do {
+                restored = try StableLocalFileDigest.capture(at: localURL)
+            } catch let error as CocoaError where error.code == .fileReadUnsupportedScheme {
+                throw SyncEngineError.localFileModified(path: localURL.path)
+            }
+            guard restored.sha256Hex == stored.sha256Hex,
+                  restored.fileSize == stored.fileSize else {
+                throw SyncEngineError.localFileModified(path: localURL.path)
+            }
+            try stored.version.validate(at: storedURL)
+            try await removeLocalStoredConflict(record)
+            do {
+                try FileManager.default.removeItem(at: storedURL)
+            } catch {
+                logger.warning("Unable to remove restored local conflict copy [\(storedURL.path)]: \(error)")
+            }
+        case .remote:
+            if try LocalFileVersion.read(at: storedURL) != nil {
+                try FileManager.default.trashItem(at: storedURL, resultingItemURL: nil)
+            }
+            try await removeLocalStoredConflict(record)
+        }
+    }
+
+    private func removeLocalStoredConflict(
+        _ record: SyncConflictStore.LocalRecord, allowMissing: Bool = false
+    ) async throws {
+        try await store.write { conn in
+            let remove = try conn.cachedStatement("""
+                DELETE FROM local_conflicts
+                WHERE conflict_id = ? AND original_path = ? AND stored_path = ?;
+                """)
+            defer { remove.reset() }
+            remove.bindText(record.id, at: 1)
+            remove.bindText(record.originalPath, at: 2)
+            remove.bindText(record.storedPath, at: 3)
+            _ = try remove.step()
+            guard conn.changes == 1 || allowMissing else {
+                throw SyncEngineError.general("Local conflict changed while resolving: \(record.id)")
+            }
         }
     }
 

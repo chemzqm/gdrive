@@ -311,10 +311,10 @@ struct ItemCleanupTests {
         let conflicts = try await fixture.engine.listConflicts(localPath: fixture.localRoot.path)
         let conflict = try #require(conflicts.first)
         #expect(conflicts.count == 1)
-        #expect(conflict.localPath == local.path)
-        #expect(conflict.conflictPath == nil)
-        #expect(conflict.remoteSHA256 == oldSHA)
-        #expect(conflict.remoteStatus == .trashed)
+        #expect(conflict.kind == .sync)
+        #expect(conflict.localFilePath == local.path)
+        #expect(conflict.localStagedPath == local.path)
+        #expect(conflict.remoteFilePath == nil)
         try await fixture.store.read { conn in
             let stmt = try conn.prepare("""
                 SELECT local_device, local_inode, local_size, local_sha256,
@@ -412,6 +412,55 @@ struct ItemCleanupTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: modifiedCopy.storedPath)) == observedModified)
         #expect(try Data(contentsOf: URL(fileURLWithPath: newCopy.storedPath)) == Data("new local file".utf8))
         #expect(byPath[unchanged.path] == nil)
+
+        let conflicts = try await fixture.engine.listConflicts(localPath: fixture.localRoot.path)
+        #expect(conflicts.count == 2)
+        let listed = Dictionary(uniqueKeysWithValues: conflicts.map { ($0.localFilePath, $0) })
+        let modifiedConflict = try #require(listed[modified.path])
+        let newConflict = try #require(listed[newFile.path])
+        #expect(modifiedConflict.id.hasPrefix("parent-"))
+        #expect(modifiedConflict.kind == .parentRemoved)
+        #expect(modifiedConflict.remoteFilePath == nil)
+        #expect(modifiedConflict.localStagedPath == modifiedCopy.storedPath)
+        #expect(newConflict.localStagedPath == newCopy.storedPath)
+
+        try FileManager.default.createDirectory(at: modified.deletingLastPathComponent(),
+                                                withIntermediateDirectories: true)
+        try Data("occupied".utf8).write(to: modified)
+        await #expect(throws: Error.self) {
+            try await fixture.engine.resolveConflict(id: modifiedConflict.id, resolution: .local)
+        }
+        #expect(try Data(contentsOf: modified) == Data("occupied".utf8))
+        #expect(try await fixture.engine.listConflicts(localPath: fixture.localRoot.path).count == 2)
+        try FileManager.default.removeItem(at: modified)
+        try await fixture.store.write { conn in
+            let remove = try conn.prepare("DELETE FROM roots WHERE root_id = ?;")
+            defer { remove.reset() }
+            remove.bindInt64(fixture.rootID, at: 1)
+            _ = try remove.step()
+        }
+        #expect(try await fixture.engine.listConflicts(localPath: fixture.localRoot.path).count == 2)
+
+        try await fixture.store.write { conn in
+            try conn.execute("""
+                CREATE TRIGGER reject_local_resolution BEFORE DELETE ON local_conflicts
+                BEGIN SELECT RAISE(ABORT, 'injected local conflict receipt failure'); END;
+                """)
+        }
+        await #expect(throws: Error.self) {
+            try await fixture.engine.resolveConflict(id: modifiedConflict.id, resolution: .local)
+        }
+        #expect(try Data(contentsOf: modified) == observedModified)
+        #expect(FileManager.default.fileExists(atPath: modifiedCopy.storedPath))
+        try await fixture.store.write { try $0.execute("DROP TRIGGER reject_local_resolution;") }
+
+        try await fixture.engine.resolveConflict(id: modifiedConflict.id, resolution: .local)
+        #expect(try Data(contentsOf: modified) == observedModified)
+        #expect(!FileManager.default.fileExists(atPath: modifiedCopy.storedPath))
+        try await fixture.engine.resolveConflict(id: newConflict.id, resolution: .remote)
+        #expect(!FileManager.default.fileExists(atPath: newCopy.storedPath))
+        #expect(!FileManager.default.fileExists(atPath: newFile.path))
+        #expect(try await fixture.engine.listConflicts(localPath: fixture.localRoot.path).isEmpty)
     }
 
     @Test("A failed file move does not block directory cleanup")

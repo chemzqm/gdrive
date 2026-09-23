@@ -312,7 +312,13 @@ struct SyncConflictTests {
         let localVersion = try #require(try LocalFileVersion.read(at: testFixture.original))
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == Data("remote edited content".utf8))
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == stats.conflicts)
+        let listed = try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+        #expect(listed.map(\.id) == stats.conflicts.map(\.id))
+        let entry = try #require(listed.first)
+        #expect(entry.kind == .sync)
+        #expect(entry.localFilePath == testFixture.original.path)
+        #expect(entry.localStagedPath == testFixture.original.path)
+        #expect(entry.remoteFilePath == conflictPath)
         let downloads = context.value.state.withLock { $0.downloads }
         let pending = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(pending.conflicts == stats.conflicts)
@@ -539,7 +545,7 @@ struct SyncConflictTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath))
             == Data("remote edited content".utf8))
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
-            == [conflict])
+            .map(\.id) == [conflict.id])
     }
 
     @Test("Large publication rollback reuses the download for a durable conflict")
@@ -569,7 +575,8 @@ struct SyncConflictTests {
         #expect(try Data(contentsOf: testFixture.original) == localEdit)
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == remote)
         #expect(context.value.state.withLock { $0.downloads } == downloads + 1)
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            .map(\.id) == [conflict.id])
     }
 
     @Test("Selecting the local conflict version trashes the old remote file and uploads a new one")
@@ -588,7 +595,8 @@ struct SyncConflictTests {
         context.value.state.withLock { $0.rejectTrash = false }
         #expect(try Data(contentsOf: testFixture.original) == Data("local edited content".utf8))
         #expect(FileManager.default.fileExists(atPath: conflictPath))
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            .map(\.id) == [conflict.id])
         #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == false)
 
         try await testFixture.store.write { conn in
@@ -601,7 +609,8 @@ struct SyncConflictTests {
             try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
         }
         #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == true)
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            .map(\.id) == [conflict.id])
         try await testFixture.store.write {
             try $0.execute("DROP TRIGGER reject_local_conflict_commit;")
         }
@@ -673,6 +682,10 @@ struct SyncConflictTests {
         let removed = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
         #expect(removed.conflicts.first?.remoteStatus == .removed)
         #expect(try Data(contentsOf: URL(fileURLWithPath: conflictPath)) == newer)
+        let listed = try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+        let entry = try #require(listed.first)
+        #expect(entry.localStagedPath == nil)
+        #expect(entry.remoteFilePath == nil)
         #expect(try await conflictRevision(testFixture.store, id: conflict.id) > refreshedRevision)
     }
 
@@ -699,7 +712,11 @@ struct SyncConflictTests {
         let conflict = try #require(stats.conflicts.first)
         #expect(conflict.remoteStatus == .present)
         #expect(context.value.state.withLock { $0.files[testFixture.remoteID]?.trashed } == false)
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        let listed = try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+        #expect(listed.map(\.id) == [conflict.id])
+        let entry = try #require(listed.first)
+        #expect(entry.localStagedPath == nil)
+        #expect(entry.remoteFilePath == conflict.conflictPath)
         try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
         #expect(try Data(contentsOf: testFixture.original) == Data("remote edited content".utf8))
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
@@ -740,7 +757,8 @@ struct SyncConflictTests {
         await #expect(throws: (any Error).self) {
             try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .local)
         }
-        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path) == [conflict])
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            .map(\.id) == [conflict.id])
         try await testFixture.store.write {
             try $0.execute("DROP TRIGGER reject_local_conflict_resolution;")
         }

@@ -86,8 +86,8 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 默认下载到 `~/.gdrive/remotes/<remoteRootId>/` 下的独立临时文件，SHA-256 校验完成后通过目标原路径分块写入同步目录。
 
 如果同步目录中的同路径文件与远端 SHA-256 不同，远端版本保存在
-`~/.gdrive/conflicts/<remoteRootId>/<relativePath>`。冲突会出现在 `SyncStats.conflicts`，进程重启后
-也可查询并显式解决：
+`~/.gdrive/conflicts/<remoteRootId>/<relativePath>`。内容冲突会出现在 `SyncStats.conflicts`；
+`listConflicts(localPath:)` 还会列出远端父目录删除时保管的本地文件，进程重启后也可查询并显式解决：
 
 ```swift
 let conflicts = try await engine.listConflicts(localPath: localPath)
@@ -106,10 +106,19 @@ for conflict in conflicts {
 未解决期间，远端新版本会更新 conflicts 文件；远端删除只更新冲突状态。该路径不会传播上传或
 删除操作，其他路径继续正常同步。
 
+`listConflicts` 的每条结果包含 `id`、`kind`、`localFilePath`、`remoteFilePath` 和
+`localStagedPath`。`localFilePath` 始终是原始绝对路径；后两个路径分别指向可查看的远端副本
+和本地文件。`remoteFilePath` 为空表示远端版本已删除；`localStagedPath` 为空表示本地文件
+不存在或当前无法作为普通文件查看。普通内容冲突的 `localStagedPath` 通常等于
+`localFilePath`；父目录删除冲突的 `remoteFilePath` 为空，`localStagedPath` 指向保管文件。
+保管文件不存在或无法作为普通文件读取时，查询会删除对应的 `local_conflicts` 记录。
+
 一侧删除而另一侧仍为已同步基线内容时会产生删除意图。本地删除扩散到远端时直接移入 Google Drive
 垃圾桶；远端删除扩散到本地时，新增或相对 SQLite 基线已修改的文件先移入与 conflicts 同级的
 `parent_removed`，剩余目录再移入 macOS 废纸篓。原路径和保管路径保存在
-`local_conflicts` 表中，供后续恢复功能使用；无法计算 SHA-256 或移动失败的文件仍随目录进入废纸篓。
+`local_conflicts` 表中。调用 `resolveConflict` 选择 `.local` 会在原路径不存在或正文相同时
+恢复文件；选择 `.remote` 会把保管文件移入系统废纸篓。成功后删除该条记录。
+无法计算 SHA-256 或移动失败的文件仍随目录进入废纸篓。
 若进程在文件移动后、数据库提交前终止，文件仍在 `parent_removed`，需要手动查找。
 若远端目录在同步删除期间包含协作者刚修改或新增的内容，需要从 Google Drive 垃圾桶恢复。
 这里的 `remoteRootId` 是 Google Drive 同步根文件夹 ID，不是 SQLite 的数字 `root_id`。
