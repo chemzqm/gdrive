@@ -33,10 +33,7 @@ extension SyncEngine {
             ]))
 
         // Verify that the remote root directory exists
-        let remoteRoot = try await client.getFile(remoteId: remoteRootId)
-        guard remoteRoot.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 2, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a directory: \(remoteRootId)"])
-        }
+        try await validateRemoteRoot(remoteRootId: remoteRootId)
 
         // Only verify whether the remote end is an empty directory when the root baseline is not established for the first time.
         let rootExists: Bool = try await store.read { conn in
@@ -689,5 +686,4 @@ extension SyncEngine {
 
         return stats
     }
-
 }

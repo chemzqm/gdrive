@@ -49,10 +49,7 @@ extension SyncEngine {
             localPath: resolvedLocalPath, remoteRootID: remoteRootId)
 
         // Verify that the remote root directory exists
-        let remoteRoot = try await client.getFile(remoteId: remoteRootId)
-        guard remoteRoot.isDirectory else {
-            throw NSError(domain: "SyncEngine", code: 10, userInfo: [NSLocalizedDescriptionKey: "The remote target is not a valid directory: \(remoteRootId)"])
-        }
+        try await validateRemoteRoot(remoteRootId: remoteRootId)
 
         let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
         defer { cleanupDownloadStagingDirectory(downloadDirectory) }
@@ -473,5 +470,4 @@ extension SyncEngine {
 
         return stats
     }
-
 }

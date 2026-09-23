@@ -74,14 +74,7 @@ extension SyncEngine {
         logger.info("[Sync] No baseline exists; checking local and remote directory state...")
 
         // Detect remote directories: verify existence, whether it is a directory, and whether it contains non-recycle bin subkeys
-        let remoteFile = try await client.getFile(remoteId: remoteFolderId)
-        guard remoteFile.trashed != true else {
-            throw SyncEngineError.remoteRootLost(remoteId: remoteFolderId, reason: "trashed")
-        }
-        guard remoteFile.isDirectory else {
-            throw SyncEngineError.general(
-                "The remote target is not a valid directory: \(remoteFolderId)")
-        }
+        let remoteFile = try await validateRemoteRoot(remoteRootId: remoteFolderId)
         // Probe only the top level; hidden entries are included, only .git directories are pruned.
         let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
         // Capture before listing so a concurrent remote creation cannot fall before the cursor.
@@ -155,6 +148,19 @@ extension SyncEngine {
                     + "(\(resolvedLocalPath)) and remote folder (\(remoteFolderId)) contain files. "
                     + "Use an empty directory for initialization to avoid overwrites or widespread conflicts.")
         }
+    }
+
+    @discardableResult
+    func validateRemoteRoot(remoteRootId: String) async throws -> DriveFile {
+        let remoteRoot = try await client.getFile(remoteId: remoteRootId)
+        guard remoteRoot.trashed != true else {
+            logger.error("[Sync] The remote sync root is trashed: \(remoteRootId). Stopping sync.")
+            throw SyncEngineError.remoteRootLost(remoteId: remoteRootId, reason: "trashed")
+        }
+        guard remoteRoot.isDirectory else {
+            throw SyncEngineError.general("The remote target is not a valid directory: \(remoteRootId)")
+        }
+        return remoteRoot
     }
 
     /// O(1) memory, no recursion or content reads; matches includeHidden + excludeDirectory(".git").
