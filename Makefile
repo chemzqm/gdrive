@@ -12,6 +12,9 @@ clean:
 	swift package clean
 	rm -rf .build
 
+auth:
+	GDRIVE_TESTING=1 swift run gdrive-auth
+  
 test:
 	GDRIVE_TESTING=1 swift test
 

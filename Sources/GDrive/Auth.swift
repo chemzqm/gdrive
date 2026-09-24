@@ -36,7 +36,7 @@ private final class OAuthCallbackCancellation: Sendable {
     }
 }
 
-/// Data stored in ~/.gdrive/auth.json.
+/// Configuration and current in-memory authorization state.
 public struct AuthData: Codable, Sendable {
     public var clientId: String
     public var clientSecret: String?
@@ -75,6 +75,9 @@ public actor Auth {
     private var data: AuthData
     private let session: URLSession
     private var refreshTask: Task<String, Error>?
+    #if !GDRIVE_TESTING
+    private let keychain: AuthKeychain
+    #endif
 
     public init(path: String = defaultPath) throws {
         try self.init(path: path, session: .shared)
@@ -89,12 +92,30 @@ public actor Auth {
         let rawData = try Data(contentsOf: fileURL)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+        #if GDRIVE_TESTING
         self.data = try decoder.decode(AuthData.self, from: rawData)
+        #else
+        let configuration = try decoder.decode(AuthConfiguration.self, from: rawData)
+        let keychain = AuthKeychain(path: path, clientID: configuration.clientId)
+        var data = AuthData(clientId: configuration.clientId,
+                            rootID: configuration.rootID, scopes: configuration.scopes)
+        try keychain.load()?.apply(to: &data)
+        self.keychain = keychain
+        self.data = data
+        #endif
     }
 
     /// Get current credentials
     public func authData() -> AuthData {
         data
+    }
+
+    /// Stores or removes the optional OAuth client secret in the active credential store.
+    public func setClientSecret(_ secret: String?) throws {
+        var updated = data
+        updated.clientSecret = secret
+        try save(updated)
+        data = updated
     }
 
     /// Returns a valid access token, refreshing it when necessary.
@@ -234,21 +255,24 @@ public actor Auth {
         }
 
         let decoded = try JSONDecoder().decode(TokenResponse.self, from: respData)
-        data.accessToken = decoded.access_token
-        data.expiresAt = Date().addingTimeInterval(decoded.expires_in)
+        var updated = data
+        updated.accessToken = decoded.access_token
+        updated.expiresAt = Date().addingTimeInterval(decoded.expires_in)
         if let refreshToken = decoded.refresh_token, !refreshToken.isEmpty {
-            data.refreshToken = refreshToken
+            updated.refreshToken = refreshToken
         }
 
-        try save()
+        try save(updated)
+        data = updated
         return decoded.access_token
     }
 
-    private func save() throws {
+    private func save(_ updated: AuthData) throws {
+        #if GDRIVE_TESTING
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
-        let raw = try encoder.encode(data)
+        let raw = try encoder.encode(updated)
         let temporaryURL = fileURL.deletingLastPathComponent().appendingPathComponent(
             ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp")
         let descriptor = Darwin.open(
@@ -281,6 +305,9 @@ public actor Auth {
             throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
         }
         shouldRemoveTemporaryFile = false
+        #else
+        try keychain.save(updated)
+        #endif
     }
 
     // MARK: - Helpers

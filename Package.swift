@@ -19,9 +19,9 @@ var targets: [Target] = [
         resources: [
             .copy("Storage/SQLite/schema.sql")
         ],
-        swiftSettings: [
-            .swiftLanguageMode(.v6)
-        ]
+        swiftSettings: isTesting
+            ? [.swiftLanguageMode(.v6), .define("GDRIVE_TESTING")]
+            : [.swiftLanguageMode(.v6)]
     ),
     .executableTarget(
         name: "GDriveAuth",

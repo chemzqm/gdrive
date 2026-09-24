@@ -11,7 +11,7 @@
 ```text
 [调用方 / 宿主应用]
         │
-        ├── 1. 凭据管理 ──────→ Auth (读取 ~/.gdrive/auth.json 或自定义 OAuth 刷新)
+        ├── 1. 凭据管理 ──────→ Auth (从 auth.json 读取配置，从 Keychain 读取认证密钥)
         ├── 2. 状态基线 ──────→ StateStore (SQLite WAL 数据库，单 Writer 多并发 Readers)
         ├── 3. 网络传输 ──────→ DriveClient (Google Drive REST / Multipart / Resumable)
         └── 4. 同步调度 ──────→ SyncEngine (驱动初始同步与增量双向同步)
@@ -62,7 +62,7 @@ let package = Package(
 import Foundation
 import GDrive
 
-// 1. 初始化凭据（默认读取 ~/.gdrive/auth.json，支持自动 Refresh Token）
+// 1. 从 ~/.gdrive/auth.json 读取非敏感配置，从 macOS Keychain 读取认证密钥
 let auth = try Auth()
 
 // 2. 初始化持久化 SQLite 状态存储（建议位于应用支持目录下）
@@ -80,6 +80,13 @@ let engine = try await SyncEngine(auth: auth, store: store, client: client)
 初始化时仅 `auth` 必填。`store`、`client` 和 `idPool` 均可省略，由引擎创建；
 需要共享已有组件时可显式传入。引擎通过同名只读属性公开这些组件，并通过 `monitor`
 公开传输监控器（快照读取见第 8 节）。
+
+生产模式下，`auth.json` 只需包含 `clientId`，也可包含 `rootID`、`scopes`。
+文件中已有的 `clientSecret`、`accessToken`、`refreshToken`、`expiresAt` 字段会被忽略；
+库不会自动清除旧文件中的这些字段，请自行移除。首次授权可调用 `await auth.login()`；
+若 OAuth 客户端需要可选的 client secret，先调用 `try await auth.setClientSecret(secret)`。
+认证密钥按规范化配置文件路径和 client ID 存入当前宿主程序可访问的 macOS Keychain，
+换路径、换客户端或换宿主程序时可能需要重新授权。`make test` 的构建仍使用测试文件凭证。
 
 ### 2.3 设置下载临时目录
 
