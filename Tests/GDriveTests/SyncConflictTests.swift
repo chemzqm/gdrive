@@ -9,9 +9,18 @@ private struct ConflictRemoteFile: Sendable {
     var parentID = "root"
     var content: Data
     var trashed = false
+    var isDirectory = false
     var json: [String: Any] {
-        ["id": id, "name": name, "parents": [parentID], "size": String(content.count),
-         "sha256Checksum": SyncEngine.computeSha256(of: content), "version": "2", "trashed": trashed]
+        var fields: [String: Any] = [
+            "id": id, "name": name, "parents": [parentID], "version": "2", "trashed": trashed
+        ]
+        if isDirectory {
+            fields["mimeType"] = "application/vnd.google-apps.folder"
+        } else {
+            fields["size"] = String(content.count)
+            fields["sha256Checksum"] = SyncEngine.computeSha256(of: content)
+        }
+        return fields
     }
 }
 private struct ConflictServerState: Sendable {
@@ -331,6 +340,74 @@ struct SyncConflictTests {
             at: testFixture.local, includingPropertiesForKeys: nil)
         #expect(localEntries.map(\.lastPathComponent) == ["file.txt"])
         #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Remote conflict resolution follows a renamed parent without overwriting the old path")
+    func remoteResolutionAfterParentRename() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        try await addMappedRemoteDirectory(to: testFixture, name: "A", remoteID: "remote-A")
+        let oldPath = testFixture.local.appendingPathComponent("A/file.txt")
+        try FileManager.default.moveItem(at: testFixture.original, to: oldPath)
+        try await testFixture.store.write { conn in
+            let update = try conn.prepare("""
+                UPDATE items SET parent_id = (
+                    SELECT item_id FROM items WHERE remote_file_id = 'remote-A'
+                ), remote_parent_file_id = 'remote-A'
+                WHERE remote_file_id = ?;
+                """)
+            defer { update.reset() }
+            update.bindText(testFixture.remoteID, at: 1)
+            _ = try update.step()
+        }
+        context.value.state.withLock {
+            $0.files["remote-A"] = ConflictRemoteFile(
+                id: "remote-A", name: "A", content: Data(), isDirectory: true)
+            $0.files[testFixture.remoteID]!.parentID = "remote-A"
+        }
+
+        let first = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(first.conflicts.first)
+        #expect(conflict.localPath == oldPath.path)
+
+        context.value.state.withLock { $0.files["remote-A"]!.name = "B" }
+        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let renamedPath = testFixture.local.appendingPathComponent("B/file.txt")
+        #expect(try Data(contentsOf: renamedPath) == Data("local edited content".utf8))
+        #expect(!FileManager.default.fileExists(atPath: oldPath.path))
+        let pending = try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+        #expect(pending.map(\.id) == [conflict.id])
+        #expect(pending.first?.localFilePath == renamedPath.path)
+
+        let unrelated = Data("unrelated new file".utf8)
+        try FileManager.default.createDirectory(
+            at: oldPath.deletingLastPathComponent(), withIntermediateDirectories: false)
+        try unrelated.write(to: oldPath)
+
+        try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+
+        #expect(try Data(contentsOf: oldPath) == unrelated)
+        #expect(try Data(contentsOf: renamedPath) == Data("remote edited content".utf8))
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path).isEmpty)
+    }
+
+    @Test("Remote conflict resolution preserves a replacement at the current path")
+    func remoteResolutionRejectsReplacedLocalFile() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        let stats = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let conflict = try #require(stats.conflicts.first)
+        let unrelated = Data("unrelated replacement".utf8)
+        try FileManager.default.removeItem(at: testFixture.original)
+        try unrelated.write(to: testFixture.original)
+
+        await #expect(throws: (any Error).self) {
+            try await testFixture.engine.resolveConflict(id: conflict.id, resolution: .remote)
+        }
+
+        #expect(try Data(contentsOf: testFixture.original) == unrelated)
+        #expect(try await testFixture.engine.listConflicts(localPath: testFixture.local.path)
+            .map(\.id) == [conflict.id])
     }
 
     @Test("Large remote conflict resolution consumes its copy without reporting cleanup failure")

@@ -23,6 +23,8 @@ enum SyncConflictStore {
         let localGeneration: Int64
         let remoteGeneration: Int64
         let dirtyGeneration: Int64
+        let localDevice: Int64?
+        let localInode: Int64?
     }
 
     static func directory(base: URL, remoteRootID: String) throws -> URL {
@@ -40,15 +42,18 @@ enum SyncConflictStore {
             if localPath != nil {
                 sql = """
                 SELECT c.conflict_id, c.remote_file_id, c.relative_path, c.local_path,
-                    c.conflict_path, c.remote_sha256, c.remote_size, c.remote_version, c.remote_status
+                    c.conflict_path, c.remote_sha256, c.remote_size, c.remote_version, c.remote_status,
+                    c.item_id, r.local_root_path
                 FROM sync_conflicts c JOIN roots r ON r.root_id = c.root_id
                 WHERE r.local_root_path = ? AND r.is_active = 1 ORDER BY c.relative_path;
                 """
             } else {
                 sql = """
-                SELECT conflict_id, remote_file_id, relative_path, local_path,
-                    conflict_path, remote_sha256, remote_size, remote_version, remote_status
-                FROM sync_conflicts WHERE root_id = ? ORDER BY relative_path;
+                SELECT c.conflict_id, c.remote_file_id, c.relative_path, c.local_path,
+                    c.conflict_path, c.remote_sha256, c.remote_size, c.remote_version, c.remote_status,
+                    c.item_id, r.local_root_path
+                FROM sync_conflicts c JOIN roots r ON r.root_id = c.root_id
+                WHERE c.root_id = ? ORDER BY c.relative_path;
                 """
             }
             let query = try conn.cachedStatement(sql)
@@ -57,17 +62,21 @@ enum SyncConflictStore {
             var result: [SyncConflict] = []
             while try query.step() {
                 guard let id = query.columnText(at: 0), let remoteID = query.columnText(at: 1),
-                      let relative = query.columnText(at: 2), let local = query.columnText(at: 3),
                       let sha = query.columnText(at: 5),
                       let size = query.columnInt64(at: 6),
                       let statusText = query.columnText(at: 8),
-                      let status = SyncConflict.RemoteStatus(rawValue: statusText) else { continue }
+                      let status = SyncConflict.RemoteStatus(rawValue: statusText),
+                      let itemID = query.columnInt64(at: 9),
+                      let rootPath = query.columnText(at: 10),
+                      let relative = try conn.itemRelativePath(itemID: itemID),
+                      !relative.isEmpty else { continue }
+                let local = URL(fileURLWithPath: rootPath).appendingPathComponent(relative).path
                 result.append(SyncConflict(
                     id: id, remoteFileId: remoteID, relativePath: relative,
                     localPath: local, conflictPath: query.columnText(at: 4), remoteSHA256: sha,
                     remoteSize: size, remoteVersion: query.columnInt64(at: 7), remoteStatus: status))
             }
-            return result
+            return result.sorted { ($0.relativePath, $0.id) < ($1.relativePath, $1.id) }
         }
     }
 
@@ -76,7 +85,8 @@ enum SyncConflictStore {
             let query = try conn.cachedStatement("""
             SELECT c.conflict_id, c.remote_file_id, c.relative_path, c.local_path, c.conflict_path,
                 c.remote_sha256, c.remote_size, c.remote_version, c.remote_status, c.root_id,
-                c.item_id, c.revision, i.local_generation, i.remote_generation, i.dirty_generation
+                c.item_id, c.revision, i.local_generation, i.remote_generation, i.dirty_generation,
+                i.local_device, i.local_inode
             FROM sync_conflicts c JOIN items i ON i.item_id = c.item_id
             WHERE c.conflict_id = ? AND i.phase = 'blocked';
             """)
@@ -98,7 +108,8 @@ enum SyncConflictStore {
                 remoteVersion: query.columnInt64(at: 7), remoteStatus: status),
                 rootID: rootID, itemID: itemID, revision: revision,
                 localGeneration: localGeneration, remoteGeneration: remoteGeneration,
-                dirtyGeneration: dirtyGeneration)
+                dirtyGeneration: dirtyGeneration, localDevice: query.columnInt64(at: 15),
+                localInode: query.columnInt64(at: 16))
         }
     }
 
@@ -533,7 +544,8 @@ extension SyncEngine {
             guard let current = try await SyncConflictStore.record(store: self.store, id: id) else {
                 throw SyncEngineError.general("Sync conflict was not found: \(id)")
             }
-            try await self.resolveInitialConflict(current, resolution: resolution)
+            try await self.resolveInitialConflict(
+                current, localRootPath: localRoot, resolution: resolution)
         }
     }
 
@@ -662,12 +674,26 @@ extension SyncEngine {
         try await commitConflictDeletion(record, storedURL: storedURL)
     }
 
+    private func conflictTargetVersion(
+        _ record: SyncConflictStore.Record, at localURL: URL
+    ) throws -> LocalFileVersion? {
+        let version = try LocalFileVersion.read(at: localURL)
+        if let version,
+           version.device != record.localDevice || version.inode != record.localInode {
+            throw SyncEngineError.localFileModified(path: localURL.path)
+        }
+        return version
+    }
+
     private func resolveRemoteConflict(
         _ record: SyncConflictStore.Record, localURL: URL, storedURL: URL?
     ) async throws {
         let conflict = record.conflict
-        if try await resolveRemoteDeletionIfNeeded(
-            record, localURL: localURL, storedURL: storedURL) { return }
+        if conflict.remoteStatus != .present {
+            _ = try conflictTargetVersion(record, at: localURL)
+            if try await resolveRemoteDeletionIfNeeded(
+                record, localURL: localURL, storedURL: storedURL) { return }
+        }
         guard let storedURL else {
             throw SyncEngineError.general(
                 "The remote conflict copy is unavailable: \(conflict.relativePath)")
@@ -690,7 +716,7 @@ extension SyncEngine {
             throw SyncEngineError.general(
                 "The stored remote conflict file changed: \(storedURL.path)")
         }
-        let expected = try LocalFileVersion.read(at: localURL)
+        let expected = try conflictTargetVersion(record, at: localURL)
         let result = try LocalFilePublication.publish(
             storedURL, to: localURL, expected: expected,
             expectedSHA256: conflict.remoteSHA256)
@@ -760,10 +786,13 @@ extension SyncEngine {
         }
     }
 
-    private func resolveInitialConflict(_ record: SyncConflictStore.Record,
+    private func resolveInitialConflict(_ record: SyncConflictStore.Record, localRootPath: String,
                                         resolution: SyncConflictResolution) async throws {
         let conflict = record.conflict
-        let localURL = URL(fileURLWithPath: conflict.localPath)
+        guard let relative = try await store.read({
+            try $0.itemRelativePath(itemID: record.itemID)
+        }), !relative.isEmpty else { return }
+        let localURL = URL(fileURLWithPath: localRootPath).appendingPathComponent(relative)
         let storedURL = conflict.conflictPath.map(URL.init(fileURLWithPath:))
         switch resolution {
         case .remote:
