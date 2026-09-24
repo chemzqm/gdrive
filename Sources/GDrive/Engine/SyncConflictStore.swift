@@ -478,13 +478,19 @@ extension SyncEngine {
         }
     }
 
-    private static func stagedRegularFilePath(at path: String) -> String? {
+    private static func stagedRegularFilePath(at path: String) throws -> String? {
         let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
-        guard descriptor >= 0 else { return nil }
+        guard descriptor >= 0 else {
+            if errno == ENOENT { return nil }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
         defer { _ = close(descriptor) }
         var value = stat()
-        guard fstat(descriptor, &value) == 0, (value.st_mode & S_IFMT) == S_IFREG else {
-            return nil
+        guard fstat(descriptor, &value) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        guard (value.st_mode & S_IFMT) == S_IFREG else {
+            throw SyncEngineError.general("The staged conflict path is not a regular file: \(path)")
         }
         return path
     }
@@ -495,15 +501,32 @@ extension SyncEngine {
         let localConflicts = try await SyncConflictStore.localRecords(store: store, localPath: path)
         var result: [SyncConflictEntry] = []
         for conflict in syncConflicts {
-            let localFile = Self.stagedRegularFilePath(at: conflict.localPath)
+            let localFile: String?
+            let inspectionError: String?
+            do {
+                localFile = try Self.stagedRegularFilePath(at: conflict.localPath)
+                inspectionError = nil
+            } catch {
+                localFile = nil
+                inspectionError = "\(conflict.localPath): \(error.localizedDescription)"
+            }
             let remoteFile: String? = conflict.remoteStatus == .present ? conflict.conflictPath : nil
             result.append(SyncConflictEntry(
                 id: conflict.id, kind: .sync, localFilePath: conflict.localPath,
                 remoteFilePath: remoteFile,
-                localStagedPath: localFile))
+                localStagedPath: localFile, error: inspectionError))
         }
         for conflict in localConflicts {
-            guard let localFile = Self.stagedRegularFilePath(at: conflict.storedPath) else {
+            let localFile: String?
+            do {
+                localFile = try Self.stagedRegularFilePath(at: conflict.storedPath)
+            } catch {
+                result.append(SyncConflictEntry(
+                    id: conflict.id, kind: .parentRemoved, localFilePath: conflict.originalPath,
+                    error: "\(conflict.storedPath): \(error.localizedDescription)"))
+                continue
+            }
+            guard let localFile else {
                 try await removeLocalStoredConflict(conflict, allowMissing: true)
                 continue
             }

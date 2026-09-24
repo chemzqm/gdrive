@@ -507,6 +507,49 @@ struct ItemCleanupTests {
         #expect(try Data(contentsOf: URL(fileURLWithPath: saved[0].storedPath)) == Data("movable".utf8))
     }
 
+    @Test("Listing keeps unreadable stored conflicts and removes missing ones")
+    func unreadableStoredConflictRemainsListed() async throws {
+        let fixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let stored = fixture.conflictBase.appendingPathComponent("stored.txt")
+        let original = fixture.localRoot.appendingPathComponent("removed/stored.txt")
+        try FileManager.default.createDirectory(at: fixture.conflictBase, withIntermediateDirectories: true)
+        try Data("preserved".utf8).write(to: stored)
+        try await fixture.store.write { conn in
+            let insert = try conn.prepare("""
+                INSERT INTO local_conflicts(conflict_id, root_id, original_path, stored_path, created_at)
+                VALUES (?, ?, ?, ?, 1);
+                """)
+            defer { insert.reset() }
+            for (id, path) in [("parent-preserved", stored.path),
+                               ("parent-missing", fixture.conflictBase.appendingPathComponent("missing.txt").path)] {
+                insert.bindText(id, at: 1)
+                insert.bindInt64(fixture.rootID, at: 2)
+                insert.bindText(original.path, at: 3)
+                insert.bindText(path, at: 4)
+                _ = try insert.step()
+                insert.reset()
+            }
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: stored.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stored.path) }
+
+        let unavailable = try await fixture.engine.listConflicts(localPath: fixture.localRoot.path)
+        #expect(unavailable.map(\.id) == ["parent-preserved"])
+        #expect(unavailable.first?.localStagedPath == nil)
+        #expect(unavailable.first?.error?.contains(stored.path) == true)
+        #expect(try await storedLocalConflicts(fixture.store).map(\.storedPath) == [stored.path])
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: stored.path)
+        let restored = try await fixture.engine.listConflicts(localPath: fixture.localRoot.path)
+        #expect(restored.map(\.id) == ["parent-preserved"])
+        #expect(restored.first?.localStagedPath == stored.path)
+        #expect(restored.first?.error == nil)
+        try await fixture.engine.resolveConflict(id: "parent-preserved", resolution: .local)
+        #expect(try Data(contentsOf: original) == Data("preserved".utf8))
+        #expect(try await storedLocalConflicts(fixture.store).isEmpty)
+    }
+
     @Test("A failed conflict batch leaves moved files available for manual recovery")
     func localConflictBatchFailure() async throws {
         let fixture = try await fixture()

@@ -50,19 +50,22 @@ public struct SyncConflictEntry: Sendable, Equatable {
     public let localFilePath: String
     public let remoteFilePath: String?
     public let localStagedPath: String?
+    public let error: String?
 
     public init(
         id: String,
         kind: Kind,
         localFilePath: String,
         remoteFilePath: String? = nil,
-        localStagedPath: String? = nil
+        localStagedPath: String? = nil,
+        error: String? = nil
     ) {
         self.id = id
         self.kind = kind
         self.localFilePath = localFilePath
         self.remoteFilePath = remoteFilePath
         self.localStagedPath = localStagedPath
+        self.error = error
     }
 }
 

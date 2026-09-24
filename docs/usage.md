@@ -106,12 +106,13 @@ for conflict in conflicts {
 未解决期间，远端新版本会更新 conflicts 文件；远端删除只更新冲突状态。该路径不会传播上传或
 删除操作，其他路径继续正常同步。
 
-`listConflicts` 的每条结果包含 `id`、`kind`、`localFilePath`、`remoteFilePath` 和
-`localStagedPath`。`localFilePath` 始终是原始绝对路径；后两个路径分别指向可查看的远端副本
+`listConflicts` 的每条结果包含 `id`、`kind`、`localFilePath`、`remoteFilePath`、
+`localStagedPath` 和可选的 `error`。`localFilePath` 始终是原始绝对路径；后两个路径分别指向可查看的远端副本
 和本地文件。`remoteFilePath` 为空表示远端版本已删除；`localStagedPath` 为空表示本地文件
 不存在或当前无法作为普通文件查看。普通内容冲突的 `localStagedPath` 通常等于
 `localFilePath`；父目录删除冲突的 `remoteFilePath` 为空，`localStagedPath` 指向保管文件。
-保管文件不存在或无法作为普通文件读取时，查询会删除对应的 `local_conflicts` 记录。
+保管文件确认不存在时，查询会删除对应的 `local_conflicts` 记录；其他检查错误会保留记录，
+并在 `error` 中返回可展示的错误信息。
 
 一侧删除而另一侧仍为已同步基线内容时会产生删除意图。本地删除扩散到远端时直接移入 Google Drive
 垃圾桶；远端删除扩散到本地时，新增或相对 SQLite 基线已修改的文件先移入与 conflicts 同级的
