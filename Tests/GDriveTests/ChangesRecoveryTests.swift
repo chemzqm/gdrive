@@ -463,6 +463,70 @@ struct ChangesRecoveryTests {
         #expect(try String(contentsOf: testFixture.local.appendingPathComponent("incoming/nested/deep"), encoding: .utf8) == "remote content")
     }
 
+    @Test("A directory rename and child move in one Changes page use the renamed path", arguments: [true, false])
+    func parentRenameAndChildMoveInOnePage(directoryFirst: Bool) async throws {
+        let testFixture = try await fixture()
+        defer { testFixture.cleanup() }
+        let originalDirectory = folder("directory", "root", name: "A")
+        let originalFile = remoteFile("incoming", parent: "root", name: "incoming.txt")
+        context.value.state.withLock {
+            $0.files[originalDirectory.id] = originalDirectory
+            $0.pages["start"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "steady",
+                changes: [
+                    DriveChange(fileId: originalDirectory.id, removed: false, file: originalDirectory),
+                    DriveChange(fileId: originalFile.id, removed: false, file: originalFile)
+                ])
+        }
+        try await converge(testFixture)
+        let localA = testFixture.local.appendingPathComponent("A")
+        let localIncoming = testFixture.local.appendingPathComponent("incoming.txt")
+        #expect(FileManager.default.fileExists(atPath: localA.path))
+        #expect(try Data(contentsOf: localIncoming) == Data("remote content".utf8))
+
+        let renamedDirectory = DriveFile(
+            id: originalDirectory.id, name: "B", mimeType: "application/vnd.google-apps.folder",
+            parents: ["root"], version: "2")
+        let movedFile = DriveFile(
+            id: originalFile.id, name: originalFile.name, parents: [originalDirectory.id],
+            size: originalFile.size, sha256Checksum: originalFile.sha256Checksum, version: "2")
+        let directoryChange = DriveChange(fileId: renamedDirectory.id, removed: false, file: renamedDirectory)
+        let fileChange = DriveChange(fileId: movedFile.id, removed: false, file: movedFile)
+        context.value.state.withLock {
+            $0.files[renamedDirectory.id] = renamedDirectory
+            $0.files[movedFile.id] = movedFile
+            $0.pages["steady"] = DriveChangesPage(
+                nextPageToken: nil, newStartPageToken: "after-move",
+                changes: directoryFirst ? [directoryChange, fileChange] : [fileChange, directoryChange])
+        }
+
+        _ = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        let localBFile = testFixture.local.appendingPathComponent("B/incoming.txt")
+        #expect((try? Data(contentsOf: localBFile)) == Data("remote content".utf8))
+        #expect(!FileManager.default.fileExists(atPath: localA.path))
+        let retry = try await testFixture.engine.syncIncremental(localPath: testFixture.local.path)
+        #expect(retry.filesUploaded == 0)
+        #expect((try? Data(contentsOf: localBFile)) == Data("remote content".utf8))
+        #expect(!FileManager.default.fileExists(atPath: localA.path))
+        let inboxIDs = try await testFixture.store.read { conn in
+            let query = try conn.prepare("""
+                SELECT remote_id FROM remote_change_inbox
+                WHERE root_id = ? AND remote_id IN ('directory', 'incoming');
+                """)
+            defer { query.reset() }
+            query.bindInt64(testFixture.rootID, at: 1)
+            var ids: [String] = []
+            while try query.step() {
+                if let id = query.columnText(at: 0) { ids.append(id) }
+            }
+            return ids
+        }
+        #expect(inboxIDs.isEmpty)
+        #expect(context.value.state.withLock {
+            $0.files.values.filter { $0.name == "incoming.txt" }.count
+        } == 1)
+    }
+
     @Test("Missing and explicitly rejected cursors reconstruct pre-existing remote files", arguments: ["missing", "rejected", "invalid"])
     func missingCursor(kind: String) async throws {
         let testFixture = try await fixture(cursor: kind != "missing")

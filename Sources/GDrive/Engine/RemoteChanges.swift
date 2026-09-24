@@ -359,9 +359,29 @@ struct RemoteChanges: Sendable {
     private func applyResolvedBatch(_ batch: [Resolved], started: Double) async throws {
         // Persist the observation boundary before touching the local filesystem.
         try await retainResolvedBatch(batch, started: started)
-        let prepared = try await prepareResolvedBatch(batch)
-        let completed = try await executeLocalPathOperations(prepared)
-        try await commitResolvedBatch(completed)
+        var groups: [[Resolved]] = []
+        var files: [Resolved] = []
+        for result in batch {
+            if result.entry.change.file?.isDirectory == true {
+                // Later paths must see this directory's committed name and parent.
+                if !files.isEmpty {
+                    groups.append(files)
+                    files = []
+                }
+                groups.append([result])
+            } else {
+                files.append(result)
+            }
+        }
+        if !files.isEmpty { groups.append(files) }
+
+        for group in groups {
+            let prepared = try await prepareResolvedBatch(group)
+            let completed = try await executeLocalPathOperations(prepared)
+            let committed = try await commitResolvedBatch(completed)
+            if group[0].entry.change.file?.isDirectory == true,
+               completed.count != 1 || !committed { break }
+        }
     }
 
     private func retainResolvedBatch(_ batch: [Resolved], started: Double) async throws {
@@ -442,8 +462,9 @@ struct RemoteChanges: Sendable {
         return executed
     }
 
-    private func commitResolvedBatch(_ completed: [PreparedResult]) async throws {
+    private func commitResolvedBatch(_ completed: [PreparedResult]) async throws -> Bool {
         try await store.write { conn in
+            var allCommitted = true
             for item in completed {
                 let result = item.result
                 try conn.execute("SAVEPOINT remote_apply;")
@@ -451,14 +472,18 @@ struct RemoteChanges: Sendable {
                     if try apply(conn, result, executedPathOperation: item.operation) {
                         try Self.execute(conn, "DELETE FROM remote_change_inbox WHERE root_id = ? AND remote_id = ?;",
                             [.int(rootID), .text(result.entry.change.fileId)])
+                    } else {
+                        allCommitted = false
                     }
                     try conn.execute("RELEASE remote_apply;")
                 } catch {
                     try conn.execute("ROLLBACK TO remote_apply;")
                     try conn.execute("RELEASE remote_apply;")
                     if DatabaseFailure.isSQLite(error) { throw error }
+                    allCommitted = false
                 }
             }
+            return allCommitted
         }
     }
 
