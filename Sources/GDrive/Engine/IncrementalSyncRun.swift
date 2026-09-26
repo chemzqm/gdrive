@@ -152,6 +152,8 @@ extension IncrementalSyncRun {
         try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
             remoteRootID: remoteRootID, localRoot: rootURL)
+        try await engine.registerSyncStorageDirectories(
+            rootID: rootID, remoteRootID: remoteRootID, downloadDirectory: downloadDirectory)
         try SyncRunControl.current?.checkCancellation()
         let itemTaskRegistry = ItemTaskRegistry()
         var prepared = false

@@ -119,6 +119,8 @@ extension SyncEngine {
             return (rId, rItemId)
         }
 
+        try await registerSyncStorageDirectories(
+            rootID: rootId, remoteRootID: remoteRootId)
         try SyncRunControl.current?.checkCancellation()
 
         try await RemoteChanges(

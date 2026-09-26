@@ -222,6 +222,15 @@ CREATE TABLE IF NOT EXISTS sync_conflicts (
 );
 CREATE INDEX IF NOT EXISTS idx_sync_conflicts_root ON sync_conflicts(root_id);
 
+-- Every per-root directory that may receive temporary downloads or conflict
+-- copies.  The history lets unlink clean files created by an earlier engine
+-- configuration after the engine has been restarted or reconfigured.
+CREATE TABLE IF NOT EXISTS root_storage_directories (
+    root_id INTEGER NOT NULL REFERENCES roots(root_id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    PRIMARY KEY(root_id, path)
+);
+
 -- Actionable item-level failures retained until the whole sync root converges.
 CREATE TABLE IF NOT EXISTS sync_issues (
     issue_id TEXT PRIMARY KEY NOT NULL,

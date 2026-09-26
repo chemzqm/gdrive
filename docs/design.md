@@ -61,6 +61,8 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
   * `remote_change_inbox`：游标已确认但尚未成功应用的远端事件。
   * `remote_directory_scans`：目录补列任务、扫描身份和分页进度。
   * `sync_conflicts`：等待调用方明确选择版本的内容冲突。
+  * `root_storage_directories`：每个同步根已使用过的下载与冲突目录；解除绑定时据此清理配置变更或
+    重启前创建的根专属文件。
   * `sync_issues`：条目级失败的结构化记录；同一根、条目和阶段重复失败时更新诊断并累计次数。
   * `local_conflicts`：远端目录删除时保管的本地新增或已修改文件及其恢复路径。
 * **`SQLiteConnection.swift`**：
@@ -139,8 +141,11 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
     并拒绝位于任一绑定根内的持久化冲突副本，防止凭据、WAL、未完成下载和冲突副本被反向上传。
   * **根边界隔离**：新绑定会和同一账户的全部既有绑定比较规范化路径，祖先或后代关系均返回
     `rootBindingConflict`；进程内协调器用相同规则拒绝并发运行的嵌套根。路径比较会解析符号链接。
-  * **取消同步**：`cancelSync(localPath:)` 只停止当前同步轮次并等待其退出，保留 SQLite
-    基线和意图以供下次恢复。
+  * **取消与解除绑定**：`cancelSync(localPath:)` 只停止当前同步轮次并等待其退出，保留 SQLite
+    基线和意图以供下次恢复。`unlink(localPath:)` 在进程内保留该根、停止并排空当前同步和回执后，
+    删除根的 SQLite 记录及已登记的下载/冲突存储；普通本地内容、远端内容和凭据不变。`parent_removed`
+    文件保留但其 `local_conflicts` 记录删除。解除绑定不发送 Drive 请求，缺失绑定可重复调用；文件系统
+    与 SQLite 清理之间不提供整体原子性，调用方需停止外部调度器并在重启同步前重新配置该根。
   * **下载暂存目录**：通过初始化参数 `downloadTemporaryDirectory` 或
     `setDownloadTemporaryDirectory(_:)` 配置基目录，默认 `~/.gdrive/remotes`，按远程根 ID
     使用 `<基目录>/<remoteRootId>/`。初始化、增量和冲突内容下载统一使用同步目录外的暂存路径，

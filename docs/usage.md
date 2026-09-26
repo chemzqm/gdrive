@@ -189,12 +189,19 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 该锁不提供跨进程互斥。库不接收单个文件变化；需要响应文件监听事件时，由调用方合并或防抖后
 显式调用 `syncIncremental(localPath:)` 执行整根同步。
 
-### 3.1 取消同步
+### 3.1 取消与解除绑定
 
 `await engine.cancelSync(localPath:)` 只取消该根当前同步轮次：已开始的传输会被取消，
 排队工作不再开始，已经开始的非传输操作会收尾；调用在该轮退出后返回，原同步调用以
 `CancellationError` 结束。SQLite 基线和已记录意图保留，之后调用同步入口会继续恢复。
 没有进行中的同步时直接返回。该协调仅限当前进程。
+
+`try await engine.unlink(localPath:)` 先锁定该同步根、停止并排空该根同步及待提交回执，
+再删除该绑定的 SQLite 根记录、下载暂存目录和冲突副本。普通本地文件、Google Drive 内容和
+凭据均保留；`parent_removed` 中的文件字节也保留，但对应的查询和恢复记录会被删除。缺失本地目录、
+没有绑定以及重复调用都成功返回。真实文件系统或 SQLite 错误会抛出，保留定位记录以便重试；
+文件系统和数据库之间不承诺整体原子性。外部调度器必须停止并重新配置该根后再启动同步。
+该操作不发送 Drive 请求，也只提供进程内协调。
 
 ### 3.2 统一智能同步入口 (`sync`) 【推荐】
 

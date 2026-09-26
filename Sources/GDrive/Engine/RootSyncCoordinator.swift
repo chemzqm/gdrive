@@ -11,6 +11,7 @@ actor RootSyncCoordinator {
     private struct Entry {
         let key: String
         let control: SyncRunControl?
+        let isUnlinkReservation: Bool
         var waiters: [CheckedContinuation<Void, Never>] = []
     }
 
@@ -22,7 +23,7 @@ actor RootSyncCoordinator {
             throw SyncEngineError.rootBusy(path: key)
         }
         let id = UUID()
-        runningRoots[id] = Entry(key: key, control: control)
+        runningRoots[id] = Entry(key: key, control: control, isUnlinkReservation: false)
         return Token(id: id)
     }
 
@@ -42,6 +43,27 @@ actor RootSyncCoordinator {
         }).map({ ($0.key, $0.value.control!) }) else { return }
         control.cancel()
         await waitForRelease(id)
+    }
+
+    /// Reserves the exact path before cancelling an active sync, leaving no
+    /// admission gap for a new sync or another unlink operation.
+    func acquireForUnlink(localRootPath: String) async throws -> Token {
+        let key = Self.normalizedPath(localRootPath)
+        guard !runningRoots.values.contains(where: { $0.key == key && $0.isUnlinkReservation }) else {
+            throw SyncEngineError.rootBusy(path: key)
+        }
+        guard !runningRoots.values.contains(where: { $0.key != key && Self.overlaps($0.key, key) }) else {
+            throw SyncEngineError.rootBusy(path: key)
+        }
+        let activeID = runningRoots.first(where: { $0.value.key == key })?.key
+        let reservationID = UUID()
+        runningRoots[reservationID] = Entry(key: key, control: nil, isUnlinkReservation: true)
+
+        if let activeID, let active = runningRoots[activeID] {
+            active.control?.cancel()
+            await waitForRelease(activeID)
+        }
+        return Token(id: reservationID)
     }
 
     private func waitForRelease(_ id: UUID) async {

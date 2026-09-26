@@ -354,6 +354,21 @@ public final class SyncEngine: Sendable {
                 try self.validateOperationalStateIsOutsideSyncRoot(rootPath)
             }
 
+            let storageDirectories = try conn.cachedStatement("""
+                SELECT path FROM root_storage_directories;
+                """)
+            defer { storageDirectories.reset() }
+            while try storageDirectories.step() {
+                guard let storagePath = storageDirectories.columnText(at: 0) else { continue }
+                for rootPath in rootPaths
+                where RootSyncCoordinator.contains(storagePath, in: rootPath)
+                    || RootSyncCoordinator.contains(rootPath, in: storagePath) {
+                    throw SyncEngineError.general(
+                        "The local sync root overlaps registered storage: \(storagePath). "
+                            + "Configure operational state outside the sync root.")
+                }
+            }
+
             let conflicts = try conn.cachedStatement("""
                 SELECT conflict_path FROM sync_conflicts WHERE conflict_path IS NOT NULL;
                 """)

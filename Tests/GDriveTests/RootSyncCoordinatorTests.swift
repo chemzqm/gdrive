@@ -171,4 +171,40 @@ struct RootSyncCoordinatorTests {
         try await verifyLockCanBeReacquired(testFixture)
     }
 
+    @Test("Unlink reserves a root before cancelling its active sync and excludes a second unlink")
+    func unlinkReservationCancelsAndExcludes() async throws {
+        let path = "/tmp/gdrive-unlink-lock-\(UUID().uuidString)"
+        let control = SyncRunControl()
+        let active = try await RootSyncCoordinator.shared.acquire(
+            localRootPath: path, control: control)
+        let transferStarted = AsyncSemaphore(count: 0)
+        let transferBlock = AsyncSemaphore(count: 0)
+        let transfer = Task {
+            try await SyncRunControl.$current.withValue(control) {
+                try await SyncRunControl.withTransfer {
+                    transferStarted.signal()
+                    try await transferBlock.wait()
+                }
+            }
+        }
+        try await transferStarted.wait()
+
+        let unlink = Task {
+            try await RootSyncCoordinator.shared.acquireForUnlink(localRootPath: path)
+        }
+        await #expect(throws: CancellationError.self) { try await transfer.value }
+        await #expect(throws: SyncEngineError.self) {
+            try await RootSyncCoordinator.shared.acquireForUnlink(localRootPath: path)
+        }
+        await #expect(throws: SyncEngineError.self) {
+            try await RootSyncCoordinator.shared.acquire(localRootPath: path)
+        }
+
+        await RootSyncCoordinator.shared.release(active)
+        let reservation = try await unlink.value
+        await RootSyncCoordinator.shared.release(reservation)
+        let retry = try await RootSyncCoordinator.shared.acquire(localRootPath: path)
+        await RootSyncCoordinator.shared.release(retry)
+    }
+
 }
