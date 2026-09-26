@@ -515,6 +515,19 @@ public final class DriveClient: Sendable {
         }
     }
 
+    /// Network body requests are the only requests owned by a soft-cancelled
+    /// sync. Metadata calls deliberately remain outside this boundary so their
+    /// current result can still be committed while the run drains.
+    private func executeTransferRequest(
+        _ request: URLRequest,
+        acceptableStatusCodes: Set<Int>
+    ) async throws -> (Data, HTTPURLResponse) {
+        return try await SyncRunControl.withTransfer {
+            try await self.executeRequest(
+                request, acceptableStatusCodes: acceptableStatusCodes)
+        }
+    }
+
     private func parseRateLimit(data: Data, response http: HTTPURLResponse) -> RateLimitEncounter? {
         let retryDelay = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
 
@@ -776,7 +789,8 @@ public final class DriveClient: Sendable {
 
         req.httpBody = body
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 409])
+        let (data, http) = try await executeTransferRequest(
+            req, acceptableStatusCodes: [200, 201, 409])
 
         // 409 Conflict check
         if http.statusCode == 409 {
@@ -888,7 +902,7 @@ public final class DriveClient: Sendable {
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: metadata)
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200])
+        let (data, http) = try await executeTransferRequest(req, acceptableStatusCodes: [200])
         guard let location = http.value(forHTTPHeaderField: "Location"), let sessionURL = URL(string: location) else {
             let detail = (String(bytes: data, encoding: .utf8) ?? "Invalid UTF-8 data")
             throw DriveError.serverError(statusCode: http.statusCode, message: "Failed to create resumable upload session: \(detail)")
@@ -912,7 +926,8 @@ public final class DriveClient: Sendable {
         req.setValue(String(chunkData.count), forHTTPHeaderField: "Content-Length")
         req.httpBody = chunkData
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308, 404])
+        let (data, http) = try await executeTransferRequest(
+            req, acceptableStatusCodes: [200, 201, 308, 404])
 
         if http.statusCode == 308 {
             return .incomplete(confirmedOffset: try parseResumableConfirmedOffset(http, totalBytes: totalBytes))
@@ -933,7 +948,8 @@ public final class DriveClient: Sendable {
         req.setValue("bytes */\(totalBytes)", forHTTPHeaderField: "Content-Range")
         req.setValue("0", forHTTPHeaderField: "Content-Length")
 
-        let (data, http) = try await executeRequest(req, acceptableStatusCodes: [200, 201, 308, 404])
+        let (data, http) = try await executeTransferRequest(
+            req, acceptableStatusCodes: [200, 201, 308, 404])
 
         switch http.statusCode {
         case 200, 201:
@@ -1139,8 +1155,11 @@ public final class DriveClient: Sendable {
 
         let tempURL = temporaryDirectory.appendingPathComponent(".tmp_\(UUID().uuidString)")
         do {
-            _ = try await executeDownloadRequest(
-                req, remoteId: remoteId, destinationURL: tempURL, onProgress: onProgress)
+            let request = req
+            _ = try await SyncRunControl.withTransfer {
+                try await self.executeDownloadRequest(
+                    request, remoteId: remoteId, destinationURL: tempURL, onProgress: onProgress)
+            }
 
             let fileHandle = try FileHandle(forReadingFrom: tempURL)
             defer { try? fileHandle.close() }

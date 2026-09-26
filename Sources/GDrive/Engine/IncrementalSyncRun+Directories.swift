@@ -178,6 +178,7 @@ extension IncrementalSyncRun {
         }
 
         for (item, intent) in pendingDirectoryCreates {
+            try SyncRunControl.current?.checkCancellation()
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
             let path = parent.isEmpty ? item.name : "\(parent)/\(item.name)"
             if failedDirectorySubtrees.blocks(
@@ -257,6 +258,7 @@ extension IncrementalSyncRun {
                 > secondPath.split(separator: "/").count
         }
         for item in ordered {
+            try SyncRunControl.current?.checkCancellation()
             do {
                 let expected = ItemCleanupGenerations(
                     local: item.localGeneration, remote: item.remoteGeneration,

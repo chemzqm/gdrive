@@ -105,6 +105,10 @@ final class TaskLifecycle: @unchecked Sendable {
         handles.forEach { $0.cancel() }
     }
 
+    var isCancelled: Bool {
+        state.withLock { $0.cancelled }
+    }
+
     func waitForAll() async {
         await withCheckedContinuation { continuation in
             let resumeNow = state.withLock { state in

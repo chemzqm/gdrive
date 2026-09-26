@@ -362,6 +362,7 @@ extension SyncEngine {
             return result
         }
         for entry in pending {
+            try SyncRunControl.current?.checkCancellation()
             do {
                 if entry.change.removed == true || entry.change.file?.trashed == true {
                     let status = entry.change.file?.trashed == true ? "trashed" : "removed"
@@ -465,7 +466,7 @@ extension SyncEngine {
                     remove.reset()
                 }
             } catch {
-                if DatabaseFailure.isSQLite(error) { throw error }
+                if error is CancellationError || DatabaseFailure.isSQLite(error) { throw error }
                 try await SyncIssueStore.record(
                     store: store, rootID: rootID,
                     subject: SyncIssueSubject(

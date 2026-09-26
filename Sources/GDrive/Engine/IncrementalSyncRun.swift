@@ -96,6 +96,7 @@ extension SyncEngine {
         maxConcurrency: Int,
         onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
+        try SyncRunControl.current?.checkCancellation()
         try await SyncIssueStore.clear(store: store, rootID: rootId)
         let run = try await IncrementalSyncRun.prepare(
             engine: self,
@@ -151,6 +152,7 @@ extension IncrementalSyncRun {
         try await validateRemoteRoot(engine: engine, remoteRootID: remoteRootID)
         let downloadDirectory = try await engine.downloadStagingDirectory(
             remoteRootID: remoteRootID, localRoot: rootURL)
+        try SyncRunControl.current?.checkCancellation()
         let itemTaskRegistry = ItemTaskRegistry()
         var prepared = false
         defer {
@@ -213,6 +215,7 @@ extension IncrementalSyncRun {
     }
 
     private func executeStages() async throws -> SyncStats {
+        try SyncRunControl.current?.checkCancellation()
         let pendingDirectories = try await loadDirtyItems().filter { item in
             guard item.entryKind == "directory", item.pendingCreate != nil else { return false }
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
@@ -220,10 +223,13 @@ extension IncrementalSyncRun {
             return !remoteGate.blocks(path)
         }
         try await recoverPendingDirectories(pendingDirectories)
+        try SyncRunControl.current?.checkCancellation()
         try await scanLocal()
         try actionTracker.throwIfDatabaseFailure()
         try validateLocalRootIdentity()
+        try SyncRunControl.current?.checkCancellation()
         try await markMissingAfterSuccessfulScan()
+        try SyncRunControl.current?.checkCancellation()
         let dirtyItems = try await loadDirtyItems()
         let eligibleItems = dirtyItems.filter { item in
             let parent = directoryContext.getRelPath(for: item.parentId) ?? ""
@@ -254,10 +260,12 @@ extension IncrementalSyncRun {
         }
         await drainTransfers()
         try actionTracker.throwIfDatabaseFailure()
+        try SyncRunControl.current?.checkCancellation()
         try await processCollidedDownloads()
         try actionTracker.throwIfDatabaseFailure()
         try await engine.store.flush()
         try validateLocalRootIdentity()
+        try SyncRunControl.current?.checkCancellation()
         try await reconcileDirectories(dirItems)
         return try await finish()
     }

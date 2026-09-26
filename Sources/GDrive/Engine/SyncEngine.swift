@@ -23,6 +23,7 @@ extension SyncEngine {
         onProgress: (@Sendable (SyncProgress) -> Void)?
     ) async throws -> SyncStats {
         let resolvedLocalPath = (localPath as NSString).expandingTildeInPath
+        try SyncRunControl.current?.checkCancellation()
         try await validateRootBinding(
             localPath: resolvedLocalPath, remoteRootID: remoteFolderId)
 
@@ -75,11 +76,13 @@ extension SyncEngine {
 
         // Detect remote directories: verify existence, whether it is a directory, and whether it contains non-recycle bin subkeys
         _ = try await validateRemoteRoot(remoteRootId: remoteFolderId)
+        try SyncRunControl.current?.checkCancellation()
         // Probe only the top level; hidden entries are included, only .git directories are pruned.
         let isLocalEmpty = try Self.isLocalRootEmpty(resolvedLocalPath)
         // Capture before listing so a concurrent remote creation cannot fall before the cursor.
         let emptyRootCursor = isLocalEmpty ? try await client.getStartPageToken() : nil
         let remoteChildren = try await client.listChildren(parentId: remoteFolderId)
+        try SyncRunControl.current?.checkCancellation()
         let isRemoteEmpty = remoteChildren.isEmpty
 
         // 3. Safe diversion based on detection results

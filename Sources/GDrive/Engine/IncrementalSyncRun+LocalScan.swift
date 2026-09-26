@@ -786,6 +786,7 @@ extension IncrementalSyncRun {
             var pendingObservations: [IncrementalLocalObservation] = []
             var firstObservationSent = sentFirstObservation.withLock { $0 }
             for record in records {
+                try SyncRunControl.current?.checkCancellation()
                 try self.actionTracker.throwIfDatabaseFailure()
                 let fullPath = record.fullPath
                 let relPath = fullPath.hasPrefix(staticPrefix)

@@ -8,6 +8,7 @@ private final class DownloadCancellationState: Sendable {
     let secondObserved = AsyncSemaphore(count: 0)
     let stopped = OSAllocatedUnfairLock(initialState: false)
     let timedOut = OSAllocatedUnfairLock(initialState: false)
+    let mediaRequests = OSAllocatedUnfairLock(initialState: 0)
 }
 
 private final class BlockedBootstrapDownloadProtocol: URLProtocol, @unchecked Sendable {
@@ -18,6 +19,7 @@ private final class BlockedBootstrapDownloadProtocol: URLProtocol, @unchecked Se
         let state = TestHTTPContext<DownloadCancellationState>.value(for: request)!
         let url = request.url!
         if url.query?.contains("alt=media") == true {
+            state.mediaRequests.withLock { $0 += 1 }
             state.started.signal()
             // A watchdog bounds a broken cancellation path; it is not synchronization.
             DispatchQueue.global().asyncAfter(deadline: .now() + 10) { [weak self] in
@@ -54,8 +56,8 @@ private final class BlockedBootstrapDownloadProtocol: URLProtocol, @unchecked Se
 
 @Suite("Bootstrap download cancellation", .timeLimit(.minutes(1)))
 struct BootstrapDownloadCancellationTests {
-    @Test("Cancellation reaches active downloads while traversal waits for a slot")
-    func cancellationDuringTraversal() async throws {
+    @Test("Cancellation reaches active downloads while traversal waits for a slot", arguments: [false, true])
+    func cancellationDuringTraversal(usesPublicAPI: Bool) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let local = directory.appendingPathComponent("local")
         try FileManager.default.createDirectory(at: local, withIntermediateDirectories: true)
@@ -87,12 +89,21 @@ struct BootstrapDownloadCancellationTests {
         }
         try await context.value.started.wait()
         try await context.value.secondObserved.wait()
-        sync.cancel()
+        let cancellation: Task<Void, Never>?
+        if usesPublicAPI {
+            cancellation = Task {
+                await engine.cancelSync(localPath: local.path)
+            }
+        } else {
+            cancellation = nil
+            sync.cancel()
+        }
         await #expect(throws: CancellationError.self) { _ = try await sync.value }
+        await cancellation?.value
         #expect(context.value.stopped.withLock { $0 })
         #expect(!context.value.timedOut.withLock { $0 })
-        engine.monitor.refreshSnapshot()
-        let snapshot = engine.monitor.getSnapshot()
+        #expect(context.value.mediaRequests.withLock { $0 } == 1)
+        let snapshot = engine.transferStatus
         #expect(snapshot.activeDownloads.isEmpty)
         #expect(snapshot.queuedDownloads.isEmpty)
         let token = try await RootSyncCoordinator.shared.acquire(localRootPath: local.path)

@@ -189,7 +189,14 @@ try engine.setDownloadTemporaryDirectory(DriveClient.defaultDownloadTemporaryDir
 该锁不提供跨进程互斥。库不接收单个文件变化；需要响应文件监听事件时，由调用方合并或防抖后
 显式调用 `syncIncremental(localPath:)` 执行整根同步。
 
-### 3.1 统一智能同步入口 (`sync`) 【推荐】
+### 3.1 取消同步
+
+`await engine.cancelSync(localPath:)` 只取消该根当前同步轮次：已开始的传输会被取消，
+排队工作不再开始，已经开始的非传输操作会收尾；调用在该轮退出后返回，原同步调用以
+`CancellationError` 结束。SQLite 基线和已记录意图保留，之后调用同步入口会继续恢复。
+没有进行中的同步时直接返回。该协调仅限当前进程。
+
+### 3.2 统一智能同步入口 (`sync`) 【推荐】
 
 调用方**无需关心**远端是否为空或本地是否已有同步基线，`engine.sync` 会自动向云端和本地发起状态探测：
 
@@ -222,7 +229,7 @@ print("同步完成: 上传 \(stats.filesUploaded) 项, 下载 \(stats.filesDown
 
 ---
 
-### 3.2 底层显式同步接口（进阶）
+### 3.3 底层显式同步接口（进阶）
 
 若调用方需要在特定业务流程中显式指定初始化方向，可调用专用子接口：
 
@@ -278,7 +285,7 @@ print("  - 本地建目录: \(stats.directoriesCreated)")
 
 ---
 
-### 3.3 增量双向同步 (`syncIncremental`)
+### 3.4 增量双向同步 (`syncIncremental`)
 
 完成初始化后，可通过 `syncIncremental` 主动执行整根双向同步，包括定时拉取远端变化。
 本地文件监听也应触发该整根同步入口，见第 5 节。

@@ -70,6 +70,16 @@ struct RootSyncCoordinatorTests {
         await RootSyncCoordinator.shared.release(token)
     }
 
+    @Test("Public cancellation is a no-op when no sync owns the root")
+    func idleCancellationIsRepeatable() async throws {
+        let testFixture = try await fixture()
+        defer { try? FileManager.default.removeItem(at: testFixture.directory) }
+        await testFixture.engine.cancelSync(localPath: testFixture.root.path)
+        await testFixture.engine.cancelSync(localPath: testFixture.root.path)
+        let token = try await RootSyncCoordinator.shared.acquire(localRootPath: testFixture.root.path)
+        await RootSyncCoordinator.shared.release(token)
+    }
+
     @Test("Different local roots remain independent")
     func allowsDifferentLocalRoots() async throws {
         let first = "/tmp/gdrive-root-lock-\(UUID().uuidString)"

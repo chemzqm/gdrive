@@ -83,6 +83,7 @@ extension IncrementalSyncRun {
 
         var receipts: [@Sendable (SQLiteConnection) throws -> Void] = []
         for entry in collided {
+            try SyncRunControl.current?.checkCancellation()
             try actionTracker.throwIfDatabaseFailure()
             let item = entry.item
             let localFileURL = entry.localFileURL
@@ -135,8 +136,15 @@ extension IncrementalSyncRun {
     }
 
     private func acquireTransfer() async throws {
+        try SyncRunControl.current?.checkCancellation()
         try Task.checkCancellation()
         try await syncSemaphore.wait()
+        do {
+            try SyncRunControl.current?.checkCancellation()
+        } catch {
+            syncSemaphore.signal()
+            throw error
+        }
         if Task.isCancelled {
             syncSemaphore.signal()
             throw CancellationError()
@@ -152,6 +160,7 @@ extension IncrementalSyncRun {
     func scheduleFiles(_ fileItems: [DirtyRecord], duringScan: Bool) async throws {
         var receipts: [@Sendable (SQLiteConnection) throws -> Void] = []
         for item in fileItems {
+            try SyncRunControl.current?.checkCancellation()
             try actionTracker.throwIfDatabaseFailure()
             guard let decision = decisionForScheduling(item, duringScan: duringScan) else { continue }
             try Task.checkCancellation()
@@ -277,6 +286,7 @@ extension IncrementalSyncRun {
             }
 
             do {
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 if createIntent == nil, let remoteID = item.remoteFileId {
                     throw DriveError.unsafeOverwrite(fileId: remoteID)
@@ -394,6 +404,7 @@ extension IncrementalSyncRun {
             }
 
             do {
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 guard let remoteFileId = item.remoteFileId else { return }
                 let parentRel = directoryContext.getRelPath(for: item.parentId) ?? ""
@@ -511,6 +522,7 @@ extension IncrementalSyncRun {
                 syncSemaphore.signal()
             }
             do {
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 guard let remoteID = item.remoteFileId else {
                     throw SyncEngineError.general(

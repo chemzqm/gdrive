@@ -181,6 +181,7 @@ struct RemoteChanges: Sendable {
         if let saved { token = saved } else { token = try await startRebuild() }
         var rebuilt = saved == nil
         while true {
+            try SyncRunControl.current?.checkCancellation()
             let page: DriveChangesPage
             do { page = try await client.listChanges(pageToken: token) } catch let error as DriveError {
                 // Drive documents non-expiring tokens. Handle explicit token rejection,
@@ -300,6 +301,7 @@ struct RemoteChanges: Sendable {
             var visiting: Set<String> = []
             func resolve(_ id: String) async throws -> Scope {
                 if id == remoteRootID { return .inside }
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 func cachedScope() -> Scope? {
                     if let value = visited[id] { return value }
@@ -323,6 +325,7 @@ struct RemoteChanges: Sendable {
                         guard budget > 0 else { return .unknown }
                         budget -= 1
                         do { file = try await client.getFile(remoteId: id) } catch {
+                            try SyncRunControl.current?.checkCancellation()
                             try Task.checkCancellation()
                             unavailable.insert(id)
                             return .unknown // retained inbox, never inferred absent
@@ -343,6 +346,7 @@ struct RemoteChanges: Sendable {
                 return scope
             }
             for entry in entries {
+                try SyncRunControl.current?.checkCancellation()
                 _ = try await resolve(entry.change.fileId)
             }
             // Preserve any budget-limited/failed probe which did not produce a resolution.
@@ -820,6 +824,7 @@ struct RemoteChanges: Sendable {
             return rows
         }
         guard !jobs.isEmpty else { return false }
+        try SyncRunControl.current?.checkCancellation()
         try await withThrowingTaskGroup(of: Void.self) { group in
             for job in jobs {
                 group.addTask {
@@ -858,6 +863,7 @@ struct RemoteChanges: Sendable {
             }
             try await group.waitForAll()
         }
+        try SyncRunControl.current?.checkCancellation()
         return true
     }
 

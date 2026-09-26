@@ -5,22 +5,54 @@ actor RootSyncCoordinator {
     static let shared = RootSyncCoordinator()
 
     struct Token: Sendable {
-        fileprivate let key: String
+        fileprivate let id: UUID
     }
 
-    private var runningRoots: Set<String> = []
+    private struct Entry {
+        let key: String
+        let control: SyncRunControl?
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
 
-    func acquire(localRootPath: String) throws -> Token {
+    private var runningRoots: [UUID: Entry] = [:]
+
+    func acquire(localRootPath: String, control: SyncRunControl? = nil) throws -> Token {
         let key = Self.normalizedPath(localRootPath)
-        guard !runningRoots.contains(where: { Self.overlaps($0, key) }) else {
+        guard !runningRoots.values.contains(where: { Self.overlaps($0.key, key) }) else {
             throw SyncEngineError.rootBusy(path: key)
         }
-        runningRoots.insert(key)
-        return Token(key: key)
+        let id = UUID()
+        runningRoots[id] = Entry(key: key, control: control)
+        return Token(id: id)
     }
 
     func release(_ token: Token) {
-        runningRoots.remove(token.key)
+        guard let entry = runningRoots.removeValue(forKey: token.id) else { return }
+        entry.waiters.forEach { $0.resume() }
+    }
+
+    /// Stops only a currently running sync for this exact root, then waits for
+    /// that invocation to release its root token.  A later invocation cannot
+    /// be mistaken for the cancelled one because the waiter is attached to its
+    /// original token.
+    func cancelSync(localRootPath: String) async {
+        let key = Self.normalizedPath(localRootPath)
+        guard let (id, control) = runningRoots.first(where: {
+            $0.value.key == key && $0.value.control != nil
+        }).map({ ($0.key, $0.value.control!) }) else { return }
+        control.cancel()
+        await waitForRelease(id)
+    }
+
+    private func waitForRelease(_ id: UUID) async {
+        await withCheckedContinuation { continuation in
+            guard var entry = runningRoots[id] else {
+                continuation.resume()
+                return
+            }
+            entry.waiters.append(continuation)
+            runningRoots[id] = entry
+        }
     }
 
     nonisolated static func normalizedPath(_ path: String) -> String {

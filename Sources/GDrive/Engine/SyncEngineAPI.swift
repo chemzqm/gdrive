@@ -229,7 +229,7 @@ public final class SyncEngine: Sendable {
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let normalizedLocalPath = Self.normalizedPath(localPath)
-        return try await withRootSyncLock(localPath: normalizedLocalPath) {
+        return try await withRootSyncLock(localPath: normalizedLocalPath, cancellable: true) {
             try await self.syncUnlocked(
                 localPath: normalizedLocalPath,
                 remoteFolderId: remoteFolderId,
@@ -248,7 +248,7 @@ public final class SyncEngine: Sendable {
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let normalizedLocalPath = Self.normalizedPath(localPath)
-        return try await withRootSyncLock(localPath: normalizedLocalPath) {
+        return try await withRootSyncLock(localPath: normalizedLocalPath, cancellable: true) {
             try await self.syncLocalToRemoteEmptyUnlocked(
                 localPath: normalizedLocalPath,
                 remoteRootId: remoteRootId,
@@ -267,7 +267,7 @@ public final class SyncEngine: Sendable {
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let normalizedLocalPath = Self.normalizedPath(localPath)
-        return try await withRootSyncLock(localPath: normalizedLocalPath) {
+        return try await withRootSyncLock(localPath: normalizedLocalPath, cancellable: true) {
             try await self.initializeRemoteToLocalEmpty(localPath: normalizedLocalPath, remoteRootId: remoteRootId,
                 maxDownloadConcurrency: maxDownloadConcurrency, onProgress: onProgress, initialCursor: nil)
         }
@@ -282,7 +282,7 @@ public final class SyncEngine: Sendable {
         onProgress: (@Sendable (SyncProgress) -> Void)? = nil
     ) async throws -> SyncStats {
         let normalizedLocalPath = Self.normalizedPath(localPath)
-        return try await withRootSyncLock(localPath: normalizedLocalPath) {
+        return try await withRootSyncLock(localPath: normalizedLocalPath, cancellable: true) {
             guard let root = try await self.activeRootBinding(localRootPath: normalizedLocalPath) else {
                 throw SyncEngineError.general(
                     "Directory has no available remote root ID: \(normalizedLocalPath)"
@@ -299,25 +299,41 @@ public final class SyncEngine: Sendable {
         }
     }
 
+    /// Stops admission of new work for the active sync of this exact root and
+    /// waits until its already admitted work has drained.
+    public func cancelSync(localPath: String) async {
+        await RootSyncCoordinator.shared.cancelSync(localRootPath: Self.normalizedPath(localPath))
+    }
+
     // MARK: - Root synchronization lock
 
     func withRootSyncLock<T: Sendable>(
         localPath: String,
+        cancellable: Bool = false,
         operation: @Sendable () async throws -> T
     ) async throws -> T {
         let resolvedLocalPath = Self.normalizedPath(localPath)
-        try await verifyDatabaseConnection()
-        try await validateOperationalStateIsOutsideSyncRoots(resolvedLocalPath)
+        let control = cancellable ? SyncRunControl() : nil
         let token = try await RootSyncCoordinator.shared.acquire(
-            localRootPath: resolvedLocalPath)
+            localRootPath: resolvedLocalPath, control: control)
         let result: Result<T, any Error>
         do {
-            result = .success(try await operation())
+            let value = try await SyncRunControl.$current.withValue(control) {
+                try control?.checkCancellation()
+                try await verifyDatabaseConnection()
+                try await validateOperationalStateIsOutsideSyncRoots(resolvedLocalPath)
+                try control?.checkCancellation()
+                return try await operation()
+            }
+            result = .success(value)
         } catch {
             result = .failure(error)
         }
+        monitor.refreshSnapshot()
         await RootSyncCoordinator.shared.release(token)
-        return try result.get()
+        let value = try result.get()
+        try control?.checkCancellation()
+        return value
     }
 
     private func validateOperationalStateIsOutsideSyncRoots(_ localPath: String) async throws {

@@ -139,6 +139,8 @@ GDrive 采用**以 SQLite 数据库为三方同步基线 (Baseline)** 的架构�
     并拒绝位于任一绑定根内的持久化冲突副本，防止凭据、WAL、未完成下载和冲突副本被反向上传。
   * **根边界隔离**：新绑定会和同一账户的全部既有绑定比较规范化路径，祖先或后代关系均返回
     `rootBindingConflict`；进程内协调器用相同规则拒绝并发运行的嵌套根。路径比较会解析符号链接。
+  * **取消同步**：`cancelSync(localPath:)` 只停止当前同步轮次并等待其退出，保留 SQLite
+    基线和意图以供下次恢复。
   * **下载暂存目录**：通过初始化参数 `downloadTemporaryDirectory` 或
     `setDownloadTemporaryDirectory(_:)` 配置基目录，默认 `~/.gdrive/remotes`，按远程根 ID
     使用 `<基目录>/<remoteRootId>/`。初始化、增量和冲突内容下载统一使用同步目录外的暂存路径，

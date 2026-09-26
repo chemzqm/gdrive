@@ -34,6 +34,7 @@ extension SyncEngine {
 
         // Verify that the remote root directory exists
         try await validateRemoteRoot(remoteRootId: remoteRootId)
+        try SyncRunControl.current?.checkCancellation()
 
         // Only verify whether the remote end is an empty directory when the root baseline is not established for the first time.
         let rootExists: Bool = try await store.read { conn in
@@ -46,6 +47,7 @@ extension SyncEngine {
             client: client, rootExists: rootExists, initialToken: nil)
         if !rootExists {
             let existingChildren = try await client.listChildren(parentId: remoteRootId)
+            try SyncRunControl.current?.checkCancellation()
             guard existingChildren.isEmpty else {
                 throw NSError(domain: "SyncEngine", code: 20, userInfo: [NSLocalizedDescriptionKey: "The remote target is not empty; localToRemoteEmpty cannot run: \(remoteRootId)"])
             }
@@ -116,6 +118,8 @@ extension SyncEngine {
 
             return (rId, rItemId)
         }
+
+        try SyncRunControl.current?.checkCancellation()
 
         try await RemoteChanges(
             store: store, client: client, rootID: rootId, remoteRootID: remoteRootId,
@@ -348,15 +352,18 @@ extension SyncEngine {
             }
 
             do {
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 // Resolving the parent happens before a transfer slot is acquired.
                 let parentTarget = try await parent.value()
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 let remoteParentId = parentTarget.remoteID
                 parentItemID = parentTarget.itemID
 
                 try await uploadSemaphore.wait()
                 didAcquireSemaphore = true
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 if let error = databaseError.withLock({ $0 }) { throw error }
 
@@ -493,11 +500,14 @@ extension SyncEngine {
         @Sendable func createDirectory(relPath: String, parent: BootstrapDirectoryDependency, name: String, metadata: FileMetadata?) async throws -> BootstrapDirectoryTarget {
             var createIntent: DurableCreateIntent?
             do {
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 let parentTarget = try await parent.value()
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 try await directorySemaphore.wait()
                 defer { directorySemaphore.signal() }
+                try SyncRunControl.current?.checkCancellation()
                 try Task.checkCancellation()
                 if let error = databaseError.withLock({ $0 }) { throw error }
                 let localAttributes = try FileManager.default.attributesOfItem(
@@ -570,12 +580,14 @@ extension SyncEngine {
         }
 
         @Sendable func processBatch(_ batch: ScanBatch) async throws {
+            try SyncRunControl.current?.checkCancellation()
             try Task.checkCancellation()
             if let error = databaseError.withLock({ $0 }) { throw error }
             try batch.withRawData { rawBuf in
                 guard let basePtr = rawBuf.baseAddress else { return }
 
                 for idx in 0..<batch.count {
+                    try SyncRunControl.current?.checkCancellation()
                     try Task.checkCancellation()
                     if let error = databaseError.withLock({ $0 }) { throw error }
                     let record = batch.records[idx]
@@ -640,7 +652,9 @@ extension SyncEngine {
                 taskRegistry.cancelAll()
             }
         } catch {
-            taskRegistry.cancelAll()
+            if !((SyncRunControl.current?.isCancelled) ?? false) {
+                taskRegistry.cancelAll()
+            }
             await taskRegistry.waitForAll()
             if let databaseFailure = databaseError.withLock({ $0 }) { throw databaseFailure }
             throw error
@@ -654,6 +668,7 @@ extension SyncEngine {
             taskRegistry.cancelAll()
         }
         if let error = databaseError.withLock({ $0 }) { throw error }
+        try SyncRunControl.current?.checkCancellation()
         try Task.checkCancellation()
 
         // 6. Force the buffer to be written to disk and execute WAL checkpoint

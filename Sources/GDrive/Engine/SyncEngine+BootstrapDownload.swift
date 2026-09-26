@@ -50,6 +50,7 @@ extension SyncEngine {
 
         // Verify that the remote root directory exists
         try await validateRemoteRoot(remoteRootId: remoteRootId)
+        try SyncRunControl.current?.checkCancellation()
 
         let downloadDirectory = try await downloadStagingDirectory(remoteRootID: remoteRootId, localRoot: rootURL)
         defer { cleanupDownloadStagingDirectory(downloadDirectory) }
@@ -65,6 +66,7 @@ extension SyncEngine {
         }
         let newRootCursor = try await RemoteChanges.initialBootstrapCursor(
             client: client, rootExists: rootExists, initialToken: initialCursor)
+        try SyncRunControl.current?.checkCancellation()
 
         // Existing local entries are preserved. Equal content is adopted and
         // divergent same-path content is recorded as a durable conflict.
@@ -148,6 +150,8 @@ extension SyncEngine {
             return (rId, rItemId)
         }
 
+        try SyncRunControl.current?.checkCancellation()
+
         try await RemoteChanges(
             store: store, client: client, rootID: rootId, remoteRootID: remoteRootId,
             rootURL: rootURL
@@ -224,6 +228,7 @@ extension SyncEngine {
         func enqueueFileDownload(
             _ item: DriveFile, parentItemId: Int64, localURL: URL
         ) async throws {
+            try SyncRunControl.current?.checkCancellation()
             try await RemoteChanges.retainBootstrapObservation(
                 store: self.store, rootID: rootId, file: item)
             if try await recoverPublishedFile(
@@ -240,7 +245,7 @@ extension SyncEngine {
                 self.monitor.finishDownload(id: item.id)
                 throw error
             }
-            if Task.isCancelled {
+            if (SyncRunControl.current?.isCancelled ?? false) || Task.isCancelled {
                 self.monitor.finishDownload(id: item.id)
                 downloadSemaphore.signal()
                 throw CancellationError()
@@ -253,6 +258,7 @@ extension SyncEngine {
                 }
 
                 do {
+                    try SyncRunControl.current?.checkCancellation()
                     try Task.checkCancellation()
                     try checkDatabaseFailure()
                     self.monitor.startDownload(
@@ -324,10 +330,12 @@ extension SyncEngine {
 
         // 2. Recursive enumeration of remote files and streaming download
         func traverseRemote(parentRemoteId: String, currentLocalURL: URL, parentItemId: Int64) async throws {
+            try SyncRunControl.current?.checkCancellation()
             let children = try await self.client.listChildren(parentId: parentRemoteId)
             try RemoteNameMapping.validateSiblings(children)
 
             for item in children {
+                try SyncRunControl.current?.checkCancellation()
                 try checkDatabaseFailure()
                 let itemLocalURL = currentLocalURL.appendingPathComponent(item.name)
                 try RemoteNameMapping.validateDestination(itemLocalURL, root: rootURL)
@@ -425,6 +433,7 @@ extension SyncEngine {
         }
 
         try checkDatabaseFailure()
+        try SyncRunControl.current?.checkCancellation()
         try await store.flush()
         if let traversalError {
             // Preserve a durable recovery route for a partially downloaded bootstrap.
